@@ -1,0 +1,14 @@
+services:
+  leadpuller:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:${HOST_PORT:-8090}:8090"   # HOST_PORT in .env if 8090 is taken; put Nginx/Caddy with HTTPS in front
+    volumes:
+      - ./data:/data
+    logging:                    # cap Docker's copy of the console output at 3 x 10 MB
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

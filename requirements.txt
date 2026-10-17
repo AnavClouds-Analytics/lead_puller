@@ -1,0 +1,8 @@
+# Pinned to the versions the test suite passed with (2026-10-18). Bump deliberately and rerun pytest.
+fastapi==0.143.3
+starlette==1.8.0
+uvicorn==0.54.0
+httpx==0.28.1
+python-multipart==0.0.32
+openpyxl==3.1.5
+pytest==9.1.1

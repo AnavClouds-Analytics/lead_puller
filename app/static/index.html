@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Lead Puller · AnavClouds</title>
+<style>
+:root{
+  --bg:#f5f6f8; --panel:#ffffff; --ink:#15181e; --ink2:#4b5260; --ink3:#8a91a0; --line:#e3e6eb; --line2:#eef0f3;
+  --brand:#1f5eff; --brand-ink:#ffffff; --brand-soft:#e8efff;
+  --ok:#14804a; --ok-soft:#e5f4ec; --warn:#a15c00; --warn-soft:#fdf1df; --bad:#c22f2f; --bad-soft:#fbe7e7;
+  --radius:10px; --shadow:0 1px 2px rgba(16,24,40,.05),0 1px 3px rgba(16,24,40,.06);
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#0f1115; --panel:#171a20; --ink:#e9ecf1; --ink2:#b4bac6; --ink3:#7d8494; --line:#2a2f38; --line2:#20242b;
+  --brand:#5b8cff; --brand-ink:#0b0d12; --brand-soft:#1b2540;
+  --ok:#43c37f; --ok-soft:#14291e; --warn:#f0a83a; --warn-soft:#2c2213; --bad:#ff7070; --bad-soft:#2d1717;
+  --shadow:none;}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--brand);text-decoration:none} a:hover{text-decoration:underline}
+button{font:inherit;cursor:pointer}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
+textarea{resize:vertical}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--brand-soft);border-color:var(--brand)}
+.layout{display:flex;min-height:100vh}
+nav.side{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:2px}
+.logo{font-weight:700;font-size:16px;padding:4px 10px 16px;letter-spacing:-.01em}
+.logo small{display:block;font-weight:500;color:var(--ink3);font-size:12px}
+nav.side a{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--ink2);font-weight:500}
+nav.side a:hover{background:var(--line2);text-decoration:none}
+nav.side a.on{background:var(--brand-soft);color:var(--brand)}
+nav.side .spacer{flex:1}
+.credit-chip{margin:8px 4px;padding:10px;border:1px solid var(--line);border-radius:10px;font-size:12px;color:var(--ink2)}
+.credit-chip b{display:block;font-size:18px;color:var(--ink)}
+main{flex:1;min-width:0;padding:28px 32px 80px;max-width:1240px}
+h1{font-size:22px;margin:0 0 4px;letter-spacing:-.01em} h2{font-size:16px;margin:0 0 12px} h3{font-size:14px;margin:0 0 8px}
+.sub{color:var(--ink3);margin:0 0 20px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);margin-bottom:16px}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.grid{display:grid;gap:12px} .g2{grid-template-columns:repeat(2,minmax(0,1fr))} .g3{grid-template-columns:repeat(3,minmax(0,1fr))} .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:900px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))} .g2{grid-template-columns:1fr}
+  .layout{flex-direction:column} nav.side{width:auto;height:auto;position:static;flex-direction:row;overflow-x:auto;padding:8px;border-right:none;border-bottom:1px solid var(--line)}
+  nav.side .logo,nav.side .spacer,nav.side .credit-chip{display:none} nav.side a{flex:none} main{padding:18px 16px 60px}}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:8px 14px;border-radius:8px;font-weight:600;white-space:nowrap}
+.btn:hover{border-color:var(--ink3)}
+.btn.primary{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)} .btn.primary:hover{filter:brightness(1.07)}
+.btn.danger{color:var(--bad)} .btn.small{padding:4px 10px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.stat{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel)}
+.stat .k{font-size:12px;color:var(--ink3);font-weight:500} .stat .v{font-size:22px;font-weight:700;letter-spacing:-.01em}
+.stat .h{font-size:12px;color:var(--ink3)}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600;background:var(--line2);color:var(--ink2)}
+.b-ok{background:var(--ok-soft);color:var(--ok)} .b-warn{background:var(--warn-soft);color:var(--warn)} .b-bad{background:var(--bad-soft);color:var(--bad)} .b-brand{background:var(--brand-soft);color:var(--brand)}
+.notice{border-radius:10px;padding:10px 14px;margin-bottom:14px;border:1px solid}
+.notice.info{background:var(--brand-soft);border-color:transparent;color:var(--ink)}
+.notice.warn{background:var(--warn-soft);border-color:transparent;color:var(--ink)}
+.notice.bad{background:var(--bad-soft);border-color:transparent;color:var(--ink)}
+.notice ul{margin:4px 0 0;padding-left:18px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-weight:600;color:var(--ink3);font-size:12px;padding:8px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px;border-bottom:1px solid var(--line2);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel)}
+.muted{color:var(--ink3)} .small{font-size:12px} .nowrap{white-space:nowrap} .right{text-align:right}
+.steps{display:flex;gap:6px;margin:14px 0 18px;flex-wrap:wrap}
+.steps span{padding:4px 12px;border-radius:999px;font-size:12px;font-weight:600;background:var(--line2);color:var(--ink3)}
+.steps span.on{background:var(--brand);color:var(--brand-ink)} .steps span.done{background:var(--brand-soft);color:var(--brand)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px}
+.chip{display:inline-flex;align-items:center;gap:4px;background:var(--brand-soft);color:var(--brand);border-radius:999px;padding:2px 4px 2px 10px;font-size:12.5px;font-weight:500}
+.chip button{border:none;background:none;color:inherit;padding:0 6px;font-size:14px;line-height:1}
+.field{margin-bottom:14px} .field label{display:block;font-weight:600;font-size:13px;margin-bottom:5px}
+.field .help{font-size:12px;color:var(--ink3);margin-top:4px}
+.fgroup{border-top:1px solid var(--line2);padding-top:14px;margin-top:6px}
+.fgroup>h3{color:var(--ink2)}
+.bar{height:10px;border-radius:999px;background:var(--line2);overflow:hidden} .bar>i{display:block;height:100%;background:var(--brand);transition:width .4s}
+.prompt-box textarea{font-size:15px;min-height:110px;padding:14px}
+.example{border:1px dashed var(--line);border-radius:999px;padding:4px 12px;background:none;color:var(--ink2);font-size:12.5px}
+.example:hover{border-color:var(--brand);color:var(--brand)}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:12px}
+.tabs button{border:none;background:none;padding:8px 12px;color:var(--ink3);font-weight:600;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs button.on{color:var(--brand);border-color:var(--brand)}
+.radio{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;margin-bottom:8px;cursor:pointer}
+.radio input{width:auto;margin-top:3px} .radio.on{border-color:var(--brand);background:var(--brand-soft)}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--line);border-top-color:var(--brand);border-radius:50%;animation:s .8s linear infinite;vertical-align:-2px}
+@keyframes s{to{transform:rotate(360deg)}}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:10px;font-weight:500;z-index:9;max-width:90vw}
+.toast.err{background:var(--bad);color:#fff}
+.center-box{max-width:380px;margin:12vh auto;padding:0 16px}
+.name-input{font-size:22px;font-weight:700;border:1px solid transparent;background:none;padding:2px 6px;margin-left:-7px;width:auto;min-width:200px}
+.name-input:hover{border-color:var(--line)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px} .kv div:nth-child(odd){color:var(--ink3)}
+.switch{display:flex;align-items:center;gap:8px;font-weight:500} .switch input{width:auto}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+"use strict";
+const $ = (s, el=document) => el.querySelector(s);
+const esc = s => (s==null?"":String(s)).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = n => n==null ? "—" : Number(n).toLocaleString("en-US");
+const when = t => t ? new Date(t*1000).toLocaleString(undefined,{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"}) : "";
+let META = null, POLL = null, CURRENT_PULL = null;
+
+async function api(path, opts={}) {
+  const o = {method: opts.method || (opts.body ? "POST" : "GET"), headers:{}};
+  if (opts.body instanceof FormData) o.body = opts.body;
+  else if (opts.body !== undefined) { o.headers["Content-Type"]="application/json"; o.body=JSON.stringify(opts.body); }
+  const r = await fetch(path, o);
+  if (r.status === 401 && !path.startsWith("/api/auth")) { location.hash = "#/login"; throw new Error("Please log in."); }
+  let data = null; try { data = await r.json(); } catch(e) {}
+  if (!r.ok) throw new Error((data && (data.error || data.detail)) || ("Error " + r.status));
+  return data;
+}
+function toast(msg, err) {
+  const t = document.createElement("div"); t.className = "toast" + (err?" err":""); t.textContent = msg;
+  document.body.appendChild(t); setTimeout(()=>t.remove(), err?6000:3000);
+}
+async function busy(btn, fn) {
+  const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span> ' + old;
+  try { return await fn(); } catch(e) { toast(e.message, true); } finally { btn.disabled = false; btn.innerHTML = old; }
+}
+
+// ------------------------------------------------------------ shell
+const NAV = [["#/new","New pull"],["#/pulls","Pulls"],["#/presets","Presets"],["#/exclusions","Do-not-pull list"],["#/credits","Credits"],["#/settings","Settings"]];
+function shell(content) {
+  const h = location.hash || "#/new";
+  const c = META ? META.credits : {};
+  return `<div class="layout"><nav class="side">
+    <div class="logo">Lead Puller<small>AnavClouds · Seamless.AI</small></div>
+    ${NAV.map(([href,label]) => `<a href="${href}" class="${h.startsWith(href)||(href==="#/pulls"&&h.startsWith("#/pull/"))?"on":""}">${label}</a>`).join("")}
+    <div class="spacer"></div>
+    <div class="credit-chip" id="creditChip">Seamless credits<b>${fmt(c.balance)}</b>
+      ${c.monthly_budget ? `${fmt(c.spent_this_month)} of ${fmt(c.monthly_budget)} used this month` : `${fmt(c.spent_this_month)} used this month`}</div>
+    ${META && META.user ? `<div class="small muted" style="overflow-wrap:anywhere">${esc(META.user)}</div>` : ""}
+    <a href="#" id="logout">Log out</a>
+  </nav><main id="main">${content}</main></div>`;
+}
+async function refreshMeta() { META = await api("/api/meta"); }
+
+async function route() {
+  clearInterval(POLL); POLL = null; CURRENT_PULL = null;
+  const h = location.hash || "#/new";
+  const st = await api("/api/auth/status");
+  if (!st.logged_in) return renderLogin(st.needs_setup);
+  if (h === "#/login") { location.hash = "#/new"; return; }
+  await refreshMeta();
+  const app = $("#app");
+  let m;
+  if ((m = h.match(/^#\/pull\/(\d+)/))) { app.innerHTML = shell('<div class="muted">Loading…</div>'); return renderPull(+m[1]); }
+  const pages = {"#/new":renderNew,"#/pulls":renderPulls,"#/presets":renderPresets,"#/exclusions":renderExclusions,"#/credits":renderCredits,"#/settings":renderSettings};
+  app.innerHTML = shell('<div class="muted">Loading…</div>');
+  await (pages[h] || renderNew)();
+}
+window.addEventListener("hashchange", route);
+document.addEventListener("click", e => {
+  if (e.target.id === "logout") { e.preventDefault(); api("/api/auth/logout",{body:{}}).then(()=>{location.hash="#/login";route();}); }
+});
+function setMain(html) { $("#main").innerHTML = html; }
+
+// ------------------------------------------------------------ login
+function renderLogin(setup) {
+  $("#app").innerHTML = `<div class="center-box"><div class="card">
+    <h1>Lead Puller</h1><p class="sub">${setup ? "First time here. Create the login for this tool: your email and a password (at least 8 characters)." : "Log in to continue."}</p>
+    <form id="lf"><div class="field"><label>Email</label><input type="email" id="em" autocomplete="username" required autofocus></div>
+    <div class="field"><label>Password</label><input type="password" id="pw" autocomplete="${setup?"new-password":"current-password"}" required></div>
+    <button class="btn primary" style="width:100%">${setup ? "Create login" : "Log in"}</button></form></div></div>`;
+  $("#lf").onsubmit = async e => {
+    e.preventDefault();
+    try { await api(setup ? "/api/auth/setup" : "/api/auth/login", {body:{email:$("#em").value, password:$("#pw").value}}); location.hash="#/new"; route(); }
+    catch(err) { toast(err.message, true); }
+  };
+}
+
+// ------------------------------------------------------------ new pull
+const EXAMPLES = [
+  "CTOs and VP Engineering at US software companies with 50–500 employees that use Salesforce, 500 people",
+  "Heads of IT and IT Directors at Canadian healthcare and insurance companies, 200–5,000 employees, 300 people",
+  "Founders and CTOs of Israeli tech startups that raised Seed to Series B in the last year, 200 people",
+  "Salesforce admins and CRM managers in the UK, Germany and the Netherlands, skip staffing and consulting firms, 300 people",
+];
+async function renderNew() {
+  const presets = (await api("/api/presets")).rows;
+  const keysMissing = !META.has_seamless_key || !META.has_claude_key;
+  setMain(`<h1>New pull</h1><p class="sub">Describe who you want. Claude turns it into Seamless filters — you check them before any credits are spent.</p>
+    ${keysMissing ? `<div class="notice warn">Add your ${!META.has_seamless_key?"Seamless":""}${!META.has_seamless_key&&!META.has_claude_key?" and ":""}${!META.has_claude_key?"Claude":""} API key in <a href="#/settings">Settings</a> first.</div>` : ""}
+    <div class="card prompt-box"><textarea id="prompt" placeholder="e.g. VP Engineering and CTOs at US SaaS companies, 50–500 employees, using Salesforce, 2,000 people"></textarea>
+      <div class="row" style="margin-top:10px;justify-content:space-between">
+        <div class="row" style="gap:6px">${EXAMPLES.map((x,i)=>`<button class="example" data-ex="${i}">${esc(x.split(",")[0])}…</button>`).join("")}</div>
+        <div class="row"><button class="btn" id="manual">Set filters by hand</button><button class="btn primary" id="build">Build search</button></div>
+      </div></div>
+    ${presets.length ? `<div class="card"><h2>Start from a preset</h2><div class="tablewrap"><table><tbody>
+      ${presets.map(p=>`<tr><td><b>${esc(p.name)}</b><div class="small muted">${esc(summarize(p.filters))}</div></td><td class="right"><button class="btn small" data-preset="${p.id}">Use</button></td></tr>`).join("")}
+      </tbody></table></div></div>` : ""}`);
+  document.querySelectorAll("[data-ex]").forEach(b => b.onclick = () => { $("#prompt").value = EXAMPLES[+b.dataset.ex]; $("#prompt").focus(); });
+  $("#build").onclick = e => busy(e.currentTarget, async () => {
+    const prompt = $("#prompt").value.trim(); if (!prompt) return toast("Describe who you want to find.", true);
+    const p = await api("/api/pulls/interpret", {body:{prompt}}); location.hash = "#/pull/" + p.id;
+  });
+  $("#manual").onclick = e => busy(e.currentTarget, async () => {
+    const p = await api("/api/pulls", {body:{name:"New pull", filters:{}, prompt:$("#prompt").value.trim()}}); location.hash = "#/pull/" + p.id;
+  });
+  document.querySelectorAll("[data-preset]").forEach(b => b.onclick = () => busy(b, async () => {
+    const p = await api(`/api/presets/${b.dataset.preset}/use`, {body:{}}); location.hash = "#/pull/" + p.id;
+  }));
+}
+function summarize(f) {
+  const parts = [];
+  if (f.jobTitle) parts.push(f.jobTitle.slice(0,3).join(", ") + (f.jobTitle.length>3?"…":""));
+  if (f.seniority) parts.push(f.seniority.join("/"));
+  if (f.industry) parts.push(f.industry.slice(0,2).join(", ") + (f.industry.length>2?"…":""));
+  if (f.companySize) parts.push(f.companySize.join(", ") + " employees");
+  if (f.contactCountry) parts.push(f.contactCountry.join(", "));
+  return parts.join(" · ") || "No filters";
+}
+
+// ------------------------------------------------------------ filter editor
+function filterEditor(filters, editable) {
+  const groups = {};
+  META.filters.forEach(f => (groups[f.group] = groups[f.group] || []).push(f));
+  let html = "";
+  Object.entries(groups).forEach(([g, fs], gi) => {
+    const anySet = fs.some(f => filters[f.key] !== undefined);
+    const collapsed = !anySet && gi > 0;
+    html += `<div class="fgroup"><h3>${esc(g)} ${collapsed && editable ? `<button class="btn small" data-open="${gi}" style="margin-left:6px">Show</button>` : ""}</h3>
+      <div class="grid g2 ${collapsed && editable ? "hide" : ""}" data-group="${gi}">`;
+    fs.forEach(f => {
+      if (!editable && filters[f.key] === undefined) return;
+      html += `<div class="field" data-key="${f.key}"><label>${esc(f.label)}</label>${fieldInput(f, filters[f.key], editable)}${f.help && editable ? `<div class="help">${esc(f.help)}</div>`:""}</div>`;
+    });
+    html += `</div></div>`;
+  });
+  return html;
+}
+function fieldInput(f, val, editable) {
+  if (f.kind === "choice") {
+    const labels = f.option_labels || {};
+    if (!editable) return `<div>${esc(labels[String(val)] || String(val))}</div>`;
+    return `<select data-choice><option value="">Any</option>${f.options.map(o=>`<option value="${esc(String(o))}" ${String(val)===String(o)?"selected":""}>${esc(labels[String(o)]||String(o))}</option>`).join("")}</select>`;
+  }
+  const items = val || [];
+  const chips = `<div class="chips">${items.map(v=>`<span class="chip">${esc(v)}${editable?`<button data-rm="${esc(v)}" title="Remove">×</button>`:""}</span>`).join("")}</div>`;
+  if (!editable) return chips;
+  if (f.kind === "enum_list") return chips + `<select data-add><option value="">+ Add…</option>${f.options.filter(o=>!items.includes(o)).map(o=>`<option>${esc(o)}</option>`).join("")}</select>`;
+  return chips + `<input data-text placeholder="Type and press Enter (comma for several)">`;
+}
+function readFilters(root) {
+  const out = {};
+  root.querySelectorAll(".field[data-key]").forEach(el => {
+    const key = el.dataset.key, f = META.filters.find(x=>x.key===key);
+    if (f.kind === "choice") { const v = $("select", el).value; if (v !== "") out[key] = (v==="true"?true:v==="false"?false:v); }
+    else { const vals = [...el.querySelectorAll(".chip")].map(c => c.firstChild.textContent); if (vals.length) out[key] = vals; }
+  });
+  return out;
+}
+function wireEditor(root, onChange) {
+  root.addEventListener("click", e => {
+    if (e.target.dataset.rm !== undefined) { e.target.closest(".chip").remove(); onChange(); }
+    if (e.target.dataset.open !== undefined) { root.querySelector(`[data-group="${e.target.dataset.open}"]`).classList.remove("hide"); e.target.remove(); }
+  });
+  root.addEventListener("change", e => {
+    if (e.target.matches("select[data-add]") && e.target.value) {
+      addChip(e.target.closest(".field"), e.target.value); e.target.querySelector(`option[value="${CSS.escape(e.target.value)}"]`)?.remove();
+      e.target.value = ""; onChange();
+    }
+    if (e.target.matches("select[data-choice]")) onChange();
+  });
+  root.addEventListener("keydown", e => {
+    if (e.target.matches("input[data-text]") && e.key === "Enter") {
+      e.preventDefault();
+      e.target.value.split(",").map(s=>s.trim()).filter(Boolean).forEach(v => addChip(e.target.closest(".field"), v));
+      e.target.value = ""; onChange();
+    }
+  });
+  root.addEventListener("focusout", e => {
+    if (e.target.matches("input[data-text]") && e.target.value.trim()) {
+      e.target.value.split(",").map(s=>s.trim()).filter(Boolean).forEach(v => addChip(e.target.closest(".field"), v));
+      e.target.value = ""; onChange();
+    }
+  });
+}
+function addChip(field, v) {
+  const chips = $(".chips", field);
+  if ([...chips.querySelectorAll(".chip")].some(c => c.firstChild.textContent === v)) return;
+  const f = META.filters.find(x=>x.key===field.dataset.key);
+  if (chips.children.length >= (f.max||100)) return toast(`${f.label}: up to ${f.max} values.`, true);
+  const s = document.createElement("span"); s.className = "chip"; s.append(document.createTextNode(v));
+  const b = document.createElement("button"); b.dataset.rm = v; b.title = "Remove"; b.textContent = "×"; s.append(b);
+  chips.append(s);
+}
+
+// ------------------------------------------------------------ pull page
+const STEP_OF = {draft:0, previewed:1, collecting:2, collected:3, researching:4, paused:-1, done:5, cancelled:3, failed:-1};
+const STEP_NAMES = ["Filters","Preview","Collect","Choose","Research","Results"];
+const STATUS_BADGE = {draft:["Filters","b-brand"],previewed:["Previewed","b-brand"],collecting:["Collecting","b-warn"],collected:["Ready to research","b-brand"],
+  researching:["Researching","b-warn"],paused:["Paused","b-bad"],done:["Done","b-ok"],cancelled:["Stopped",""],failed:["Failed","b-bad"]};
+
+async function renderPull(id) {
+  let p;
+  try { p = await api("/api/pulls/" + id); } catch(e) { return setMain(`<div class="notice bad">${esc(e.message)}</div>`); }
+  CURRENT_PULL = p;
+  META.credits = p.credits;
+  const cc = $("#creditChip"), c = p.credits;
+  if (cc) cc.innerHTML = `Seamless credits<b>${fmt(c.balance)}</b>${c.monthly_budget ? `${fmt(c.spent_this_month)} of ${fmt(c.monthly_budget)} used this month` : `${fmt(c.spent_this_month)} used this month`}`;
+  const step = p.status === "paused" ? STEP_OF[p.paused_from] : STEP_OF[p.status];
+  const [bl, bc] = STATUS_BADGE[p.status] || [p.status, ""];
+  let body = "";
+  if (p.status === "draft") body = await stageDraft(p);
+  else if (p.status === "previewed") body = await stagePreview(p);
+  else if (p.status === "collecting" || (p.status === "paused" && p.paused_from === "collecting")) body = stageCollecting(p);
+  else if (p.status === "collected") body = await stageChoose(p);
+  else if (p.status === "researching" || (p.status === "paused" && p.paused_from === "researching")) body = stageResearching(p);
+  else if (p.status === "done") body = await stageDone(p);
+  setMain(`<div class="row" style="justify-content:space-between;align-items:flex-start">
+      <div><input class="name-input" id="pname" value="${esc(p.name)}">
+      <div class="row small muted" style="gap:8px;margin-top:2px"><span class="badge ${bc}">${bl}</span> Pull #${p.id} · ${when(p.created_at)}
+        · ${fmt(p.search_credits + p.research_credits)} credits used (${fmt(p.search_credits)} search, ${fmt(p.research_credits)} research)
+        ${p.cloned_from ? ` · re-run of <a href="#/pull/${p.cloned_from}">#${p.cloned_from}</a>` : ""}</div></div>
+      <div class="row"><button class="btn small" id="rerun" title="Same filters, only people you've never pulled">Run again, new people only</button>
+      ${["collecting","researching"].includes(p.status) ? "" : `<button class="btn small danger" id="del">Delete</button>`}</div></div>
+    <div class="steps">${STEP_NAMES.map((n,i)=>`<span class="${i===step?"on":i<step?"done":""}">${i+1}. ${n}</span>`).join("")}</div>
+    ${p.status==="paused" ? `<div class="notice bad"><b>${esc(p.error || "Paused.")}</b><div class="row" style="margin-top:8px"><button class="btn primary small" id="resume">Resume</button><button class="btn small" id="cancel">Stop</button></div></div>`
+      : p.error ? `<div class="notice warn">${esc(p.error)}</div>` : ""}
+    ${body}`);
+  $("#pname").onchange = e => api("/api/pulls/" + id, {method:"PATCH", body:{name:e.target.value}}).then(()=>toast("Renamed."));
+  $("#rerun").onclick = e => busy(e.currentTarget, async () => { const n = await api(`/api/pulls/${id}/rerun`, {body:{}}); location.hash = "#/pull/" + n.id; });
+  $("#del") && ($("#del").onclick = async () => {
+    if (!confirm("Delete this pull and its results? People you already paid for stay on the already-pulled list, so they are still skipped in future pulls.")) return;
+    try { await api("/api/pulls/" + id, {method:"DELETE"}); location.hash = "#/pulls"; } catch(e) { toast(e.message, true); }
+  });
+  $("#resume") && ($("#resume").onclick = e => busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/resume`, {body:{}}); renderPull(id); }));
+  $("#cancel") && ($("#cancel").onclick = e => busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/cancel`, {body:{}}); renderPull(id); }));
+  wirePull(p);
+  if (["collecting","researching"].includes(p.status) && !POLL) POLL = setInterval(() => {
+    if (CURRENT_PULL && CURRENT_PULL.id === id && location.hash === "#/pull/" + id) renderPull(id); else { clearInterval(POLL); POLL = null; }
+  }, 2500);
+  if (!["collecting","researching"].includes(p.status) && POLL) { clearInterval(POLL); POLL = null; }
+}
+
+async function stageDraft(p) {
+  return `${p.notes.length ? `<div class="notice info"><b>How Claude read your request</b><ul>${p.notes.map(n=>`<li>${esc(n)}</li>`).join("")}</ul></div>` : ""}
+    <div class="card"><div class="row" style="gap:8px"><input id="refine" placeholder="Adjust in words, e.g. “also include Directors” or “only companies over 200 people”" style="flex:1;min-width:240px"><button class="btn" id="refineBtn">Adjust</button></div>
+      ${p.prompt ? `<div class="small muted" style="margin-top:8px">Your request: ${esc(p.prompt)}</div>` : ""}</div>
+    <div class="card" id="editor"><h2>Search filters</h2><div class="small muted" style="margin-bottom:6px">Nothing is spent until you press Preview.</div>${filterEditor(p.filters, true)}</div>
+    <div class="row" style="justify-content:space-between"><div class="row"><input id="presetName" placeholder="Preset name" style="width:200px"><button class="btn" id="savePreset">Save as preset</button></div>
+      <button class="btn primary" id="previewBtn">Preview — about 3 credits</button></div>`;
+}
+async function stagePreview(p) {
+  const s = p.stats;
+  const sample = (await api(`/api/pulls/${p.id}/contacts?view=all&limit=25`)).rows;
+  const fit = s.fit || {};
+  const est = n => Math.ceil(n / 10);
+  return `<div class="grid g4" style="margin-bottom:16px">
+      <div class="stat"><div class="k">Matching people in Seamless</div><div class="v">${fmt(p.total_matches)}</div><div class="h">for these filters</div></div>
+      <div class="stat"><div class="k">Sample checked</div><div class="v">${fmt(s.seen)}</div><div class="h">${fmt(s.kept)} kept · ${fmt(s.skipped)} skipped</div></div>
+      <div class="stat"><div class="k">Fit in sample</div><div class="v">${fmt(fit.high||0)} <span class="small muted">good</span></div><div class="h">${fmt(fit.medium||0)} maybe · ${fmt(fit.low||0)} poor${fit.unrated?` · ${fmt(fit.unrated)} unrated`:""}</div></div>
+      <div class="stat"><div class="k">Credits spent so far</div><div class="v">${fmt(p.search_credits)}</div><div class="h">balance ${fmt(p.credits.balance)}</div></div></div>
+    ${(fit.low||0) > (s.kept/3) ? `<div class="notice warn">A lot of the sample is a poor fit. Consider tightening the filters before collecting.</div>` : ""}
+    ${s.seen === 0 ? `<div class="notice warn">No one matched. Loosen the filters (fewer titles, wider size range, or check the locations).</div>` : ""}
+    <div class="card"><h2>Collect the list</h2>
+      <div class="grid g3"><div class="field"><label>How many people</label><input type="number" id="target" min="1" value="${p.target || Math.min(p.total_matches||100, 500)}"></div>
+      <div class="field"><label>Max people per company</label><input type="number" id="cap" min="0" value="${p.per_company_cap}"><div class="help">0 = no limit</div></div>
+      <div class="field"><label>Estimated search cost</label><div id="est" style="padding:8px 0;font-weight:600"></div><div class="help">1 credit per 10 people found; skipped people still count. Emails cost extra in the next step.</div></div></div>
+      <div class="row" style="justify-content:space-between"><button class="btn" id="backBtn">Edit filters</button><button class="btn primary" id="collectBtn">Collect list</button></div></div>
+    <div class="card"><h2>Sample (first ${fmt(s.seen)} results)</h2>${contactTable(sample, "preview")}</div>
+    <div class="grid g2">${breakdown("Country (sample)", s.by_country, "country")}${breakdown("Company size (sample)", s.by_size, "size")}</div>`;
+}
+function breakdown(title, rows, key) {
+  const total = rows.reduce((a,r)=>a+r.n,0) || 1;
+  return `<div class="card"><h3>${title}</h3>${rows.length ? rows.map(r=>`<div class="row small" style="gap:8px;margin-bottom:6px"><div style="width:140px" class="nowrap">${esc(r[key])}</div><div class="bar" style="flex:1"><i style="width:${(r.n/total*100).toFixed(0)}%"></i></div><div style="width:40px" class="right">${fmt(r.n)}</div></div>`).join("") : '<div class="muted small">No data</div>'}</div>`;
+}
+function stageCollecting(p) {
+  const s = p.stats, pct = p.target ? Math.min(100, s.kept / p.target * 100) : 0;
+  return `<div class="card"><h2>${p.status==="paused"?"Collecting paused":"Collecting the list…"}</h2>
+    <div class="bar" style="margin:10px 0"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div class="row" style="justify-content:space-between"><div><b>${fmt(s.kept)}</b> of ${fmt(p.target)} people · ${fmt(s.skipped)} skipped · ${fmt(p.pages_fetched)} pages · ${fmt(p.search_credits)} search credits</div>
+    ${p.status==="collecting" ? `<div class="row"><button class="btn small" id="pauseBtn">Pause</button><button class="btn small" id="stopBtn">Stop and keep what's collected</button></div>`:""}</div>
+    <div class="small muted" style="margin-top:8px">This runs on the server. You can close this page and come back.</div></div>
+    ${s.skip_reasons.length ? `<div class="card"><h3>Why people were skipped</h3>${s.skip_reasons.map(r=>`<div class="row small" style="justify-content:space-between"><span>${esc(r.reason)}</span><b>${fmt(r.n)}</b></div>`).join("")}</div>` : ""}`;
+}
+async function stageChoose(p) {
+  const s = p.stats, fit = s.fit || {};
+  const rated = (fit.high||0)+(fit.medium||0)+(fit.low||0);
+  const rows = (await api(`/api/pulls/${p.id}/contacts?view=kept&limit=500`)).rows;
+  const opts = [["all", `Everyone kept (${fmt(s.kept)})`, s.kept], ["high_medium", `Good + maybe fit (${fmt((fit.high||0)+(fit.medium||0)+(fit.unrated||0))})`, (fit.high||0)+(fit.medium||0)+(fit.unrated||0)],
+    ["high", `Good fit only (${fmt((fit.high||0)+(fit.unrated||0))})`, (fit.high||0)+(fit.unrated||0)], ["first_n", "Only the first…", null]];
+  const c = p.credits;
+  return `${p.stop_reason ? `<div class="notice info">${esc(p.stop_reason)}</div>` : ""}
+    <div class="grid g4" style="margin-bottom:16px">
+      <div class="stat"><div class="k">People collected</div><div class="v">${fmt(s.kept)}</div><div class="h">${fmt(s.skipped)} skipped</div></div>
+      <div class="stat"><div class="k">Good fit</div><div class="v">${fmt(fit.high||0)}</div><div class="h">${fmt(fit.medium||0)} maybe · ${fmt(fit.low||0)} poor</div></div>
+      <div class="stat"><div class="k">Seamless balance</div><div class="v">${fmt(c.balance)}</div><div class="h">${c.budget_left!=null?`${fmt(c.budget_left)} left in monthly budget`:"no monthly budget set"}</div></div>
+      <div class="stat"><div class="k">Search credits used</div><div class="v">${fmt(p.search_credits)}</div><div class="h">${fmt(p.pages_fetched)} pages</div></div></div>
+    <div class="card"><h2>Who should get emails and phones?</h2>
+      <p class="small muted" style="margin-top:-6px">Research costs 1 credit per person. ${rated ? "" : "Fit wasn't rated (no Claude key or fit check off)."}</p>
+      ${opts.map(([v,l,n],i)=>`<label class="radio ${i===1&&rated||i===0&&!rated?"on":""}"><input type="radio" name="choice" value="${v}" ${i===1&&rated||i===0&&!rated?"checked":""}><div><b>${l}</b>${v==="first_n"?` <input type="number" id="firstN" min="1" value="${Math.min(100,s.kept)}" style="width:110px;display:inline-block;margin-left:6px">`:""}</div></label>`).join("")}
+      <div class="row" style="justify-content:space-between;margin-top:12px"><div id="costLine" style="font-weight:600"></div>
+      <div class="row"><button class="btn" id="moreBtn">Collect more</button><button class="btn primary" id="researchBtn">Get emails & phones</button></div></div>
+      <div class="small muted" style="margin-top:8px">You can also untick people in the list below. Unticked people are never researched.</div></div>
+    <div class="card"><div class="row" style="justify-content:space-between;margin-bottom:8px"><h2 style="margin:0">Collected list</h2>
+      <select id="fitFilter" style="width:auto"><option value="">All fits</option><option value="high">Good</option><option value="medium">Maybe</option><option value="low">Poor</option><option value="unrated">Unrated</option></select></div>
+      <div id="chooseTable">${contactTable(rows, "choose")}</div>
+      ${s.kept > 500 ? `<div class="small muted" style="margin-top:6px">Showing the first 500.</div>`:""}</div>`;
+}
+function stageResearching(p) {
+  const s = p.stats, total = s.selected || 1, done = s.submitted - s.pending, pct = Math.min(100, done / total * 100);
+  return `${p.stop_reason ? `<div class="notice info">${esc(p.stop_reason)}</div>` : ""}
+    <div class="card"><h2>${p.status==="paused"?"Research paused":"Getting emails and phones…"}</h2>
+    <div class="bar" style="margin:10px 0"><i style="width:${pct.toFixed(1)}%"></i></div>
+    <div class="row" style="justify-content:space-between"><div><b>${fmt(done)}</b> of ${fmt(s.selected)} done · ${fmt(s.with_email)} with email · ${fmt(s.pending)} waiting on Seamless · ${fmt(s.to_research)} not sent yet · ${fmt(p.research_credits)} research credits</div>
+    ${p.status==="researching" ? `<div class="row"><button class="btn small" id="pauseBtn">Pause</button>${s.to_research?`<button class="btn small" id="stopBtn">Stop sending more</button>`:""}</div>`:""}</div>
+    <div class="small muted" style="margin-top:8px">This runs on the server. You can close this page and come back.</div></div>`;
+}
+async function stageDone(p) {
+  const s = p.stats, rate = s.submitted ? Math.round(s.with_email / s.submitted * 100) : 0;
+  return `${p.stop_reason ? `<div class="notice info">${esc(p.stop_reason)}</div>` : ""}
+    <div class="grid g4" style="margin-bottom:16px">
+      <div class="stat"><div class="k">Researched</div><div class="v">${fmt(s.submitted)}</div><div class="h">people</div></div>
+      <div class="stat"><div class="k">With email</div><div class="v">${fmt(s.with_email)}</div><div class="h">${rate}% hit rate</div></div>
+      <div class="stat"><div class="k">Credits used</div><div class="v">${fmt(p.search_credits + p.research_credits)}</div><div class="h">${s.with_email?`${(((p.search_credits+p.research_credits)/s.with_email)).toFixed(2)} per email`:""}</div></div>
+      <div class="stat"><div class="k">Seamless balance</div><div class="v">${fmt(p.credits.balance)}</div><div class="h">now</div></div></div>
+    <div class="card"><h2>Download</h2><div class="row">
+      <a class="btn primary" id="dlAnav" href="/api/pulls/${p.id}/export?format=anavmail&include_risky=1">AnavMail CSV</a>
+      <label class="switch small"><input type="checkbox" id="risky" checked> include “risky” emails</label>
+      <span class="muted">·</span><a class="btn" href="/api/pulls/${p.id}/export?format=xlsx">Excel (all fields)</a><a class="btn" href="/api/pulls/${p.id}/export?format=full">CSV (all fields)</a></div>
+      <div class="small muted" style="margin-top:8px">AnavMail CSV: email, first_name, last_name, company, title, linkedin. Only people with an email; invalid emails and anything on your do-not-pull list are left out.</div></div>
+    <div class="grid g2"><div class="card"><h3>Hit rate by country</h3><div class="tablewrap"><table><thead><tr><th>Country</th><th class="right">Researched</th><th class="right">With email</th><th class="right">Rate</th></tr></thead><tbody>
+      ${s.hit_rate.map(r=>`<tr><td>${esc(r.country)}</td><td class="right">${fmt(r.researched)}</td><td class="right">${fmt(r.with_email)}</td><td class="right"><b>${r.researched?Math.round(r.with_email/r.researched*100):0}%</b></td></tr>`).join("")}</tbody></table></div></div>
+      <div class="card"><h3>What Seamless returned</h3><div class="tablewrap"><table><tbody>
+      ${s.research_outcomes.map(r=>`<tr><td>${esc(friendly(r.status))}</td><td class="right"><b>${fmt(r.n)}</b></td></tr>`).join("")}</tbody></table></div>
+      <div class="small muted" style="margin-top:8px">“Already researched before” means someone in your Seamless account researched that person earlier; Seamless doesn't charge or return them again here — they're in your Seamless saved contacts.</div></div></div>
+    <div class="card"><div class="tabs" id="resTabs"><button class="on" data-v="results">All</button><button data-v="with_email">With email</button><button data-v="no_email">No email</button></div>
+      <input id="resQ" placeholder="Search name, company, title or email" style="margin-bottom:10px"><div id="resTable"></div></div>`;
+}
+const FRIENDLY = {"done":"Found","not found":"Not found in Seamless","missing":"Not found in Seamless","duplicate":"Already researched before","contact-already-researched":"Already researched before",
+  "error":"Seamless error","no license or credits available":"No credits / license","timed out":"Seamless took too long","no answer":"No result","queued":"Waiting","researching":"Waiting"};
+const friendly = s => FRIENDLY[(s||"").toLowerCase()] || s || "";
+const FITB = {high:["Good","b-ok"],medium:["Maybe","b-warn"],low:["Poor","b-bad"]};
+function contactTable(rows, mode) {
+  if (!rows.length) return '<div class="muted small">Nobody here.</div>';
+  const res = mode === "results";
+  return `<div class="tablewrap"><table><thead><tr>${mode==="choose"?'<th><input type="checkbox" id="allSel" checked style="width:auto"></th>':""}
+    <th>Name</th><th>Title</th><th>Company</th><th>Country</th>${res?"<th>Email</th><th>Phone</th><th>Result</th>":"<th>Fit</th>"}${mode==="preview"?"<th>Status</th>":""}</tr></thead><tbody>
+    ${rows.map(r=>{ const [fl,fc] = FITB[r.fit]||["—",""];
+      return `<tr ${r.kept===0&&mode==="preview"?'style="opacity:.55"':""}>${mode==="choose"?`<td><input type="checkbox" data-sel="${r.id}" ${r.selected?"checked":""} style="width:auto"></td>`:""}
+      <td class="nowrap">${r.li_url?`<a href="${esc(r.li_url.startsWith("http")?r.li_url:"https://"+r.li_url)}" target="_blank" rel="noopener">${esc(r.name)}</a>`:esc(r.name)}</td>
+      <td>${esc(r.title)}</td><td>${esc(r.company)}<div class="small muted">${esc(r.domain)}${r.size?` · ${esc(r.size)}`:""}</div></td><td class="nowrap">${esc(r.country)}</td>
+      ${res ? `<td>${r.email?`${esc(r.email)} ${r.email_status&&r.email_status.toLowerCase()!=="valid"?`<span class="badge b-warn">${esc(r.email_status)}</span>`:""}`:'<span class="muted">—</span>'}</td><td class="nowrap">${esc(r.phone||"")}</td><td class="small">${esc(friendly(r.research_status))}${r.research_message?`<div class="muted">${esc(r.research_message)}</div>`:""}</td>`
+            : `<td><span class="badge ${fc}">${fl}</span>${r.fit_reason?`<div class="small muted">${esc(r.fit_reason)}</div>`:""}</td>`}
+      ${mode==="preview"?`<td class="small">${r.kept?'<span class="badge b-ok">Kept</span>':`<span class="muted">${esc(r.skip_reason)}</span>`}</td>`:""}</tr>`;}).join("")}
+    </tbody></table></div>`;
+}
+
+function wirePull(p) {
+  const id = p.id;
+  if (p.status === "draft") {
+    const ed = $("#editor");
+    let saveTimer;
+    const save = () => { clearTimeout(saveTimer); saveTimer = setTimeout(async () => {
+      try { await api("/api/pulls/" + id, {method:"PATCH", body:{filters: readFilters(ed)}}); } catch(e) { toast(e.message, true); } }, 300); };
+    wireEditor(ed, save);
+    $("#refineBtn").onclick = e => busy(e.currentTarget, async () => {
+      const t = $("#refine").value.trim(); if (!t) return;
+      await api("/api/pulls/" + id, {method:"PATCH", body:{filters: readFilters(ed)}});
+      await api("/api/pulls/interpret", {body:{prompt:t, pull_id:id}}); renderPull(id);
+    });
+    $("#refine").onkeydown = e => { if (e.key === "Enter") $("#refineBtn").click(); };
+    $("#savePreset").onclick = e => busy(e.currentTarget, async () => {
+      const name = $("#presetName").value.trim() || p.name;
+      await api("/api/presets", {body:{name, filters: readFilters(ed), prompt: p.prompt}}); toast("Preset saved.");
+    });
+    $("#previewBtn").onclick = e => busy(e.currentTarget, async () => {
+      clearTimeout(saveTimer);
+      await api("/api/pulls/" + id, {method:"PATCH", body:{filters: readFilters(ed)}});
+      await api(`/api/pulls/${id}/preview`, {body:{}}); renderPull(id);
+    });
+  }
+  if (p.status === "previewed") {
+    const upd = () => { const n = +$("#target").value || 0; $("#est").textContent = n ? `about ${fmt(Math.ceil(n/10))}–${fmt(Math.ceil(n*1.6/10))} credits` : "—"; };
+    $("#target").oninput = upd; upd();
+    $("#backBtn").onclick = e => busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/back-to-filters`, {body:{}}); renderPull(id); });
+    $("#collectBtn").onclick = e => busy(e.currentTarget, async () => {
+      await api(`/api/pulls/${id}/collect`, {body:{target:+$("#target").value, per_company_cap:+$("#cap").value}}); renderPull(id);
+    });
+  }
+  if (p.status === "collected") {
+    const s = p.stats, fit = s.fit || {};
+    const countFor = v => v==="all" ? s.selected : v==="high_medium" ? null : v==="high" ? null : +($("#firstN")?.value||0);
+    const cost = () => {
+      const v = document.querySelector('input[name="choice"]:checked').value;
+      document.querySelectorAll(".radio").forEach(r => r.classList.toggle("on", r.querySelector("input").checked));
+      const sel = [...document.querySelectorAll("[data-sel]")];
+      const ticked = sel.length ? sel.filter(c=>c.checked).length : s.selected;
+      let n;
+      if (v === "all") n = ticked;
+      else if (v === "first_n") n = Math.min(ticked, +($("#firstN").value||0));
+      else n = rowsMatching(v);
+      $("#costLine").textContent = `${fmt(n)} people → ${fmt(n)} research credits`;
+    };
+    const rowsMatching = v => [...document.querySelectorAll("[data-sel]")].filter(c => c.checked && (v==="high" ? ["high",null,""].includes(c.dataset.fit) : c.dataset.fit !== "low")).length;
+    document.querySelectorAll("[data-sel]").forEach(cb => { const r = cb.closest("tr"); cb.dataset.fit = (r.querySelector(".badge")?.textContent||"").replace("Good","high").replace("Maybe","medium").replace("Poor","low").replace("—",""); });
+    document.querySelectorAll('input[name="choice"]').forEach(r => r.onchange = cost);
+    $("#firstN").oninput = cost;
+    cost();
+    const selChange = async (ids, selected) => { try { await api(`/api/pulls/${id}/contacts/select`, {body:{ids, selected}}); cost(); } catch(e) { toast(e.message, true); } };
+    $("#chooseTable").addEventListener("change", e => {
+      if (e.target.dataset.sel) selChange([+e.target.dataset.sel], e.target.checked);
+      if (e.target.id === "allSel") { const boxes = [...document.querySelectorAll("[data-sel]")].filter(b => b.closest("tr").style.display !== "none");
+        boxes.forEach(b => b.checked = e.target.checked); selChange(boxes.map(b=>+b.dataset.sel), e.target.checked); }
+    });
+    $("#fitFilter").onchange = e => { const v = e.target.value;
+      document.querySelectorAll("[data-sel]").forEach(cb => { cb.closest("tr").style.display = !v || (cb.dataset.fit||"unrated") === v ? "" : "none"; }); };
+    $("#moreBtn").onclick = () => {
+      const n = prompt("Collect up to how many people in total?", String(s.kept + 100)); if (!n) return;
+      api(`/api/pulls/${id}/collect`, {body:{target:+n, per_company_cap:p.per_company_cap}}).then(()=>renderPull(id)).catch(e=>toast(e.message,true));
+    };
+    $("#researchBtn").onclick = e => {
+      const v = document.querySelector('input[name="choice"]:checked').value;
+      if (!confirm(`Start research? ${$("#costLine").textContent}. This spends Seamless credits.`)) return;
+      busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/research`, {body:{choice:v, first_n:+($("#firstN").value||0)}}); renderPull(id); });
+    };
+  }
+  if ($("#pauseBtn")) $("#pauseBtn").onclick = e => busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/pause`, {body:{}}); renderPull(id); });
+  if ($("#stopBtn")) $("#stopBtn").onclick = e => { if (!confirm("Stop? Anyone already sent to Seamless still finishes.")) return;
+    busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/cancel`, {body:{}}); renderPull(id); }); };
+  if (p.status === "done") {
+    let view = "results", q = "", t;
+    const load = async () => { const d = await api(`/api/pulls/${id}/contacts?view=${view}&limit=500&q=${encodeURIComponent(q)}`);
+      $("#resTable").innerHTML = contactTable(d.rows, "results") + (d.total > 500 ? `<div class="small muted" style="margin-top:6px">Showing 500 of ${fmt(d.total)}. Download for the full list.</div>` : ""); };
+    $("#resTabs").onclick = e => { if (!e.target.dataset.v) return; view = e.target.dataset.v;
+      document.querySelectorAll("#resTabs button").forEach(b => b.classList.toggle("on", b === e.target)); load(); };
+    $("#resQ").oninput = e => { clearTimeout(t); t = setTimeout(() => { q = e.target.value; load(); }, 250); };
+    $("#risky").onchange = e => $("#dlAnav").href = `/api/pulls/${id}/export?format=anavmail&include_risky=${e.target.checked?1:0}`;
+    load();
+  }
+}
+
+// ------------------------------------------------------------ pulls list
+async function renderPulls() {
+  const rows = (await api("/api/pulls")).rows;
+  setMain(`<h1>Pulls</h1><p class="sub">Every pull you've run. Open one to re-download it or run it again for new people.</p>
+    ${rows.length ? `<div class="tablewrap"><table><thead><tr><th>Pull</th><th>Status</th><th class="right">People</th><th class="right">With email</th><th class="right">Credits</th><th>Started</th></tr></thead><tbody>
+    ${rows.map(r=>{ const [bl,bc] = STATUS_BADGE[r.status]||[r.status,""]; return `<tr><td><a href="#/pull/${r.id}"><b>${esc(r.name)}</b></a><div class="small muted">#${r.id}${r.cloned_from?` · re-run of #${r.cloned_from}`:""}</div></td>
+      <td><span class="badge ${bc}">${bl}</span></td><td class="right">${fmt(r.kept)}${r.target?` <span class="muted">/ ${fmt(r.target)}</span>`:""}</td><td class="right">${fmt(r.with_email)}</td>
+      <td class="right">${fmt(r.search_credits + r.research_credits)}</td><td class="nowrap">${when(r.created_at)}</td></tr>`;}).join("")}</tbody></table></div>`
+    : `<div class="card muted">No pulls yet. <a href="#/new">Start one</a>.</div>`}`);
+}
+
+// ------------------------------------------------------------ presets
+async function renderPresets() {
+  const rows = (await api("/api/presets")).rows;
+  setMain(`<h1>Presets</h1><p class="sub">Saved searches you reuse. Save one from any pull's filter screen.</p>
+    ${rows.length ? `<div class="tablewrap"><table><tbody>${rows.map(p=>`<tr><td><b>${esc(p.name)}</b><div class="small muted">${esc(summarize(p.filters))}</div></td>
+      <td class="right nowrap"><button class="btn small" data-use="${p.id}">New pull from this</button> <button class="btn small danger" data-delp="${p.id}">Delete</button></td></tr>`).join("")}</tbody></table></div>`
+    : `<div class="card muted">No presets yet.</div>`}`);
+  document.querySelectorAll("[data-use]").forEach(b => b.onclick = () => busy(b, async () => { const p = await api(`/api/presets/${b.dataset.use}/use`, {body:{}}); location.hash = "#/pull/" + p.id; }));
+  document.querySelectorAll("[data-delp]").forEach(b => b.onclick = async () => { if (!confirm("Delete this preset?")) return; await api(`/api/presets/${b.dataset.delp}`, {method:"DELETE"}); renderPresets(); });
+}
+
+// ------------------------------------------------------------ exclusions
+async function renderExclusions(q="", offset=0) {
+  const d = await api(`/api/exclusions?q=${encodeURIComponent(q)}&offset=${offset}&limit=50`);
+  const c = d.counts;
+  setMain(`<h1>Do-not-pull list</h1><p class="sub">People and companies this tool never pulls or exports — e.g. your clients, AnavMail suppression list, competitors. Checked before any research credit is spent.</p>
+    <div class="grid g4" style="margin-bottom:16px">
+      <div class="stat"><div class="k">Emails</div><div class="v">${fmt(c.email||0)}</div></div><div class="stat"><div class="k">Domains</div><div class="v">${fmt(c.domain||0)}</div></div>
+      <div class="stat"><div class="k">LinkedIn profiles</div><div class="v">${fmt(c.linkedin||0)}</div></div><div class="stat"><div class="k">Name + company</div><div class="v">${fmt(c.name_company||0)}</div></div></div>
+    <div class="grid g2"><div class="card"><h2>Upload a CSV</h2><p class="small muted">Any CSV with columns like email, domain, linkedin, first_name, last_name, company (an AnavMail leads or suppression export works).</p>
+      <input type="file" id="exFile" accept=".csv,text/csv"><button class="btn primary" id="exUp" style="margin-top:10px">Upload</button></div>
+      <div class="card"><h2>Add by hand</h2><textarea id="exText" rows="4" placeholder="One per line: emails, domains (client.com) or LinkedIn URLs"></textarea><button class="btn" id="exAdd" style="margin-top:10px">Add</button></div></div>
+    <div class="card"><div class="row" style="justify-content:space-between;margin-bottom:10px"><input id="exQ" value="${esc(q)}" placeholder="Search the whole list" style="max-width:320px"><button class="btn small danger" id="exClear">Clear entire list</button></div>
+      ${d.rows.length ? `<div class="tablewrap"><table><thead><tr><th>Value</th><th>Type</th><th>From</th><th></th></tr></thead><tbody>${d.rows.map(r=>`<tr><td>${esc(r.kind==="name_company"?r.value.slice(3).replace("|"," @ "):r.value)}</td><td>${esc(r.kind.replace("_"," + "))}</td><td class="small muted">${esc(r.source)}</td><td class="right"><button class="btn small" data-delx="${esc(r.key)}">Remove</button></td></tr>`).join("")}</tbody></table></div>`
+      : '<div class="muted small">Nothing here.</div>'}
+      <div class="row small" style="justify-content:space-between;margin-top:10px"><span class="muted">${fmt(d.total)} entries</span><div class="row">
+        ${offset>0?`<button class="btn small" id="exPrev">Previous</button>`:""}${offset+50<d.total?`<button class="btn small" id="exNext">Next</button>`:""}</div></div></div>`);
+  $("#exUp").onclick = e => busy(e.currentTarget, async () => { const f = $("#exFile").files[0]; if (!f) return toast("Choose a CSV file.", true);
+    const fd = new FormData(); fd.append("file", f); const r = await api("/api/exclusions/upload", {body:fd}); toast(`Added ${fmt(r.added)} entries.`); renderExclusions(); });
+  $("#exAdd").onclick = e => busy(e.currentTarget, async () => { const r = await api("/api/exclusions", {body:{text:$("#exText").value}}); toast(`Added ${fmt(r.added)} entries.`); renderExclusions(); });
+  let t; $("#exQ").oninput = e => { clearTimeout(t); t = setTimeout(() => renderExclusions(e.target.value, 0).then(()=>{ const el=$("#exQ"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }), 300); };
+  $("#exClear").onclick = async () => { if (!confirm("Remove everything from the do-not-pull list?")) return; await api("/api/exclusions", {method:"DELETE"}); renderExclusions(); };
+  document.querySelectorAll("[data-delx]").forEach(b => b.onclick = async () => { await api(`/api/exclusions?key=${encodeURIComponent(b.dataset.delx)}`, {method:"DELETE"}); renderExclusions(q, offset); });
+  $("#exPrev") && ($("#exPrev").onclick = () => renderExclusions(q, offset - 50));
+  $("#exNext") && ($("#exNext").onclick = () => renderExclusions(q, offset + 50));
+}
+
+// ------------------------------------------------------------ credits
+async function renderCredits() {
+  const d = await api("/api/ledger"), c = d.credits;
+  setMain(`<h1>Credits</h1><p class="sub">Your live Seamless balance (Seamless reports it on every call) and everything this tool has spent.</p>
+    <div class="grid g3" style="margin-bottom:16px">
+      <div class="stat"><div class="k">Seamless balance</div><div class="v">${fmt(c.balance)}</div><div class="h">${c.balance_at?"as of "+when(c.balance_at):"not checked yet"}</div></div>
+      <div class="stat"><div class="k">Spent this month (this tool)</div><div class="v">${fmt(c.spent_this_month)}</div></div>
+      <div class="stat"><div class="k">Monthly budget</div><div class="v">${c.monthly_budget?fmt(c.monthly_budget):"None"}</div><div class="h">${c.budget_left!=null?fmt(c.budget_left)+" left":'<a href="#/settings">Set one</a>'}</div></div></div>
+    <div class="row" style="margin-bottom:12px"><button class="btn" id="chk">Check balance now (free)</button></div>
+    <div class="tablewrap"><table><thead><tr><th>When</th><th>Pull</th><th>What</th><th class="right">Credits</th><th class="right">Balance after</th></tr></thead><tbody>
+    ${d.rows.map(r=>`<tr><td class="nowrap">${when(r.at)}</td><td>${r.pull_id?`<a href="#/pull/${r.pull_id}">${esc(r.pull_name||"#"+r.pull_id)}</a>`:""}</td><td>${esc(r.note)}</td><td class="right">${fmt(r.credits)}</td><td class="right">${fmt(r.balance_after)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Nothing spent yet.</td></tr>'}
+    </tbody></table></div>`);
+  $("#chk").onclick = e => busy(e.currentTarget, async () => { const r = await api("/api/settings/test-seamless", {body:{}}); toast("Balance: " + fmt(r.balance)); await refreshMeta(); route(); });
+}
+
+// ------------------------------------------------------------ settings
+async function renderSettings() {
+  const s = await api("/api/settings");
+  setMain(`<h1>Settings</h1><p class="sub">Keys are stored on the server only and never shown again in the browser.</p>
+    <div class="grid g2"><div class="card"><h2>Seamless.AI</h2>
+      <div class="field"><label>API key ${s.seamless_api_key?`<span class="badge b-ok">${esc(s.seamless_api_key)}</span>`:'<span class="badge b-bad">not set</span>'}</label>
+      ${s.seamless_key_from_env ? '<div class="small muted">Set on the server (SEAMLESS_API_KEY).</div>' : `<input type="password" id="sk" placeholder="Paste a new key to replace it" autocomplete="off"><div class="help">Seamless → Settings → Public API → API Key. Checked with Seamless before saving (free).</div>`}</div>
+      <button class="btn" id="testS">Test connection</button></div>
+    <div class="card"><h2>Claude</h2>
+      <div class="field"><label>API key ${s.anthropic_api_key?`<span class="badge b-ok">${esc(s.anthropic_api_key)}</span>`:'<span class="badge b-bad">not set</span>'}</label>
+      ${s.anthropic_key_from_env ? '<div class="small muted">Set on the server (ANTHROPIC_API_KEY).</div>' : `<input type="password" id="ak" placeholder="Paste a new key to replace it" autocomplete="off"><div class="help">Used to turn your request into filters and to rate fit. From console.anthropic.com.</div>`}</div>
+      <div class="grid g2"><div class="field"><label>Filter model</label><input id="cm" value="${esc(s.claude_model)}"></div><div class="field"><label>Fit-check model</label><input id="cfm" value="${esc(s.claude_fast_model)}"></div></div>
+      <button class="btn" id="testC">Test Claude</button></div></div>
+    <div class="card"><h2>Spending and rules</h2><div class="grid g3">
+      <div class="field"><label>Monthly credit budget</label><input type="number" id="budget" min="0" value="${s.monthly_budget}"><div class="help">This tool won't spend past it in a calendar month. 0 = no budget (Seamless balance still applies).</div></div>
+      <div class="field"><label>Default max people per company</label><input type="number" id="dcap" min="0" value="${s.per_company_cap}"><div class="help">0 = no limit. Can be changed per pull.</div></div>
+      <div class="field"><label>Fit check</label><label class="switch"><input type="checkbox" id="fit" ${s.fit_scoring?"checked":""}> Claude rates each person against your request</label><div class="help">Costs a few cents of Claude usage per 1,000 people. No Seamless credits.</div></div></div>
+    <button class="btn primary" id="saveS">Save settings</button></div>`);
+  $("#saveS").onclick = e => busy(e.currentTarget, async () => {
+    const body = {monthly_budget:+$("#budget").value, per_company_cap:+$("#dcap").value, fit_scoring:$("#fit").checked, claude_model:$("#cm").value, claude_fast_model:$("#cfm").value};
+    if ($("#sk") && $("#sk").value.trim()) body.seamless_api_key = $("#sk").value.trim();
+    if ($("#ak") && $("#ak").value.trim()) body.anthropic_api_key = $("#ak").value.trim();
+    await api("/api/settings", {body}); toast("Saved."); await refreshMeta(); route();
+  });
+  $("#testS").onclick = e => busy(e.currentTarget, async () => { const r = await api("/api/settings/test-seamless", {body:{}}); toast(`Connected. Balance: ${fmt(r.balance)} credits.`); });
+  $("#testC").onclick = e => busy(e.currentTarget, async () => { await api("/api/settings/test-claude", {body:{}}); toast("Claude is working."); });
+}
+
+route().catch(e => toast(e.message, true));
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Secrets and local state: never commit or ship these
+.env
+data/
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+*.tgz
+*.zip

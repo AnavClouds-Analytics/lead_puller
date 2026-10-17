@@ -1,0 +1,211 @@
+"""SQLite storage. One file on disk (DATA_DIR/leadpuller.db), safe for the web threads and the worker."""
+import json
+import os
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
+
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data"))
+DB_PATH = os.path.join(DATA_DIR, "leadpuller.db")
+_lock = threading.RLock()
+_conn = None
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, created_at REAL, email TEXT);
+CREATE TABLE IF NOT EXISTS presets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, prompt TEXT, filters_json TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS pulls (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT, prompt TEXT, filters_json TEXT, notes_json TEXT,
+  status TEXT,              -- draft, previewed, collecting, collected, researching, paused, done, cancelled, failed
+  paused_from TEXT,
+  target INTEGER DEFAULT 0, per_company_cap INTEGER DEFAULT 0,
+  total_matches INTEGER, next_token TEXT, pages_fetched INTEGER DEFAULT 0, rows_seen INTEGER DEFAULT 0,
+  search_credits INTEGER DEFAULT 0, research_credits INTEGER DEFAULT 0,
+  stop_reason TEXT, error TEXT, cloned_from INTEGER,
+  created_at REAL, updated_at REAL, finished_at REAL);
+CREATE TABLE IF NOT EXISTS contacts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pull_id INTEGER, search_result_id TEXT,
+  name TEXT, first_name TEXT, last_name TEXT, title TEXT, company TEXT, domain TEXT,
+  country TEXT, state TEXT, city TEXT, company_country TEXT, li_url TEXT,
+  seniority TEXT, department TEXT, size TEXT, industry TEXT,
+  fit TEXT, fit_reason TEXT,
+  kept INTEGER DEFAULT 1, skip_reason TEXT, selected INTEGER DEFAULT 1,
+  request_id TEXT, research_status TEXT, research_message TEXT, submitted_at REAL,
+  email TEXT, email_status TEXT, email_confidence TEXT, personal_email TEXT,
+  phone TEXT, phone_type TEXT, company_phone TEXT,
+  raw_search TEXT, raw_research TEXT, created_at REAL);
+CREATE INDEX IF NOT EXISTS ix_contacts_pull ON contacts(pull_id);
+CREATE INDEX IF NOT EXISTS ix_contacts_req ON contacts(request_id);
+CREATE TABLE IF NOT EXISTS research_requests (
+  request_id TEXT PRIMARY KEY, pull_id INTEGER, guess_sid TEXT, status TEXT,
+  created_at REAL, resolved_at REAL);
+CREATE INDEX IF NOT EXISTS ix_rr_pull ON research_requests(pull_id, resolved_at);
+CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, pull_id INTEGER, created_at REAL);
+CREATE TABLE IF NOT EXISTS exclusions (key TEXT PRIMARY KEY, kind TEXT, value TEXT, source TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, pull_id INTEGER, kind TEXT, credits INTEGER,
+  balance_after INTEGER, note TEXT);
+"""
+
+# Columns added after a database may already exist (SCHEMA's CREATE IF NOT EXISTS won't add them).
+MIGRATIONS = [
+    ("sessions", "email", "ALTER TABLE sessions ADD COLUMN email TEXT"),
+]
+
+
+def connect():
+    global _conn
+    with _lock:
+        if _conn is None:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            _conn = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
+            _conn.row_factory = sqlite3.Row
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute("PRAGMA foreign_keys=ON")
+            _conn.executescript(SCHEMA)
+            for table, column, sql in MIGRATIONS:
+                if column not in [r["name"] for r in _conn.execute(f"PRAGMA table_info({table})")]:
+                    _conn.execute(sql)
+        return _conn
+
+
+def reset_for_tests(path):
+    """Point the module at a fresh database file (tests only)."""
+    global _conn, DB_PATH, DATA_DIR
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+        _conn = None
+        DATA_DIR = os.path.dirname(path)
+        DB_PATH = path
+
+
+@contextmanager
+def tx():
+    c = connect()
+    with _lock:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            yield c
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+
+
+def q(sql, args=()):
+    c = connect()
+    with _lock:
+        return [dict(r) for r in c.execute(sql, args).fetchall()]
+
+
+def q1(sql, args=()):
+    rows = q(sql, args)
+    return rows[0] if rows else None
+
+
+def x(sql, args=()):
+    c = connect()
+    with _lock:
+        cur = c.execute(sql, args)
+        return cur.lastrowid
+
+
+# ---------- settings ----------
+def get_setting(key, default=None):
+    row = q1("SELECT value FROM settings WHERE key=?", (key,))
+    if row is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except Exception:
+        return row["value"]
+
+
+def set_setting(key, value):
+    x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      (key, json.dumps(value)))
+
+
+# ---------- pulls ----------
+def get_pull(pull_id):
+    p = q1("SELECT * FROM pulls WHERE id=?", (pull_id,))
+    if p:
+        p["filters"] = json.loads(p.pop("filters_json") or "{}")
+        p["notes"] = json.loads(p.pop("notes_json") or "[]")
+    return p
+
+
+def update_pull(pull_id, **fields):
+    if "filters" in fields:
+        fields["filters_json"] = json.dumps(fields.pop("filters"))
+    if "notes" in fields:
+        fields["notes_json"] = json.dumps(fields.pop("notes"))
+    fields["updated_at"] = time.time()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    x(f"UPDATE pulls SET {cols} WHERE id=?", (*fields.values(), pull_id))
+
+
+def create_pull(name, prompt, filters, notes, target=0, per_company_cap=0, cloned_from=None):
+    now = time.time()
+    return x("""INSERT INTO pulls(name,prompt,filters_json,notes_json,status,target,per_company_cap,
+                cloned_from,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+             (name, prompt, json.dumps(filters), json.dumps(notes), "draft", target, per_company_cap,
+              cloned_from, now, now))
+
+
+# ---------- credits ----------
+def log_credits(pull_id, kind, credits, balance_after=None, note=""):
+    x("INSERT INTO ledger(at,pull_id,kind,credits,balance_after,note) VALUES(?,?,?,?,?,?)",
+      (time.time(), pull_id, kind, credits, balance_after, note))
+    if pull_id:
+        col = "search_credits" if kind == "search" else "research_credits"
+        x(f"UPDATE pulls SET {col}={col}+? WHERE id=?", (credits, pull_id))
+
+
+def month_spend():
+    t = time.gmtime()
+    start = time.mktime((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, -1)) - time.timezone
+    row = q1("SELECT COALESCE(SUM(credits),0) AS s FROM ledger WHERE at>=?", (start,))
+    return int(row["s"])
+
+
+# ---------- dedupe ----------
+def norm(s):
+    return " ".join((s or "").lower().replace(",", " ").replace(".", " ").split())
+
+
+def norm_li(url):
+    u = (url or "").strip().lower().split("?")[0].rstrip("/")
+    for p in ("https://", "http://", "www."):
+        if u.startswith(p):
+            u = u[len(p):]
+    if u.startswith("www."):
+        u = u[4:]
+    return u
+
+
+def norm_domain(d):
+    d = (d or "").strip().lower()
+    for p in ("https://", "http://"):
+        if d.startswith(p):
+            d = d[len(p):]
+    d = d.split("/")[0]
+    if d.startswith("www."):
+        d = d[4:]
+    return d
+
+
+def person_keys(name="", company="", li_url="", email=""):
+    keys = []
+    if li_url and norm_li(li_url):
+        keys.append("li:" + norm_li(li_url))
+    if name and company:
+        keys.append("nc:" + norm(name) + "|" + norm(company))
+    if email:
+        keys.append("em:" + email.strip().lower())
+    return keys
