@@ -13,7 +13,9 @@ BASE_URL = os.environ.get("SEAMLESS_BASE_URL", "https://api.seamless.ai/api/clie
 # Tests swap this for an httpx.MockTransport.
 TRANSPORT = None
 
-PER_MINUTE = 55  # Seamless default is 60/min per endpoint, shared across the org; stay a little under.
+# Seamless allows 60/min per endpoint for the whole org, shared with AnavScout on the same account.
+# Take about half so a pull here never starves AnavScout's nightly run (a 1,000-person pull needs ~50 calls).
+PER_MINUTE = int(os.environ.get("SEAMLESS_PER_MINUTE", 30))
 
 TERMINAL = {"done", "error", "missing", "duplicate", "not found", "contact-already-researched",
             "no license or credits available"}
