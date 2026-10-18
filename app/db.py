@@ -54,10 +54,30 @@ CREATE TABLE IF NOT EXISTS companies (
 CREATE TABLE IF NOT EXISTS searches (
   hash TEXT PRIMARY KEY, filters_json TEXT, cursor TEXT, cursor_pull_id INTEGER, cursor_at REAL,
   results_seen INTEGER DEFAULT 0, exhausted_at REAL, runs INTEGER DEFAULT 0, last_pull_id INTEGER, updated_at REAL);
+CREATE TABLE IF NOT EXISTS batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, pull_id INTEGER, created_at REAL, count INTEGER, split TEXT,
+  include_risky INTEGER, extras INTEGER, countries_json TEXT);
+CREATE TABLE IF NOT EXISTS column_sets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, columns_json TEXT,
+  created_at REAL);
+CREATE TABLE IF NOT EXISTS downloaded (email TEXT PRIMARY KEY, batch_id INTEGER, at REAL);
+CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY, has_mx INTEGER, detail TEXT, checked_at REAL);
 CREATE TABLE IF NOT EXISTS ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, pull_id INTEGER, kind TEXT, credits INTEGER,
   balance_after INTEGER, note TEXT);
 """
+
+
+MIGRATIONS = {
+    "pulls": [("company_cooldown", "INTEGER"), ("search_hash", "TEXT"), ("started_from", "TEXT"),
+              ("from_top", "INTEGER DEFAULT 0"), ("test_size", "INTEGER DEFAULT 0"), ("test_state", "TEXT"),
+              ("test_rate", "REAL"), ("bal_before", "INTEGER"), ("bal_after", "INTEGER")],
+    "contacts": [("timezone", "TEXT"), ("funding", "TEXT"), ("news", "TEXT"), ("title_started_at", "TEXT"),
+                 ("last_modified_at", "TEXT"), ("email_chance", "REAL"), ("retry", "INTEGER DEFAULT 0"),
+                 ("batch_id", "INTEGER"), ("filled_free", "INTEGER DEFAULT 0"), ("email_pick", "TEXT")],
+    "seen": [("outcome", "TEXT"), ("outcome_at", "REAL")],
+    "companies": [("tried", "INTEGER DEFAULT 0"), ("tried_last_at", "REAL")],
+    "batches": [("columns_json", "TEXT")],
+}
 
 
 def connect():
@@ -70,12 +90,13 @@ def connect():
             _conn.execute("PRAGMA journal_mode=WAL")
             _conn.execute("PRAGMA foreign_keys=ON")
             _conn.executescript(SCHEMA)
-            for col, typ in (("company_cooldown", "INTEGER"), ("search_hash", "TEXT"), ("started_from", "TEXT"),
-                             ("from_top", "INTEGER DEFAULT 0")):
-                try:
-                    _conn.execute(f"ALTER TABLE pulls ADD COLUMN {col} {typ}")
-                except sqlite3.OperationalError:
-                    pass
+            # Upgrades for databases made by older versions: add any missing columns (never drops data).
+            for table, cols in MIGRATIONS.items():
+                have = {r[1] for r in _conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                for col, typ in cols:
+                    if col not in have:
+                        _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+            _conn.execute("CREATE INDEX IF NOT EXISTS ix_contacts_batch ON contacts(batch_id)")
         return _conn
 
 
@@ -162,6 +183,18 @@ def update_pull(pull_id, **fields):
     fields["updated_at"] = time.time()
     cols = ", ".join(f"{k}=?" for k in fields)
     x(f"UPDATE pulls SET {cols} WHERE id=?", (*fields.values(), pull_id))
+
+
+def with_defaults(filters):
+    """New pulls start with the .env defaults for the 'fewer people without email' filters."""
+    f = dict(filters or {})
+    if cfg.UPDATED_WITHIN_MONTHS and "updatedWithinMonths" not in f:
+        f["updatedWithinMonths"] = cfg.UPDATED_WITHIN_MONTHS
+    if cfg.REQUIRE_COMPANY_WEBSITE and "requireCompanyWebsite" not in f:
+        f["requireCompanyWebsite"] = True
+    if cfg.REQUIRE_LINKEDIN and "requireLinkedIn" not in f:
+        f["requireLinkedIn"] = True
+    return f
 
 
 def create_pull(name, prompt, filters, notes, target=0, per_company_cap=None, cloned_from=None, cooldown=None):

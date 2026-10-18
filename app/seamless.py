@@ -145,7 +145,10 @@ def test_connection(key=None):
 
 
 def lookup_location(text, types):
-    resp = _request("GET", "/search/locations", "locations", params={"q": text, "limit": 5, "types": types})
+    params = {"q": text, "limit": 5}
+    if types:
+        params["types"] = types
+    resp = _request("GET", "/search/locations", "locations", params=params)
     return _safe_json(resp).get("data") or []
 
 
@@ -165,15 +168,18 @@ def search_contacts(body, limit, next_token=None, pull_id=None):
     return rows, sup
 
 
-def research_contacts(search_result_ids, pull_id=None):
-    """Submit up to 500 searchResultIds for research (1 credit each). Returns requestIds in order."""
-    resp = _request("POST", "/contacts/research", "research_contacts",
-                    json={"searchResultIds": list(search_result_ids)}, safe_to_retry=False)
+def research_contacts(search_result_ids, pull_id=None, skip_dedup=False):
+    """Submit up to 500 searchResultIds for research (1 credit each). Returns requestIds.
+    skip_dedup=True asks Seamless to look again at people your org researched before (charged)."""
+    body = {"searchResultIds": list(search_result_ids)}
+    if skip_dedup:
+        body["skipDeduplicationCheck"] = True
+    resp = _request("POST", "/contacts/research", "research_contacts", json=body, safe_to_retry=False)
     data = _safe_json(resp)
     ids = data.get("requestIds") or []
     if ids:
         db.log_credits(pull_id, "research", len(ids), db.get_setting("credit_balance"),
-                       f"research {len(ids)} contacts")
+                       f"research {len(ids)} contacts" + (" (retry, fresh look)" if skip_dedup else ""))
     return ids
 
 

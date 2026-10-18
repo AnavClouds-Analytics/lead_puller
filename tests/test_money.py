@@ -119,7 +119,7 @@ def test_two_pulls_collected_at_once_dont_both_pay(env):
         run_until(client, pid, {"done"})
     check_books(fake)
     check_people(client, fake)
-    second = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Already researched in pull%'",
+    second = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Already pulled before%'",
                    (ids[1],))["n"]
     assert second > 0
 
@@ -135,15 +135,27 @@ def test_company_cooldown_skips_and_release(env):
     client, fake, _, _ = env
     f = {"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]}
     a = full_pull(client, target=80, cap=0, filters=f)
+    tried = {db.company_key(r["company"], r["domain"]) for r in
+             db.q("SELECT company, domain FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (a["id"],))}
     a_companies = {db.company_key(r["company"], r["domain"]) for r in
-                   db.q("SELECT company, domain FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (a["id"],))}
-    assert db.q1("SELECT COUNT(*) n FROM companies")["n"] == len(a_companies)
+                   db.q("""SELECT company, domain FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL
+                           AND email IS NOT NULL AND email!=''""", (a["id"],))}
+    no_email_only = tried - a_companies
+    assert db.q1("SELECT COUNT(*) n FROM companies")["n"] == len(tried)
+    assert db.q1("SELECT COUNT(*) n FROM companies WHERE last_at IS NOT NULL")["n"] == len(a_companies)
+    assert no_email_only, "test data should have companies where nobody got an email"
 
     b = full_pull(client, target=60, cap=0, filters={"contactCountry": ["United States", "Canada"], "seniority": ["C-Level", "VP"]})
     b_kept = db.q("SELECT company, domain FROM contacts WHERE pull_id=? AND kept=1", (b["id"],))
     assert not ({db.company_key(r["company"], r["domain"]) for r in b_kept} & a_companies)
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company pulled%'",
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company emailed%'",
                  (b["id"],))["n"] > 0
+    # companies where nobody got an email are NOT on cooldown: their other people can come through
+    b_all = {db.company_key(r["company"], r["domain"]) for r in
+             db.q("SELECT company, domain FROM contacts WHERE pull_id=?", (b["id"],))}
+    for r in db.q("SELECT company, domain, skip_reason FROM contacts WHERE pull_id=?", (b["id"],)):
+        if db.company_key(r["company"], r["domain"]) in no_email_only:
+            assert not (r["skip_reason"] or "").startswith("Company emailed")
 
     # release one company -> it can come back; block one -> never
     rel = sorted(a_companies)[0]
@@ -173,7 +185,7 @@ def test_cooldown_expires(env):
     c = new_pull(client)
     client.patch(f"/api/pulls/{c['id']}", json={"filters": f})
     client.post(f"/api/pulls/{c['id']}/preview", json={"from_top": True})
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company pulled%'",
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company emailed%'",
                  (c["id"],))["n"] == 0
 
 
@@ -186,7 +198,7 @@ def test_cooldown_zero_means_off(env, monkeypatch):
     assert c["company_cooldown"] == 0
     client.patch(f"/api/pulls/{c['id']}", json={"filters": f})
     client.post(f"/api/pulls/{c['id']}/preview", json={"from_top": True})
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company pulled%'",
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company emailed%'",
                  (c["id"],))["n"] == 0
 
 
@@ -207,7 +219,7 @@ def test_same_search_continues_where_it_stopped(env):
     b = client.post(f"/api/pulls/{b['id']}/preview", json={"from_top": True}).json()
     assert not b["started_from"]
     assert db.q1("""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND
-                    (skip_reason LIKE 'Already pulled%' OR skip_reason LIKE 'Company pulled%')""", (b["id"],))["n"] > 0
+                    (skip_reason LIKE 'Already pulled%' OR skip_reason LIKE 'Company emailed%')""", (b["id"],))["n"] > 0
 
 
 def test_expired_saved_position_falls_back_to_top(env):

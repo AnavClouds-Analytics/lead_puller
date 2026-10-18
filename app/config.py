@@ -6,6 +6,7 @@ Nothing here needs a code change.
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+APP_VERSION = "1.2.0"
 
 
 def _load_dotenv(path):
@@ -76,6 +77,42 @@ class Config:
     def FIT_CHECK(self): return _b("FIT_CHECK", True)
     @property
     def CONTINUE_SAME_SEARCH(self): return _b("CONTINUE_SAME_SEARCH", True)
+    @property
+    def SPENDING_ENABLED(self): return _b("SPENDING_ENABLED", True)
+    @property
+    def LOW_BALANCE_WARNING(self): return max(0, _i("LOW_BALANCE_WARNING", 500))
+
+    # --- fewer people without email
+    @property
+    def UPDATED_WITHIN_MONTHS(self): return max(0, _i("UPDATED_WITHIN_MONTHS", 12))
+    @property
+    def REQUIRE_COMPANY_WEBSITE(self): return _b("REQUIRE_COMPANY_WEBSITE", True)
+    @property
+    def REQUIRE_LINKEDIN(self): return _b("REQUIRE_LINKEDIN", False)
+    @property
+    def SKIP_NO_EMAIL_SERVER(self): return _b("SKIP_NO_EMAIL_SERVER", True)
+    @property
+    def DNS_TIMEOUT_SECONDS(self): return max(1, _i("DNS_TIMEOUT_SECONDS", 3))
+    @property
+    def TEST_BATCH_SIZE(self): return max(0, _i("TEST_BATCH_SIZE", 100))
+    @property
+    def TEST_BATCH_MIN_EMAIL_RATE(self): return max(0, min(_i("TEST_BATCH_MIN_EMAIL_RATE", 60), 100))
+    @property
+    def EMAIL_CHANCE_MIN(self): return max(0, min(_i("EMAIL_CHANCE_MIN", 60), 100))
+    @property
+    def EMAIL_CHANCE_MIN_SAMPLES(self): return max(5, _i("EMAIL_CHANCE_MIN_SAMPLES", 30))
+    @property
+    def NO_EMAIL_RETRY_DAYS(self): return max(0, _i("NO_EMAIL_RETRY_DAYS", 0))
+
+    # --- downloads
+    @property
+    def EMAIL_PICK(self):
+        v = _s("EMAIL_PICK", "best").lower()
+        return v if v in ("best", "seamless") else "best"
+    @property
+    def DEFAULT_BATCH_SIZE(self): return max(1, _i("DEFAULT_BATCH_SIZE", 500))
+    @property
+    def DEFAULT_EXPORT_COLUMNS(self): return _s("DEFAULT_EXPORT_COLUMNS", "email,first_name,last_name,company")
 
     # --- Seamless API behaviour
     @property
@@ -118,7 +155,24 @@ SHOWN = [
         ("MAX_PER_COMPANY", "", "Default max people per company in one pull (0 = no limit)"),
         ("COMPANY_COOLDOWN_DAYS", "", "Skip companies pulled in the last N days, across all pulls (0 = off)"),
         ("FIT_CHECK", "", "1 = Claude rates each person against your request"),
-        ("CONTINUE_SAME_SEARCH", "", "1 = a repeated search starts where the last one stopped")]),
+        ("CONTINUE_SAME_SEARCH", "", "1 = a repeated search starts where the last one stopped"),
+        ("SPENDING_ENABLED", "", "0 = master switch: stop all Seamless spending (search and research)"),
+        ("LOW_BALANCE_WARNING", "", "Red banner when the Seamless balance is below this (0 = off)")]),
+    ("Fewer people without email", [
+        ("UPDATED_WITHIN_MONTHS", "", "Default: only contacts Seamless updated in the last N months (0 = any age)"),
+        ("REQUIRE_COMPANY_WEBSITE", "", "Default: skip people whose company has no website (1 = on)"),
+        ("REQUIRE_LINKEDIN", "", "Default: skip people with no LinkedIn profile (1 = on)"),
+        ("SKIP_NO_EMAIL_SERVER", "", "1 = skip companies whose domain has no email server (free check)"),
+        ("DNS_TIMEOUT_SECONDS", "", "Seconds to wait for that email-server check"),
+        ("TEST_BATCH_SIZE", "", "Research this many first, then check the email rate (0 = off)"),
+        ("TEST_BATCH_MIN_EMAIL_RATE", "", "Pause if the test batch's email rate is below this %"),
+        ("EMAIL_CHANCE_MIN", "", "Default % for “only people with email chance ≥ X%”"),
+        ("EMAIL_CHANCE_MIN_SAMPLES", "", "People of a kind researched before the tool trusts its email chance"),
+        ("NO_EMAIL_RETRY_DAYS", "", "Retry people who had no email after N days, paying again (0 = never)")]),
+    ("Downloads", [
+        ("EMAIL_PICK", "", "best = per person, the email with the best status and highest confidence; seamless = Seamless's primary"),
+        ("DEFAULT_BATCH_SIZE", "", "Number pre-filled in “Download next …”"),
+        ("DEFAULT_EXPORT_COLUMNS", "", "Columns ticked by default in the AnavMail download, in order (see README for all names)")]),
     ("Seamless API", [
         ("PREVIEW_SIZE", "", "People fetched in Preview (1 credit per 10)"),
         ("PAGE_SIZE", "", "People per search page while collecting"),

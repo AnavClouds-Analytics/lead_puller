@@ -6,20 +6,22 @@ import os
 import tempfile
 
 os.environ.update({"APP_PASSWORD": "demo-pass-1", "SEAMLESS_API_KEY": "good-key", "ANTHROPIC_API_KEY": "claude-key",
-                   "POLL_SECONDS": "1"})
+                   "POLL_SECONDS": "1", "TEST_BATCH_SIZE": "30", "TEST_BATCH_MIN_EMAIL_RATE": "60",
+                   "LOW_BALANCE_WARNING": "500", "UPDATED_WITHIN_MONTHS": "12", "EMAIL_CHANCE_MIN_SAMPLES": "20"})
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="leadpuller-demo-"))
 os.environ["ENV_FILE"] = os.path.join(os.environ["DATA_DIR"], "no.env")
 
 import httpx
 import uvicorn
 
-from app import claude, db, seamless
+from app import claude, db, dnscheck, seamless
 from tests.fakes import FakeClaude, FakeSeamless
 
 fake_s = FakeSeamless()
 fake_s.chaos_poll = True
 seamless.TRANSPORT = httpx.MockTransport(fake_s.handler)
 claude.TRANSPORT = httpx.MockTransport(FakeClaude().handler)
+dnscheck.LOOKUP = lambda d: "no" if d in ("acme13.com", "acme26.com") else "yes"
 db.reset_for_tests(os.path.join(os.environ["DATA_DIR"], "leadpuller.db"))
 
 if __name__ == "__main__":

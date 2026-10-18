@@ -9,7 +9,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import claude, db, main, seamless, worker
+from app import claude, db, dnscheck, main, seamless, worker
 from tests.fakes import FakeClaude, FakeSeamless
 
 
@@ -29,8 +29,14 @@ class Clock:
 def env(tmp_path, monkeypatch):
     for k, v in {"APP_PASSWORD": "secret-pass", "SEAMLESS_API_KEY": "good-key", "ANTHROPIC_API_KEY": "claude-key",
                  "DATA_DIR": str(tmp_path), "MONTHLY_CREDIT_BUDGET": "0", "MAX_PER_COMPANY": "3",
-                 "COMPANY_COOLDOWN_DAYS": "90", "FIT_CHECK": "1", "CONTINUE_SAME_SEARCH": "1"}.items():
+                 "COMPANY_COOLDOWN_DAYS": "90", "FIT_CHECK": "1", "CONTINUE_SAME_SEARCH": "1",
+                 # v1.2 features are off here unless a test turns them on, so the v1.1 money tests stay exact
+                 "UPDATED_WITHIN_MONTHS": "0", "REQUIRE_COMPANY_WEBSITE": "0", "REQUIRE_LINKEDIN": "0",
+                 "TEST_BATCH_SIZE": "0", "SKIP_NO_EMAIL_SERVER": "1", "NO_EMAIL_RETRY_DAYS": "0",
+                 "LOW_BALANCE_WARNING": "0", "SPENDING_ENABLED": "1", "EMAIL_PICK": "best",
+                 "DEFAULT_EXPORT_COLUMNS": "email,first_name,last_name,company"}.items():
         monkeypatch.setenv(k, v)
+    dnscheck.LOOKUP = lambda d: "yes"
     db.reset_for_tests(str(tmp_path / "t.db"))
     clock = Clock()
     fake_s, fake_c = FakeSeamless(seed=int(os.environ.get("FAKE_SEED", "1"))), FakeClaude()
@@ -43,6 +49,8 @@ def env(tmp_path, monkeypatch):
     worker.POLL_EVERY = 0
     worker._last_poll.clear()
     worker._failures.clear()
+    worker._saved_cache.clear()
+    worker._fill_stop.clear()
     client = TestClient(main.app)
     client.__enter__()
     assert client.post("/api/auth/login", json={"password": "secret-pass"}).status_code == 200
@@ -110,16 +118,17 @@ def check_books(fake):
         assert s == p["search_credits"] + p["research_credits"]
 
 
-def check_people(client, fake):
+def check_people(client, fake, retries_allowed=False):
     """No one is paid for twice, nobody gets someone else's details, and exports are clean."""
-    # 1. each person charged for research at most once, ever
-    assert all(n <= 1 for n in fake.researched_pids.values()), "someone was charged twice"
+    # 1. each person charged for research at most once, ever (unless a test turned on paid retries)
+    if not retries_allowed:
+        assert all(n <= 1 for n in fake.researched_pids.values()), "someone was charged twice"
     # 2. each searchResultId sent for research at most once
     sent = [r["sid"] for r in fake.requests.values()]
     resent = {s for s in sent if sent.count(s) > 1}
     # (re-sends are only allowed after an unconfirmed batch, and then Seamless doesn't charge)
     for s in resent:
-        assert fake.researched_pids.get(fake.sid_to_pid[s], 0) <= 1
+        assert retries_allowed or fake.researched_pids.get(fake.sid_to_pid[s], 0) <= 1
     # 3. every stored detail belongs to the right person
     for c in db.q("SELECT * FROM contacts WHERE submitted_at IS NOT NULL"):
         pid = fake.sid_to_pid[c["search_result_id"]]
@@ -143,3 +152,39 @@ def check_people(client, fake):
             assert email.split("@")[1] not in excluded
             c = db.q1("SELECT email_status FROM contacts WHERE pull_id=? AND LOWER(email)=?", (p["id"], email))
             assert (c["email_status"] or "").lower() != "invalid"
+
+    check_batches(client, fake)
+
+
+def batch_rows(client, bid):
+    r = client.get(f"/api/batches/{bid}/download")
+    assert r.status_code == 200, r.text
+    if r.headers["content-type"].startswith("application/zip"):
+        import zipfile
+        out = {}
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            for name in z.namelist():
+                out[name] = list(csv.DictReader(io.StringIO(z.read(name).decode("utf-8-sig"))))
+        return out
+    return list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+
+
+def check_batches(client, fake):
+    """Across ALL batches ever made: no email twice, every row is the right person, no invalid emails."""
+    all_emails = []
+    for b in db.q("SELECT * FROM batches"):
+        got = batch_rows(client, b["id"])
+        rows = [r for rs in got.values() for r in rs] if isinstance(got, dict) else got
+        assert len(rows) == b["count"], f"batch {b['id']} file has {len(rows)} rows, says {b['count']}"
+        for r in rows:
+            e = r["email"].lower()
+            all_emails.append(e)
+            pid = pid_from_email(e) if ".p" in e else None
+            c = db.q1("SELECT * FROM contacts WHERE LOWER(email)=? AND batch_id=?", (e, b["id"]))
+            assert c, f"{e} in batch file but not in batch"
+            assert (c["email_status"] or "").lower() != "invalid"
+            if pid is not None and "first_name" in r:
+                assert r["first_name"] == fake.by_pid[pid]["first"]
+            if pid is not None and "company" in r:
+                assert r["company"] == fake.by_pid[pid]["company"]
+    assert len(all_emails) == len(set(all_emails)), "the same email went out in two batches"

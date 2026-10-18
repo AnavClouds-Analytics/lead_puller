@@ -107,6 +107,11 @@ def _filter_schema():
         elif f["kind"] == "text_list":
             props[f["key"]] = {"type": "array", "items": {"type": "string"}, "maxItems": f.get("max", 10),
                                "description": desc}
+        elif f["kind"] == "bool":
+            props[f["key"]] = {"type": "boolean", "description": desc}
+        elif f["kind"] == "int":
+            props[f["key"]] = {"type": "integer", "minimum": f.get("min", 0), "maximum": f.get("max", 1000),
+                               "description": desc}
         elif f["kind"] == "choice":
             if True in f["options"]:
                 props[f["key"]] = {"type": "boolean", "description": desc}
@@ -128,7 +133,12 @@ contact search API. Rules:
   Staffing & Recruiting plus excludeCompanyWords staffing, recruit).
 - notes: one short plain-English line for every interpretation you made that the user might disagree with \
   (e.g. "Read 'mid-size' as 51-1,000 employees."), and anything you could not express as a filter.
-- target: the number of people the user asked for, or 0 if they did not say.
+- Only set updatedWithinMonths, requireCompanyWebsite, requireLinkedIn, roleMinMonths/roleMaxYears,
+  pastCompany, titleMustContain, excludeCountries or excludeSeniority when the request asks for it
+  (the tool applies its own defaults for freshness, website and LinkedIn).
+- When the user names exact roles ("only CTOs"), also put the key words in titleMustContain.
+- "<role> level" (e.g. "CTO level") is ambiguous: choose one reading and say which in notes.
+- target: the number of people the user asked for, or 0 if they did not say or said "all".
 - name: a short name for this pull, 2-6 words."""
 
 

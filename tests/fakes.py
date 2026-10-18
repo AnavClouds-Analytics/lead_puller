@@ -40,6 +40,10 @@ def make_people(n=400, seed=7):
         elif i % 4 == 0:
             li = f"http://linkedin.com/in/{first.lower()}-{i}?trk=x"   # variant spelling of same kind of URL
         people.append({
+            "lastModifiedAt": "2023-01-15 10:00:00" if i % 6 == 0 else "2026-08-01 10:00:00",
+            "titleStartedAt": "2026-09-01" if i % 10 == 0 else "2021-03-01",
+            "timezone": "Eastern (EST)" if i % 2 else "Pacific (PST)",
+            "funding": (["Series A"], "2026-06-01") if i % 7 == 0 else None,
             "pid": i, "first": first, "last": last, "name": f"{first} {last}",
             "company": company, "domain": domain, "title": TITLES[i % len(TITLES)],
             "seniority": "C-Level" if i % 3 == 0 else "VP", "department": "Engineering",
@@ -81,6 +85,12 @@ class FakeSeamless:
         self.token_ttl = None             # seconds; older paging tokens are rejected with 400
         self.shuffle_request_ids = False  # answer research with requestIds in a different order than sent
         self.email_override = {}          # pid -> email (e.g. a shared info@ address)
+        self.alt_emails = {}              # pid -> extra email records (email2/email3) to test picking
+        self.charge_not_found = True      # False: Seamless gives the credit back when it finds no email
+        self.found_later = set()          # pids that have an email only on a fresh look (skipDeduplicationCheck)
+        self.saved_searches = {}          # savedSearchId -> list of pids
+        self.searches = []                # every search body received
+        self.saved = {}                   # pid -> record: people your org has an email for (org contacts)
         self.clock = time.time
 
     # ------------------------------------------------------------------ helpers
@@ -96,21 +106,31 @@ class FakeSeamless:
         self.charges.append((kind, n))
 
     def _search_row(self, p, sid):
-        return {"searchResultId": sid, "name": p["name"], "company": p["company"], "domain": p["domain"],
-                "title": p["title"], "seniority": p["seniority"], "department": p["department"],
-                "country": p["country"], "state": "", "city": "", "companyCountry": p["country"],
-                "liUrl": p["liUrl"], "industries": p["industries"], "employeeSizeRange": p["employeeSizeRange"]}
+        row = {"searchResultId": sid, "name": p["name"], "company": p["company"], "domain": p["domain"],
+               "title": p["title"], "seniority": p["seniority"], "department": p["department"],
+               "country": p["country"], "state": "", "city": "Springfield", "companyCountry": p["country"],
+               "liUrl": p["liUrl"], "industries": p["industries"], "employeeSizeRange": p["employeeSizeRange"],
+               "lastModifiedAt": p["lastModifiedAt"], "titleStartedAt": p["titleStartedAt"], "timezone": p["timezone"],
+               "newsAndEvents": [{"title": "=cmd|' /C calc'!A0" if p["pid"] % 2 == 0 else "Opens new office",
+                                  "type": "Expansion", "date": "2026-09-10T00:00:00Z"}] if p["pid"] % 3 == 0 else []}
+        if p["funding"]:
+            row["companyLatestFundingClassifications"], row["companyLatestFundingDate"] = p["funding"]
+        return row
 
-    def contact_record(self, p):
+    def contact_record(self, p, fresh=False):
         i = p["pid"]
         has_email = not (p["country"] in ("Germany", "Israel") and i % 2 == 0)
         email = self.email_override.get(i) or (email_for(p) if has_email else None)
+        if fresh and i in self.found_later:
+            email = email_for(p)
         status = "invalid" if i % 23 == 0 else ("risky" if i % 5 == 0 else "valid")
-        return {"firstName": p["first"], "lastName": p["last"], "fullName": p["name"],
+        rec = {"firstName": p["first"], "lastName": p["last"], "fullName": p["name"],
                 "email": email, "email1": email, "email1EmailAI": status, "email1TotalAI": "95%",
                 "contactPhone1": f"415.555.{i:04d}", "contactPhone1DataType": "mobile",
                 "companyName": p["company"], "jobTitle": p["title"], "lIProfileUrl": p["liUrl"],
                 "companyDomain": p["domain"], "country": p["country"]}
+        rec.update(self.alt_emails.get(i, {}))
+        return rec
 
     # ------------------------------------------------------------------ router
     def handler(self, request: httpx.Request):
@@ -138,17 +158,38 @@ class FakeSeamless:
 
     def locations(self, request):
         q = request.url.params.get("q", "").lower()
-        known = ["United States", "Canada", "Israel", "Germany", "United Kingdom", "Netherlands"]
-        hits = [{"location": k, "type": "country", "count": 1000} for k in known if k.lower().startswith(q)]
+        known = ["United States", "Canada", "Israel", "Germany", "United Kingdom", "Netherlands",
+                 "Austin, Texas, United States", "Toronto, Ontario, Canada"]
+        hits = [{"location": k, "type": "country" if "," not in k else "city-state-country", "count": 1000}
+                for k in known if k.lower().startswith(q)]
         return self._resp(200, {"data": hits})
 
     def search(self, request):
         body = json.loads(request.content)
-        countries = set(body.get("contactCountry") or [])
-        titles = set(body.get("jobTitle") or [])
-        pool = [p for p in self.people if (not countries or p["country"] in countries)]
-        if titles == {"Head of IT"}:
-            pool = [p for p in pool if p["title"] == "Head of IT"]
+        self.searches.append(body)
+        if body.get("savedSearchId") is not None:
+            others = [k for k in body if k not in ("savedSearchId", "limit", "nextToken", "page")]
+            if others:
+                return self._resp(400, {"message": f"savedSearchId cannot be combined with {others}"})
+            pids = self.saved_searches.get(int(body["savedSearchId"]))
+            if pids is None:
+                return self._resp(404, {"message": "saved search not found"})
+            pool = [self.by_pid[i] for i in pids]
+        else:
+            vals = body.get("contactCountry") or []
+            inc = {v for v in vals if not v.startswith("-")}
+            exc = {v[1:] for v in vals if v.startswith("-")}
+            titles = set(body.get("jobTitle") or [])
+            pool = [p for p in self.people if (not inc or p["country"] in inc) and p["country"] not in exc]
+            if titles == {"Head of IT"}:
+                pool = [p for p in pool if p["title"] == "Head of IT"]
+            if body.get("titlesExactMatch"):
+                pool = [p for p in pool if p["title"] in titles]
+            if body.get("lastModifiedAfter"):
+                cut = body["lastModifiedAfter"][:10]
+                pool = [p for p in pool if p["lastModifiedAt"][:10] >= cut]
+            if body.get("pastCompany") is not None:
+                assert body["pastCompany"]["names"], "pastCompany needs names"
         key = json.dumps({k: v for k, v in body.items() if k not in ("limit", "nextToken")}, sort_keys=True)
         start = 0
         if body.get("nextToken"):
@@ -186,8 +227,9 @@ class FakeSeamless:
         if fail == "500_before_charge":
             self.research_fail_next = None
             return self._resp(500, {"message": "boom"})
-        new = [s for s in sids if self.sid_to_pid.get(s) is not None
-               and self.sid_to_pid[s] not in self.researched_pids and self.sid_to_pid[s] not in self.already_in_org]
+        fresh = bool(body.get("skipDeduplicationCheck"))
+        new = [s for s in sids if self.sid_to_pid.get(s) is not None and (fresh or (
+               self.sid_to_pid[s] not in self.researched_pids and self.sid_to_pid[s] not in self.already_in_org))]
         if self.balance < len(new):
             return self._resp(422, {"code": "insufficientCredits", "msg": "no credits",
                                     "data": {"additionalCreditsNeeded": len(new) - self.balance}})
@@ -195,13 +237,16 @@ class FakeSeamless:
         for sid in sids:
             pid = self.sid_to_pid.get(sid)
             rid = f"rq{len(self.requests)}x{self.rnd.randint(100, 999)}"
-            dup = pid in self.researched_pids or pid in self.already_in_org
+            dup = (pid in self.researched_pids or pid in self.already_in_org) and not fresh
             if pid is not None and not dup:
                 self.charge("research", 1)
                 self.researched_pids[pid] = self.researched_pids.get(pid, 0) + 1
+                rec = self.contact_record(self.by_pid[pid], fresh=fresh)
+                if rec.get("email") and not (pid % 11 == 0 and not (fresh and pid in self.found_later)):
+                    self.saved[pid] = rec            # Seamless researched them: in your saved contacts now
             elif pid is not None:
                 self.researched_pids[pid] = self.researched_pids.get(pid, 0)
-            self.requests[rid] = {"sid": sid, "pid": pid, "dup": dup, "polls": 0,
+            self.requests[rid] = {"sid": sid, "pid": pid, "dup": dup, "polls": 0, "fresh": fresh, "refunded": False,
                                   "need": self.rnd.randint(1, 4) if self.chaos_poll else 1}
             ids.append(rid)
         if fail == "500_after_charge":
@@ -235,10 +280,16 @@ class FakeSeamless:
                 row.update(status=self.rnd.choice(["queued", "researching"]))
             elif req["dup"]:
                 row.update(status="duplicate")
-            elif pid % 11 == 0:
+            elif pid % 11 == 0 and not (req["fresh"] and pid in self.found_later):
                 row.update(status="not found", message="")
+                self._maybe_refund(req)
             else:
-                row.update(status="done", contact=self.contact_record(self.by_pid[pid]))
+                rec = self.contact_record(self.by_pid[pid], fresh=req["fresh"])
+                row.update(status="done", contact=rec)
+                if rec.get("email"):
+                    self.saved[pid] = rec            # now in your org's saved contacts
+                if not rec.get("email"):
+                    self._maybe_refund(req)
             out.append(row)
             if self.chaos_poll and self.rnd.random() < 0.1:
                 out.append(dict(row))                      # duplicated row
@@ -246,12 +297,18 @@ class FakeSeamless:
             self.rnd.shuffle(out)
         return self._resp(200, {"success": True, "data": out})
 
+    def _maybe_refund(self, req):
+        if not self.charge_not_found and not req["refunded"] and not req["dup"]:
+            req["refunded"] = True
+            self.balance += 1
+            self.charged -= 1
+
     def org(self, request):
         page = int(request.url.params.get("page", 1))
         limit = int(request.url.params.get("limit", 500))
         assert request.url.params.get("startDate") and request.url.params.get("endDate")
-        pids = sorted(set(self.researched_pids) | self.already_in_org)
-        records = self.org_decoys + [self.contact_record(self.by_pid[p]) for p in pids]
+        records = self.org_decoys + [self.contact_record(self.by_pid[p]) for p in sorted(self.already_in_org)] + \
+            [self.saved[p] for p in sorted(self.saved) if p not in self.already_in_org]
         chunk = records[(page - 1) * limit: page * limit]
         return self._resp(200, {"data": chunk})
 
