@@ -127,7 +127,9 @@ contact search API. Rules:
 - Prefer seniority/department for broad role groups; use jobTitle for specific roles.
 - contactCountry: full English country names (United States, Canada, Israel, United Kingdom, Germany ...). \
   "Europe" means list the main European countries, max 10. States: full names or US abbreviations.
-- Seamless has no city filter here; use states or zip codes, or leave location at country level and say so in notes.
+- Cities go in locations ("Austin, Texas", "Tel Aviv, Israel"); locationRadius widens them.
+- locationType: leave it unset unless the user says the place is where the COMPANY is (e.g. "companies \
+  headquartered in Israel" -> company). Unset means the person's own location, which is the tool's default.
 - industry, companySize, companyRevenue, seniority, department and the funding/news fields must use the exact listed values.
 - Use the exclude* fields for anything the user wants to skip (e.g. "no staffing agencies" -> excludeIndustries \
   Staffing & Recruiting plus excludeCompanyWords staffing, recruit).

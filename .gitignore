@@ -1,6 +1,7 @@
 # Secrets and local state: never commit or ship these
 .env
 data/
+!tests/data/
 venv/
 .venv/
 __pycache__/

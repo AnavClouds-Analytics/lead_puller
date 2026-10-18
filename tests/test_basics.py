@@ -31,3 +31,15 @@ def test_env_file_is_read(tmp_path, monkeypatch):
         monkeypatch.delenv(k, raising=False)
     config._load_dotenv(str(f))
     assert config.cfg.MAX_PER_COMPANY == 7 and config.cfg.COMPANY_COOLDOWN_DAYS == 45 and config.cfg.FIT_CHECK is False
+
+
+def test_every_setting_is_in_env_example():
+    """Every .env setting the code reads is documented in .env.example (so changes never need code edits)."""
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = open(os.path.join(root, "app", "config.py")).read()
+    example = open(os.path.join(root, ".env.example")).read()
+    keys = set(re.findall(r'_(?:s|i|b|f)\("([A-Z_]+)"', code))
+    assert len(keys) > 40
+    missing = [k for k in sorted(keys) if not re.search(r"^#? ?" + k + "=", example, re.M)]
+    assert not missing, missing

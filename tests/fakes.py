@@ -67,7 +67,7 @@ class FakeSeamless:
     def __init__(self, people=None, balance=100_000, seed=1):
         self.people = people if people is not None else make_people()
         self.by_pid = {p["pid"]: p for p in self.people}
-        self.balance = balance
+        self.pools = {"good-key": balance}
         self.rnd = random.Random(seed)
         self.charged = 0                  # total credits actually charged
         self.charges = []                 # (kind, amount)
@@ -92,8 +92,38 @@ class FakeSeamless:
         self.searches = []                # every search body received
         self.saved = {}                   # pid -> record: people your org has an email for (org contacts)
         self.clock = time.time
+        # Several Seamless accounts (API keys). Each has its own credit pool unless shared_pool is True
+        # (one org pool, as Seamless's docs describe). Search result IDs and research requests belong to
+        # the key that made them; research de-duplication is org-wide (researched_pids).
+        self.pools = {"good-key": balance}
+        self.shared_pool = False
+        self.cur = "good-key"
+        self.sid_key = {}                 # searchResultId -> key that found it
+        self.rid_key = {}                 # requestId -> key that sent it
+        self.charged_by_key = {}
+        self.foreign_sid_rejected = 0
+        self.slow_pids = set()            # Seamless keeps answering "researching" for these until removed
 
     # ------------------------------------------------------------------ helpers
+    # ------------------------------------------------------------------ accounts
+    def add_key(self, key, balance):
+        self.pools[key] = balance
+
+    def _pool(self, key=None):
+        key = key or self.cur
+        return "good-key" if self.shared_pool else key
+
+    @property
+    def balance(self):
+        return self.pools[self._pool()]
+
+    @balance.setter
+    def balance(self, v):
+        self.pools[self._pool()] = v
+
+    def balance_of(self, key):
+        return self.pools[self._pool(key)]
+
     def _resp(self, status, body, extra=None):
         headers = {"X-PublicAPI-Credits": str(self.balance), "X-RateLimit-Limit": "60",
                    "X-RateLimit-Remaining": "50", "X-RateLimit-Reset": str(self.clock() + 1)}
@@ -103,6 +133,7 @@ class FakeSeamless:
     def charge(self, kind, n):
         self.balance -= n
         self.charged += n
+        self.charged_by_key[self.cur] = self.charged_by_key.get(self.cur, 0) + n
         self.charges.append((kind, n))
 
     def _search_row(self, p, sid):
@@ -135,9 +166,14 @@ class FakeSeamless:
     # ------------------------------------------------------------------ router
     def handler(self, request: httpx.Request):
         path = request.url.path.split("/api/client/v1")[-1]
+        key = request.headers.get("Token")
         self.calls.append((self.clock(), request.method, path))
-        if request.headers.get("Token") != "good-key":
-            return self._resp(401, {"message": "Unauthorized"})
+        self.calls_by_key = getattr(self, "calls_by_key", [])
+        self.calls_by_key.append((key, request.method, path))
+        if key not in self.pools:
+            self.cur = "good-key"
+            return httpx.Response(401, json={"message": "Unauthorized"})
+        self.cur = key
         if path in ("/search/contacts", "/contacts/research/poll", "/search/locations") and self.flaky_rate:
             r = self.rnd.random()
             if r < self.flaky_rate / 2:
@@ -209,6 +245,7 @@ class FakeSeamless:
         for p in page:
             sid = f"sr{self.search_count}-{p['pid']}-{self.rnd.randint(1000, 9999)}"
             self.sid_to_pid[sid] = p["pid"]
+            self.sid_key[sid] = self.cur
             rows.append(self._search_row(p, sid))
         if rows:
             self.charge("search", -(-len(rows) // 10))
@@ -227,6 +264,11 @@ class FakeSeamless:
         if fail == "500_before_charge":
             self.research_fail_next = None
             return self._resp(500, {"message": "boom"})
+        foreign = [s for s in sids if s in self.sid_key and self.sid_key[s] != self.cur]
+        if foreign:
+            # Another account's search results: rejected before charging anything.
+            self.foreign_sid_rejected += len(foreign)
+            return self._resp(400, {"message": f"{len(foreign)} searchResultIds not found for this account"})
         fresh = bool(body.get("skipDeduplicationCheck"))
         new = [s for s in sids if self.sid_to_pid.get(s) is not None and (fresh or (
                self.sid_to_pid[s] not in self.researched_pids and self.sid_to_pid[s] not in self.already_in_org))]
@@ -248,6 +290,7 @@ class FakeSeamless:
                 self.researched_pids[pid] = self.researched_pids.get(pid, 0)
             self.requests[rid] = {"sid": sid, "pid": pid, "dup": dup, "polls": 0, "fresh": fresh, "refunded": False,
                                   "need": self.rnd.randint(1, 4) if self.chaos_poll else 1}
+            self.rid_key[rid] = self.cur
             ids.append(rid)
         if fail == "500_after_charge":
             self.research_fail_next = None
@@ -265,8 +308,8 @@ class FakeSeamless:
         out = []
         for rid in rids:
             req = self.requests.get(rid)
-            if not req:
-                continue
+            if not req or self.rid_key.get(rid) != self.cur:
+                continue                                   # unknown, or sent by another account
             if self.chaos_poll and self.rnd.random() < 0.3:
                 continue                                   # left out of this answer
             req["polls"] += 1
@@ -276,7 +319,7 @@ class FakeSeamless:
                 row.pop("searchResultId")                  # some rows come back without it
             if pid is None:
                 row.update(status="error", message="unknown search result")
-            elif req["polls"] < req["need"]:
+            elif req["polls"] < req["need"] or pid in self.slow_pids:
                 row.update(status=self.rnd.choice(["queued", "researching"]))
             elif req["dup"]:
                 row.update(status="duplicate")
@@ -300,8 +343,10 @@ class FakeSeamless:
     def _maybe_refund(self, req):
         if not self.charge_not_found and not req["refunded"] and not req["dup"]:
             req["refunded"] = True
-            self.balance += 1
+            k = self.cur                                   # polls are answered only for the sending key
+            self.pools[self._pool(k)] += 1
             self.charged -= 1
+            self.charged_by_key[k] = self.charged_by_key.get(k, 0) - 1
 
     def org(self, request):
         page = int(request.url.params.get("page", 1))

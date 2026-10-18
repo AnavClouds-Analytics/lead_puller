@@ -54,6 +54,8 @@ MONEY = ["$0 - $100K", "$100K - $1M", "$1M - $5M", "$5M - $20M", "$20M - $50M", 
 
 import time
 
+from .config import cfg
+
 TIMEZONES = ["Eastern (EST)", "Central (CST)", "Mountain (MST)", "Pacific (PST)", "Alaska (AKST)", "Hawaii (HST)",
              "New Zealand (NST)", "Solomon (SST)", "Australia Eastern (AET)", "Australia Central (ACT)", "Japan (JST)",
              "China Taiwan (CTT)", "Vietnam (VST)", "Bangladesh (BST)", "India (IST)", "Indiana Eastern (IET)",
@@ -87,11 +89,14 @@ FILTERS = [
     {"key": "contactKeyword", "label": "Profile keywords", "kind": "text_list", "max": 10, "group": "People",
      "help": "Words in the person's profile, skills or bio."},
     {"key": "keywordsIsOr", "label": "Keywords: match any (instead of all)", "kind": "bool", "group": "People"},
-    {"key": "contactCountry", "label": "Countries", "kind": "text_list", "max": 10, "group": "Location",
+    {"key": "contactCountry", "label": "Countries", "kind": "text_list", "max": 10, "group": "Location", "lookup": "country",
      "help": "Full country names, e.g. United States, Canada, Israel, Germany."},
-    {"key": "contactState", "label": "States / regions", "kind": "text_list", "max": 10, "group": "Location"},
-    {"key": "contactZipCode", "label": "Zip / postal codes", "kind": "text_list", "max": 10, "group": "Location"},
+    {"key": "contactState", "label": "States / regions", "kind": "text_list", "max": 10, "group": "Location",
+     "lookup": "state-country"},
+    {"key": "contactZipCode", "label": "Zip / postal codes", "kind": "text_list", "max": 10, "group": "Location",
+     "lookup": "postcode"},
     {"key": "locations", "label": "Cities / places", "kind": "text_list", "max": 10, "group": "Location",
+     "lookup": "city-state-country,city-country",
      "help": "City level, e.g. “Austin, Texas”, “Toronto, Ontario”. Checked against Seamless's place list (free)."},
     {"key": "locationRadius", "label": "Widen cities by (miles)", "kind": "choice", "group": "Location",
      "options": ["25", "50", "100", "250"]},
@@ -99,7 +104,9 @@ FILTERS = [
      "options": TIMEZONES},
     {"key": "locationType", "label": "Location applies to", "kind": "choice", "group": "Location",
      "options": ["bothOR", "contact", "company", "bothAND"],
-     "option_labels": LOC_TYPES},
+     "option_labels": LOC_TYPES, "default_from_env": "LOCATION_APPLIES_TO",
+     "help": "Not set = the .env default (LOCATION_APPLIES_TO). “Person's location only” keeps out people who live "
+             "elsewhere but work for a company based in your country."},
     {"key": "timezoneType", "label": "Time zone applies to", "kind": "choice", "group": "Location",
      "options": ["bothOR", "contact", "company", "bothAND"], "option_labels": LOC_TYPES},
     {"key": "industry", "label": "Industries", "kind": "enum_list", "max": 5, "group": "Company",
@@ -169,13 +176,16 @@ FILTERS = [
      "group": "Skip", "local": True, "options": INDUSTRIES},
     {"key": "excludeDomains", "label": "Skip company domains", "kind": "text_list", "max": 200,
      "group": "Skip", "local": True},
-    {"key": "excludeCountries", "label": "Skip countries", "kind": "text_list", "max": 10, "group": "Skip",
+    {"key": "excludeCountries", "label": "Skip countries", "kind": "text_list", "max": 10, "group": "Skip", "lookup": "country",
      "native": "contactCountry", "help": "Excluded by Seamless itself (no credits spent on them). e.g. “Europe but not the UK”."},
     {"key": "excludeStates", "label": "Skip states / regions", "kind": "text_list", "max": 10, "group": "Skip",
+     "lookup": "state-country",
      "native": "contactState", "help": "Excluded by Seamless itself."},
     {"key": "excludeLocations", "label": "Skip cities / places", "kind": "text_list", "max": 10, "group": "Skip",
+     "lookup": "city-state-country,city-country",
      "native": "locations", "help": "Excluded by Seamless itself."},
     {"key": "excludeZipCodes", "label": "Skip zip / postal codes", "kind": "text_list", "max": 10, "group": "Skip",
+     "lookup": "postcode",
      "native": "contactZipCode", "help": "Excluded by Seamless itself."},
     {"key": "excludeSicCodes", "label": "Skip SIC codes", "kind": "text_list", "max": 5, "group": "Skip",
      "native": "industrySicCodes", "help": "Excluded by Seamless itself."},
@@ -235,6 +245,7 @@ def clean_filters(raw: dict) -> dict:
 
 
 NATIVE_EXCLUDES = {f["key"]: f["native"] for f in FILTERS if f.get("native")}
+LOCATION_KEYS = ("contactCountry", "contactState", "contactZipCode", "locations")
 NATIVE_LIMITS = {"contactCountry": 10, "contactState": 10, "locations": 10, "contactZipCode": 10,
                  "industrySicCodes": 5, "industryNaicsCodes": 5}
 
@@ -258,6 +269,8 @@ def to_search_body(filters: dict) -> dict:
             inc = list(body.get(target, []))
             room = NATIVE_LIMITS[target] - len(inc)
             body[target] = inc + ["-" + v.lstrip("-") for v in filters[ex_key][:max(0, room)]]
+    if any(body.get(k) for k in LOCATION_KEYS) and not body.get("locationType"):
+        body["locationType"] = cfg.LOCATION_APPLIES_TO
     if body.get("locationRadius") and not body.get("locations"):
         body.pop("locationRadius")
     if body.get("timezoneType") and not body.get("timezones"):

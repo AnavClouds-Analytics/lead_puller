@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS domains (domain TEXT PRIMARY KEY, has_mx INTEGER, det
 CREATE TABLE IF NOT EXISTS ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, pull_id INTEGER, kind TEXT, credits INTEGER,
   balance_after INTEGER, note TEXT);
+CREATE TABLE IF NOT EXISTS accounts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, api_key TEXT, priority INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1, monthly_budget INTEGER DEFAULT 0, source TEXT DEFAULT 'ui',
+  balance INTEGER, balance_at REAL, last_error TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS balance_marks (
+  account_id INTEGER, month TEXT, first_balance INTEGER, first_at REAL, last_balance INTEGER, last_at REAL,
+  added INTEGER DEFAULT 0, PRIMARY KEY(account_id, month));
+CREATE TABLE IF NOT EXISTS collect_pages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, pull_id INTEGER, at REAL, rows INTEGER, kept INTEGER, credits INTEGER);
+CREATE INDEX IF NOT EXISTS ix_cp_pull ON collect_pages(pull_id, id);
 """
 
 
@@ -77,6 +87,15 @@ MIGRATIONS = {
     "seen": [("outcome", "TEXT"), ("outcome_at", "REAL")],
     "companies": [("tried", "INTEGER DEFAULT 0"), ("tried_last_at", "REAL")],
     "batches": [("columns_json", "TEXT")],
+    # v1.3
+    "pulls+": [("account_id", "INTEGER"), ("account_choice", "TEXT"), ("est_search_credits", "INTEGER"),
+               ("spend_cap", "INTEGER"), ("keep_ack_page", "INTEGER DEFAULT 0"), ("claude_filters_json", "TEXT"),
+               ("edited_from", "INTEGER"), ("moved_to", "INTEGER"), ("pause_kind", "TEXT"),
+               ("collect_started_credits", "INTEGER")],
+    "contacts+": [("skip_kind", "TEXT"), ("email_chance_n", "INTEGER"), ("email_chance_basis", "TEXT")],
+    "research_requests": [("account_id", "INTEGER"), ("gave_up", "INTEGER DEFAULT 0"), ("late_polled_at", "REAL")],
+    "ledger": [("account_id", "INTEGER")],
+    "searches": [("cursor_account_id", "INTEGER")],
 }
 
 
@@ -92,12 +111,40 @@ def connect():
             _conn.executescript(SCHEMA)
             # Upgrades for databases made by older versions: add any missing columns (never drops data).
             for table, cols in MIGRATIONS.items():
+                table = table.rstrip("+")
                 have = {r[1] for r in _conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 for col, typ in cols:
                     if col not in have:
                         _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
             _conn.execute("CREATE INDEX IF NOT EXISTS ix_contacts_batch ON contacts(batch_id)")
+            _conn.execute("CREATE INDEX IF NOT EXISTS ix_contacts_skip ON contacts(pull_id, kept, skip_kind)")
+            _conn.execute("CREATE INDEX IF NOT EXISTS ix_ledger_acct ON ledger(account_id, at)")
+            _conn.execute("CREATE INDEX IF NOT EXISTS ix_rr_late ON research_requests(gave_up, created_at)")
+            _ensure_env_account(_conn)
         return _conn
+
+
+def _ensure_env_account(c):
+    """The SEAMLESS_API_KEY in .env (if any) is kept as an account, so older setups keep working.
+    Rows from before v1.3 (no account recorded) belong to it."""
+    key = cfg.SEAMLESS_API_KEY
+    row = c.execute("SELECT id, api_key FROM accounts WHERE source='env'").fetchone()
+    if key and not row:
+        n = c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        old_bal = c.execute("SELECT value FROM settings WHERE key='credit_balance'").fetchone()
+        old_at = c.execute("SELECT value FROM settings WHERE key='credit_balance_at'").fetchone()
+        c.execute("INSERT INTO accounts(name, api_key, priority, enabled, source, balance, balance_at, created_at) "
+                  "VALUES(?,?,?,?,?,?,?,?)", ("Account from .env", key, n + 1, 1, "env",
+                                               json.loads(old_bal[0]) if old_bal else None,
+                                               json.loads(old_at[0]) if old_at else None, time.time()))
+        row = c.execute("SELECT id, api_key FROM accounts WHERE source='env'").fetchone()
+    elif key and row and row[1] != key:
+        c.execute("UPDATE accounts SET api_key=?, balance=NULL, balance_at=NULL WHERE id=?", (key, row[0]))
+    if row:
+        for t in ("ledger", "research_requests", "pulls"):
+            c.execute(f"UPDATE {t} SET account_id=? WHERE account_id IS NULL", (row[0],)) if t != "pulls" else \
+                c.execute("UPDATE pulls SET account_id=? WHERE account_id IS NULL AND (search_credits>0 OR "
+                          "research_credits>0)", (row[0],))
 
 
 def reset_for_tests(path):
@@ -208,19 +255,35 @@ def create_pull(name, prompt, filters, notes, target=0, per_company_cap=None, cl
 
 
 # ---------- credits ----------
-def log_credits(pull_id, kind, credits, balance_after=None, note=""):
-    x("INSERT INTO ledger(at,pull_id,kind,credits,balance_after,note) VALUES(?,?,?,?,?,?)",
-      (time.time(), pull_id, kind, credits, balance_after, note))
+def log_credits(pull_id, kind, credits, balance_after=None, note="", account_id=None):
+    x("INSERT INTO ledger(at,pull_id,kind,credits,balance_after,note,account_id) VALUES(?,?,?,?,?,?,?)",
+      (time.time(), pull_id, kind, credits, balance_after, note, account_id))
     if pull_id:
         col = "search_credits" if kind == "search" else "research_credits"
         x(f"UPDATE pulls SET {col}={col}+? WHERE id=?", (credits, pull_id))
 
 
-def month_spend():
-    t = time.gmtime()
-    start = time.mktime((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, -1)) - time.timezone
-    row = q1("SELECT COALESCE(SUM(credits),0) AS s FROM ledger WHERE at>=?", (start,))
+def month_start(now=None):
+    t = time.gmtime(now)
+    return time.mktime((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, -1)) - time.timezone
+
+
+def month_key(now=None):
+    return time.strftime("%Y-%m", time.gmtime(now))
+
+
+def month_spend(account_id=None):
+    if account_id is None:
+        row = q1("SELECT COALESCE(SUM(credits),0) AS s FROM ledger WHERE at>=?", (month_start(),))
+    else:
+        row = q1("SELECT COALESCE(SUM(credits),0) AS s FROM ledger WHERE at>=? AND account_id=?",
+                 (month_start(), account_id))
     return int(row["s"])
+
+
+def spend_since(account_id, since):
+    return int(q1("SELECT COALESCE(SUM(credits),0) AS s FROM ledger WHERE at>=? AND account_id=?",
+                  (since, account_id))["s"])
 
 
 # ---------- dedupe ----------

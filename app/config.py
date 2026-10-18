@@ -6,7 +6,7 @@ Nothing here needs a code change.
 import os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 
 def _load_dotenv(path):
@@ -81,6 +81,28 @@ class Config:
     def SPENDING_ENABLED(self): return _b("SPENDING_ENABLED", True)
     @property
     def LOW_BALANCE_WARNING(self): return max(0, _i("LOW_BALANCE_WARNING", 500))
+    @property
+    def ACCOUNT_RESERVE(self): return max(0, _i("ACCOUNT_RESERVE", 50))
+    @property
+    def BALANCE_MISMATCH_WARN(self): return max(1, _i("BALANCE_MISMATCH_WARN", 20))
+    @property
+    def LOCATION_APPLIES_TO(self):
+        v = _s("LOCATION_APPLIES_TO", "contact")
+        return v if v in ("contact", "company", "bothOR", "bothAND") else "contact"
+    @property
+    def OPEN_PULL_HOLD_DAYS(self): return max(0, _i("OPEN_PULL_HOLD_DAYS", 14))
+
+    # --- collecting: stop wasting search credits
+    @property
+    def COLLECT_CLOSE_ENOUGH_PCT(self): return max(0, min(_i("COLLECT_CLOSE_ENOUGH_PCT", 1), 20))
+    @property
+    def COLLECT_LOW_KEEP_PCT(self): return max(0, min(_i("COLLECT_LOW_KEEP_PCT", 20), 100))
+    @property
+    def COLLECT_LOW_KEEP_PAGES(self): return max(1, _i("COLLECT_LOW_KEEP_PAGES", 3))
+    @property
+    def COLLECT_EMPTY_PAGES_STOP(self): return max(1, _i("COLLECT_EMPTY_PAGES_STOP", 3))
+    @property
+    def COLLECT_SPEND_CAP_PCT(self): return max(100, _i("COLLECT_SPEND_CAP_PCT", 150))
 
     # --- fewer people without email
     @property
@@ -112,6 +134,10 @@ class Config:
     @property
     def DEFAULT_BATCH_SIZE(self): return max(1, _i("DEFAULT_BATCH_SIZE", 500))
     @property
+    def TABLE_PAGE_SIZE(self):
+        n = _i("TABLE_PAGE_SIZE", 50)
+        return n if n in (25, 50, 100, 250) else 50
+    @property
     def DEFAULT_EXPORT_COLUMNS(self): return _s("DEFAULT_EXPORT_COLUMNS", "email,first_name,last_name,company")
 
     # --- Seamless API behaviour
@@ -126,7 +152,17 @@ class Config:
     @property
     def RATE_LIMIT_PER_MIN(self): return max(1, _i("RATE_LIMIT_PER_MIN", 55))
     @property
-    def SEARCH_SPEND_GUARD(self): return max(1, _i("SEARCH_SPEND_GUARD", 4))
+    def RESEARCH_WAIT_MINUTES(self): return max(1, _i("RESEARCH_WAIT_MINUTES", 15))
+    @property
+    def LATE_ANSWER_HOURS(self): return max(0, _i("LATE_ANSWER_HOURS", 24))
+    @property
+    def LATE_POLL_MINUTES(self): return max(1, _i("LATE_POLL_MINUTES", 5))
+    @property
+    def ERROR_PAUSE_AFTER(self): return max(1, _i("ERROR_PAUSE_AFTER", 5))
+    @property
+    def SAVED_CONTACTS_CACHE_MINUTES(self): return max(0, _i("SAVED_CONTACTS_CACHE_MINUTES", 10))
+    @property
+    def DNS_CACHE_DAYS(self): return max(1, _i("DNS_CACHE_DAYS", 30))
     @property
     def ORG_LOOKBACK_DAYS(self): return max(1, _i("ORG_LOOKBACK_DAYS", 730))
     @property
@@ -146,7 +182,7 @@ SHOWN = [
     ("Login", [("APP_PASSWORD", "secret", "Password for the tool"),
                ("SESSION_DAYS", "", "Days before you have to log in again"),
                ("COOKIE_SECURE", "", "1 once the site is on HTTPS")]),
-    ("Keys", [("SEAMLESS_API_KEY", "secret", "Seamless → Settings → Public API → API Key"),
+    ("Keys", [("SEAMLESS_API_KEY", "secret", "Optional fallback. Seamless keys are normally added on the Seamless accounts page"),
               ("ANTHROPIC_API_KEY", "secret", "console.anthropic.com → API Keys"),
               ("CLAUDE_MODEL", "", "Model that turns your request into filters"),
               ("CLAUDE_FAST_MODEL", "", "Model that rates fit")]),
@@ -157,7 +193,17 @@ SHOWN = [
         ("FIT_CHECK", "", "1 = Claude rates each person against your request"),
         ("CONTINUE_SAME_SEARCH", "", "1 = a repeated search starts where the last one stopped"),
         ("SPENDING_ENABLED", "", "0 = master switch: stop all Seamless spending (search and research)"),
-        ("LOW_BALANCE_WARNING", "", "Red banner when the Seamless balance is below this (0 = off)")]),
+        ("LOW_BALANCE_WARNING", "", "Red banner when the Seamless balance is below this (0 = off)"),
+        ("ACCOUNT_RESERVE", "", "Stop using a Seamless account when its balance would go below this; new pulls use the next account"),
+        ("BALANCE_MISMATCH_WARN", "", "Warn when Seamless's balance and this tool's count differ by more than this many credits"),
+        ("LOCATION_APPLIES_TO", "", "Default for “Location applies to”: contact = person's location only, company, bothOR, bothAND"),
+        ("OPEN_PULL_HOLD_DAYS", "", "People collected in another open pull (not yet researched) are skipped for this many days")]),
+    ("Collecting (search credits)", [
+        ("COLLECT_CLOSE_ENOUGH_PCT", "", "Finish collecting when this close to the target (% of target)"),
+        ("COLLECT_LOW_KEEP_PCT", "", "Pause and ask when the last pages kept fewer than this % of people"),
+        ("COLLECT_LOW_KEEP_PAGES", "", "…over this many pages in a row"),
+        ("COLLECT_EMPTY_PAGES_STOP", "", "Stop collecting after this many pages in a row that keep nobody"),
+        ("COLLECT_SPEND_CAP_PCT", "", "Pause and ask when search credits reach this % of the estimate shown before collecting")]),
     ("Fewer people without email", [
         ("UPDATED_WITHIN_MONTHS", "", "Default: only contacts Seamless updated in the last N months (0 = any age)"),
         ("REQUIRE_COMPANY_WEBSITE", "", "Default: skip people whose company has no website (1 = on)"),
@@ -172,14 +218,20 @@ SHOWN = [
     ("Downloads", [
         ("EMAIL_PICK", "", "best = per person, the email with the best status and highest confidence; seamless = Seamless's primary"),
         ("DEFAULT_BATCH_SIZE", "", "Number pre-filled in “Download next …”"),
-        ("DEFAULT_EXPORT_COLUMNS", "", "Columns ticked by default in the AnavMail download, in order (see README for all names)")]),
+        ("DEFAULT_EXPORT_COLUMNS", "", "Columns ticked by default in the AnavMail download, in order (see README for all names)"),
+        ("TABLE_PAGE_SIZE", "", "Rows per page in every table (25, 50, 100 or 250)")]),
     ("Seamless API", [
         ("PREVIEW_SIZE", "", "People fetched in Preview (1 credit per 10)"),
         ("PAGE_SIZE", "", "People per search page while collecting"),
         ("RESEARCH_BATCH", "", "People sent for research per call (max 500)"),
         ("POLL_SECONDS", "", "Seconds between checks for research results"),
         ("RATE_LIMIT_PER_MIN", "", "Calls per minute per endpoint (Seamless allows 60)"),
-        ("SEARCH_SPEND_GUARD", "", "Stop collecting if search credits pass target ÷ 10 × this"),
+        ("RESEARCH_WAIT_MINUTES", "", "Wait this long for a slow Seamless answer before finishing without it"),
+        ("LATE_ANSWER_HOURS", "", "Keep checking (free) for answers that arrive late, for this many hours"),
+        ("LATE_POLL_MINUTES", "", "How often to check for those late answers"),
+        ("ERROR_PAUSE_AFTER", "", "Pause a pull after this many errors in a row"),
+        ("SAVED_CONTACTS_CACHE_MINUTES", "", "Minutes to reuse the saved-contacts list during fill-in"),
+        ("DNS_CACHE_DAYS", "", "Days to remember the email-server check for a domain"),
         ("ORG_LOOKBACK_DAYS", "", "How far back to look in your Seamless saved contacts for “already researched” people"),
         ("ORG_LOOKUP_MAX_PAGES", "", "Max pages (500 each) read from saved contacts per lookup")]),
 ]

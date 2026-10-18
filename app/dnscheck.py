@@ -2,14 +2,13 @@
 
 Answers "yes", "no" or "unknown". Only a clear "no" ever skips anyone; a timeout or DNS error is
 "unknown" and the person is kept, so a flaky network never costs you leads.
-Results are cached in the database for 30 days.
+Results are cached in the database for DNS_CACHE_DAYS (default 30).
 """
 import time
 
 from . import db
 from .config import cfg
 
-CACHE_DAYS = 30
 LOOKUP = None          # tests replace this with a fake: domain -> "yes" | "no" | "unknown"
 
 
@@ -40,7 +39,7 @@ def has_mail_server(domain):
     if not domain or "." not in domain:
         return "unknown"
     row = db.q1("SELECT has_mx, checked_at FROM domains WHERE domain=?", (domain,))
-    if row and time.time() - row["checked_at"] < CACHE_DAYS * 86400:
+    if row and time.time() - row["checked_at"] < cfg.DNS_CACHE_DAYS * 86400:
         return {1: "yes", 0: "no"}.get(row["has_mx"], "unknown")
     if LOOKUP:
         out = LOOKUP(domain)

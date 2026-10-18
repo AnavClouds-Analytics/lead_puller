@@ -1,6 +1,7 @@
 """Run the app against the fake Seamless + Claude so the screens can be tried without spending credits.
 
     python -m tests.demo_server      # then open http://localhost:8765 , password: demo-pass-1
+    A second fake Seamless key to try on the "Seamless accounts" page: demo-second-key-2222
 """
 import os
 import tempfile
@@ -19,6 +20,7 @@ from tests.fakes import FakeClaude, FakeSeamless
 
 fake_s = FakeSeamless()
 fake_s.chaos_poll = True
+fake_s.add_key("demo-second-key-2222", 9_400)    # a second Seamless account to add on the accounts page
 seamless.TRANSPORT = httpx.MockTransport(fake_s.handler)
 claude.TRANSPORT = httpx.MockTransport(FakeClaude().handler)
 dnscheck.LOOKUP = lambda d: "no" if d in ("acme13.com", "acme26.com") else "yes"

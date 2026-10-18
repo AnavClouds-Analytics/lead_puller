@@ -237,9 +237,10 @@ def test_title_must_contain_role_time_and_skip_seniority(env):
         assert "CTO" in c["title"] or "Chief Technology" in c["title"]
         assert c["seniority"] != "VP"
         assert c["title_started_at"] != "2026-09-01"
-    reasons = {r["reason"] for r in p["stats"]["skip_reasons"]}
-    assert any(r.startswith("Title doesn't contain") for r in reasons)
-    assert "In current role under 3 months" in reasons
+    kinds = {r["kind"]: r for r in p["stats"]["skip_reasons"]}
+    assert kinds["title_missing"]["example"].startswith("Title doesn't contain")
+    assert kinds["role_time"]["example"] == "In current role under 3 months"
+    assert all(r["credits"] >= 0 and r["label"] for r in kinds.values())
 
 
 def test_native_excludes_and_freshness_go_to_seamless(env):
@@ -314,11 +315,16 @@ def test_email_chance_from_history(env):
     full_pull(client, target=40, cap=0, cooldown=0, filters={"contactCountry": ["Germany", "Israel"],
                                                                "seniority": ["C-Level", "VP"]})
     p = collect(client, f, target=150, cooldown=0)
-    rows = db.q("SELECT country, email_chance FROM contacts WHERE pull_id=? AND kept=1", (p["id"],))
-    assert all(r["email_chance"] is not None for r in rows)
+    rows = db.q("SELECT country, email_chance, email_chance_basis FROM contacts WHERE pull_id=? AND kept=1", (p["id"],))
+    # v1.3: no guessing from other countries. A country with enough history has a chance and says what it's based on.
+    for r in rows:
+        if r["email_chance"] is not None:
+            assert r["email_chance_basis"].startswith("based on ") and r["country"] in r["email_chance_basis"]
     us = [r["email_chance"] for r in rows if r["country"] == "United States"]
-    il = [r["email_chance"] for r in rows if r["country"] == "Israel"]
-    assert us and il and min(us) > max(il)             # learned: Israel finds far fewer emails in this data
+    il = [r["email_chance"] for r in rows if r["country"] == "Israel" and r["email_chance"] is not None]
+    assert us and None not in us                       # 50 US people researched before: enough history
+    if il:
+        assert min(us) > max(il)                       # learned: Israel finds far fewer emails in this data
     p = research(client, p["id"], choice="chance", chance_min=70)
     sent = db.q("SELECT country FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (p["id"],))
     assert sent and not any(r["country"] == "Israel" for r in sent)
@@ -471,10 +477,10 @@ def test_fill_in_can_be_stopped(env, monkeypatch):
     real = seamless.org_contacts
     pages = []
 
-    def org(*a):
+    def org(*a, **k):
         pages.append(1)
         client.post("/api/fill-stop")          # pressed Stop while the first page was loading
-        return real(*a)
+        return real(*a, **k)
     monkeypatch.setattr(seamless, "org_contacts", org)
     r1 = worker.fill_from_saved(p["id"])
     assert r1["stopped"] is True and len(pages) == 1        # stopped: no further pages read
@@ -527,7 +533,7 @@ def test_settings_page_shows_every_env_setting(env):
               "REQUIRE_LINKEDIN", "SKIP_NO_EMAIL_SERVER", "TEST_BATCH_SIZE", "TEST_BATCH_MIN_EMAIL_RATE",
               "EMAIL_CHANCE_MIN", "NO_EMAIL_RETRY_DAYS", "DEFAULT_BATCH_SIZE", "DEFAULT_EXPORT_COLUMNS", "EMAIL_PICK"):
         assert k in keys, k
-    assert s["version"] == "1.2.0"
+    assert s["version"] == "1.3.0"
 
 
 def test_new_pull_gets_env_defaults(env, monkeypatch):

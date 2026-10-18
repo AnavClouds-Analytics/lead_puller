@@ -34,7 +34,11 @@ def env(tmp_path, monkeypatch):
                  "UPDATED_WITHIN_MONTHS": "0", "REQUIRE_COMPANY_WEBSITE": "0", "REQUIRE_LINKEDIN": "0",
                  "TEST_BATCH_SIZE": "0", "SKIP_NO_EMAIL_SERVER": "1", "NO_EMAIL_RETRY_DAYS": "0",
                  "LOW_BALANCE_WARNING": "0", "SPENDING_ENABLED": "1", "EMAIL_PICK": "best",
-                 "DEFAULT_EXPORT_COLUMNS": "email,first_name,last_name,company"}.items():
+                 "DEFAULT_EXPORT_COLUMNS": "email,first_name,last_name,company",
+                 # v1.3 collecting guards are off here unless a test turns them on (tests in test_v13.py do)
+                 "COLLECT_CLOSE_ENOUGH_PCT": "0", "COLLECT_LOW_KEEP_PCT": "0", "COLLECT_EMPTY_PAGES_STOP": "100000",
+                 "COLLECT_SPEND_CAP_PCT": "100000", "OPEN_PULL_HOLD_DAYS": "0", "ACCOUNT_RESERVE": "0",
+                 "LATE_ANSWER_HOURS": "24", "RESEARCH_WAIT_MINUTES": "15"}.items():
         monkeypatch.setenv(k, v)
     dnscheck.LOOKUP = lambda d: "yes"
     db.reset_for_tests(str(tmp_path / "t.db"))

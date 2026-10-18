@@ -101,8 +101,12 @@ def test_never_pay_twice_across_pulls(env):
                  (b["id"],))["n"] > 0
 
 
-def test_two_pulls_collected_at_once_dont_both_pay(env):
-    """Both pulls collect the same people before either researches. Only the first may pay."""
+@pytest.mark.parametrize("hold", ["0", "14"])
+def test_two_pulls_collected_at_once_dont_both_pay(env, monkeypatch, hold):
+    """Both pulls look at the same people before either researches. Only the first may pay.
+    hold=0: both collect them, the re-check right before paying stops the second.
+    hold=14: the second pull already skips them at collect ("In another open pull")."""
+    monkeypatch.setenv("OPEN_PULL_HOLD_DAYS", hold)
     client, fake, _, _ = env
     f = {"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]}
     ids = []
@@ -119,8 +123,8 @@ def test_two_pulls_collected_at_once_dont_both_pay(env):
         run_until(client, pid, {"done"})
     check_books(fake)
     check_people(client, fake)
-    second = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Already pulled before%'",
-                   (ids[1],))["n"]
+    kind = "pulled_before" if hold == "0" else "other_pull"
+    second = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_kind=?", (ids[1], kind))["n"]
     assert second > 0
 
 
