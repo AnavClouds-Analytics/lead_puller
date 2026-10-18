@@ -4,13 +4,11 @@ import os
 
 import httpx
 
-from . import db
+from .config import cfg
 from .filters import FILTERS, clean_filters
 
 API_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com") + "/v1/messages"
 TRANSPORT = None  # tests swap in a MockTransport
-DEFAULT_MODEL = "claude-sonnet-5-5"
-DEFAULT_FAST_MODEL = "claude-haiku-5-5"
 
 
 class ClaudeError(Exception):
@@ -18,35 +16,85 @@ class ClaudeError(Exception):
 
 
 def api_key():
-    return os.environ.get("ANTHROPIC_API_KEY") or db.get_setting("anthropic_api_key") or ""
+    return cfg.ANTHROPIC_API_KEY
+
+
+# Models that refused a forced tool_choice; for these we ask for the tool in words instead.
+_NO_FORCED_TOOL = set()
+
+
+def _post(body, key):
+    headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    try:
+        with httpx.Client(timeout=180, transport=TRANSPORT) as c:
+            return c.post(API_URL, json=body, headers=headers)
+    except httpx.HTTPError as e:
+        raise ClaudeError(f"Could not reach Claude: {e}")
+
+
+def _error_message(r):
+    try:
+        return r.json().get("error", {}).get("message") or ""
+    except Exception:
+        return ""
+
+
+def _extract(data, tool_name):
+    """Take the tool's input; if the model answered in text instead, take the JSON object from the text."""
+    text = []
+    for block in data.get("content", []):
+        if block.get("type") == "tool_use" and block.get("name") == tool_name:
+            return block.get("input") or {}
+        if block.get("type") == "text":
+            text.append(block.get("text") or "")
+    joined = "\n".join(text)
+    start, end = joined.find("{"), joined.rfind("}")
+    if start != -1 and end > start:
+        try:
+            out = json.loads(joined[start:end + 1])
+            if isinstance(out, dict):
+                return out
+        except ValueError:
+            pass
+    return None
 
 
 def _call(model, system, messages, tool, max_tokens=2000):
     key = api_key()
     if not key:
-        raise ClaudeError("No Claude API key yet. Add it in Settings.")
-    body = {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages,
-            "tools": [tool], "tool_choice": {"type": "tool", "name": tool["name"]}}
-    headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    try:
-        with httpx.Client(timeout=120, transport=TRANSPORT) as c:
-            r = c.post(API_URL, json=body, headers=headers)
-    except httpx.HTTPError as e:
-        raise ClaudeError(f"Could not reach Claude: {e}")
-    if r.status_code == 401:
-        raise ClaudeError("Claude did not accept the API key. Check it in Settings.")
-    if r.status_code == 429:
-        raise ClaudeError("Claude is rate-limiting right now. Try again in a minute.")
-    if r.status_code >= 400:
-        try:
-            msg = r.json().get("error", {}).get("message")
-        except Exception:
-            msg = None
-        raise ClaudeError(msg or f"Claude error {r.status_code}")
-    for block in r.json().get("content", []):
-        if block.get("type") == "tool_use":
-            return block.get("input") or {}
-    raise ClaudeError("Claude returned no answer.")
+        raise ClaudeError("No Claude API key. Ask your developer to set ANTHROPIC_API_KEY in .env.")
+    forced = model not in _NO_FORCED_TOOL
+    for attempt in range(3):
+        body = {"model": model, "max_tokens": max_tokens, "messages": messages, "tools": [tool]}
+        if forced:
+            body["system"] = system
+            body["tool_choice"] = {"type": "tool", "name": tool["name"]}
+        else:
+            # Some models (e.g. with extended thinking on by default) reject forced tool use.
+            body["system"] = (system + f"\n\nAlways answer by calling the {tool['name']} tool exactly once. "
+                              "Do not answer in plain text.")
+            body["tool_choice"] = {"type": "auto"}
+        r = _post(body, key)
+        if r.status_code == 400 and forced and "tool_choice" in _error_message(r):
+            _NO_FORCED_TOOL.add(model)
+            forced = False
+            continue
+        if r.status_code == 401:
+            raise ClaudeError("Claude did not accept the API key (ANTHROPIC_API_KEY in .env).")
+        if r.status_code == 404 or (r.status_code == 400 and "model" in _error_message(r).lower()):
+            raise ClaudeError(f"Claude model “{model}” isn't available to this key: {_error_message(r)} "
+                              "(CLAUDE_MODEL / CLAUDE_FAST_MODEL in .env).")
+        if r.status_code in (429, 529):
+            raise ClaudeError("Claude is busy right now. Try again in a minute.")
+        if r.status_code >= 400:
+            raise ClaudeError(_error_message(r) or f"Claude error {r.status_code}")
+        out = _extract(r.json(), tool["name"])
+        if out is not None:
+            return out
+        if not forced and attempt < 2:
+            continue    # model talked instead of calling the tool; ask again
+        break
+    raise ClaudeError("Claude returned no usable answer. Try again, or rephrase the request.")
 
 
 def _filter_schema():
@@ -98,7 +146,7 @@ def prompt_to_filters(prompt, current=None):
                 f"else the same unless the instruction says otherwise):\n{prompt}")
     else:
         user = prompt
-    model = db.get_setting("claude_model") or DEFAULT_MODEL
+    model = cfg.CLAUDE_MODEL
     out = _call(model, FILTER_SYSTEM, [{"role": "user", "content": user}], tool)
     filters = clean_filters(out.get("filters") or {})
     notes = [str(n) for n in (out.get("notes") or []) if str(n).strip()]
@@ -131,7 +179,7 @@ def score_fit(prompt, filters, people):
                                                        "industry", "size", "country")}))
     user = (f"The salesperson asked for:\n{prompt}\n\nSearch filters used:\n{json.dumps(filters)}\n\n"
             f"People (one JSON per line):\n" + "\n".join(lines))
-    model = db.get_setting("claude_fast_model") or DEFAULT_FAST_MODEL
+    model = cfg.CLAUDE_FAST_MODEL
     out = _call(model, FIT_SYSTEM, [{"role": "user", "content": user}], tool, max_tokens=4000)
     wanted = {str(p["id"]) for p in people}
     result = {}

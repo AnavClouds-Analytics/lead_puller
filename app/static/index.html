@@ -125,7 +125,7 @@ async function busy(btn, fn) {
 }
 
 // ------------------------------------------------------------ shell
-const NAV = [["#/new","New pull"],["#/pulls","Pulls"],["#/presets","Presets"],["#/exclusions","Do-not-pull list"],["#/credits","Credits"],["#/settings","Settings"]];
+const NAV = [["#/new","New pull"],["#/pulls","Pulls"],["#/companies","Companies"],["#/presets","Presets"],["#/exclusions","Do-not-pull list"],["#/credits","Credits"],["#/settings","Settings"]];
 function shell(content) {
   const h = location.hash || "#/new";
   const c = META ? META.credits : {};
@@ -135,7 +135,6 @@ function shell(content) {
     <div class="spacer"></div>
     <div class="credit-chip" id="creditChip">Seamless credits<b>${fmt(c.balance)}</b>
       ${c.monthly_budget ? `${fmt(c.spent_this_month)} of ${fmt(c.monthly_budget)} used this month` : `${fmt(c.spent_this_month)} used this month`}</div>
-    ${META && META.user ? `<div class="small muted" style="overflow-wrap:anywhere">${esc(META.user)}</div>` : ""}
     <a href="#" id="logout">Log out</a>
   </nav><main id="main">${content}</main></div>`;
 }
@@ -145,13 +144,13 @@ async function route() {
   clearInterval(POLL); POLL = null; CURRENT_PULL = null;
   const h = location.hash || "#/new";
   const st = await api("/api/auth/status");
-  if (!st.logged_in) return renderLogin(st.needs_setup);
+  if (!st.logged_in) return renderLogin(st.no_password);
   if (h === "#/login") { location.hash = "#/new"; return; }
   await refreshMeta();
   const app = $("#app");
   let m;
   if ((m = h.match(/^#\/pull\/(\d+)/))) { app.innerHTML = shell('<div class="muted">Loading…</div>'); return renderPull(+m[1]); }
-  const pages = {"#/new":renderNew,"#/pulls":renderPulls,"#/presets":renderPresets,"#/exclusions":renderExclusions,"#/credits":renderCredits,"#/settings":renderSettings};
+  const pages = {"#/new":renderNew,"#/pulls":renderPulls,"#/presets":renderPresets,"#/exclusions":renderExclusions,"#/companies":renderCompanies,"#/credits":renderCredits,"#/settings":renderSettings};
   app.innerHTML = shell('<div class="muted">Loading…</div>');
   await (pages[h] || renderNew)();
 }
@@ -162,15 +161,16 @@ document.addEventListener("click", e => {
 function setMain(html) { $("#main").innerHTML = html; }
 
 // ------------------------------------------------------------ login
-function renderLogin(setup) {
+function renderLogin(noPassword) {
   $("#app").innerHTML = `<div class="center-box"><div class="card">
-    <h1>Lead Puller</h1><p class="sub">${setup ? "First time here. Create the login for this tool: your email and a password (at least 8 characters)." : "Log in to continue."}</p>
-    <form id="lf"><div class="field"><label>Email</label><input type="email" id="em" autocomplete="username" required autofocus></div>
-    <div class="field"><label>Password</label><input type="password" id="pw" autocomplete="${setup?"new-password":"current-password"}" required></div>
-    <button class="btn primary" style="width:100%">${setup ? "Create login" : "Log in"}</button></form></div></div>`;
+    <h1>Lead Puller</h1>${noPassword ? `<div class="notice warn">No password is set yet. Ask your developer to add <b>APP_PASSWORD</b> to the .env file and restart the app.</div>` :
+    `<p class="sub">Log in to continue.</p>
+    <form id="lf"><div class="field"><label>Password</label><input type="password" id="pw" autocomplete="current-password" autofocus></div>
+    <button class="btn primary" style="width:100%">Log in</button></form>`}</div></div>`;
+  if (noPassword) return;
   $("#lf").onsubmit = async e => {
     e.preventDefault();
-    try { await api(setup ? "/api/auth/setup" : "/api/auth/login", {body:{email:$("#em").value, password:$("#pw").value}}); location.hash="#/new"; route(); }
+    try { await api("/api/auth/login", {body:{password:$("#pw").value}}); location.hash="#/new"; route(); }
     catch(err) { toast(err.message, true); }
   };
 }
@@ -186,7 +186,7 @@ async function renderNew() {
   const presets = (await api("/api/presets")).rows;
   const keysMissing = !META.has_seamless_key || !META.has_claude_key;
   setMain(`<h1>New pull</h1><p class="sub">Describe who you want. Claude turns it into Seamless filters — you check them before any credits are spent.</p>
-    ${keysMissing ? `<div class="notice warn">Add your ${!META.has_seamless_key?"Seamless":""}${!META.has_seamless_key&&!META.has_claude_key?" and ":""}${!META.has_claude_key?"Claude":""} API key in <a href="#/settings">Settings</a> first.</div>` : ""}
+    ${keysMissing ? `<div class="notice warn">Missing ${[!META.has_seamless_key&&"SEAMLESS_API_KEY",!META.has_claude_key&&"ANTHROPIC_API_KEY"].filter(Boolean).join(" and ")} in the .env file. Ask your developer to add ${keysMissing&&!META.has_seamless_key&&!META.has_claude_key?"them":"it"} and restart the app.</div>` : ""}
     <div class="card prompt-box"><textarea id="prompt" placeholder="e.g. VP Engineering and CTOs at US SaaS companies, 50–500 employees, using Salesforce, 2,000 people"></textarea>
       <div class="row" style="margin-top:10px;justify-content:space-between">
         <div class="row" style="gap:6px">${EXAMPLES.map((x,i)=>`<button class="example" data-ex="${i}">${esc(x.split(",")[0])}…</button>`).join("")}</div>
@@ -345,16 +345,21 @@ async function stageDraft(p) {
     <div class="card"><div class="row" style="gap:8px"><input id="refine" placeholder="Adjust in words, e.g. “also include Directors” or “only companies over 200 people”" style="flex:1;min-width:240px"><button class="btn" id="refineBtn">Adjust</button></div>
       ${p.prompt ? `<div class="small muted" style="margin-top:8px">Your request: ${esc(p.prompt)}</div>` : ""}</div>
     <div class="card" id="editor"><h2>Search filters</h2><div class="small muted" style="margin-bottom:6px">Nothing is spent until you press Preview.</div>${filterEditor(p.filters, true)}</div>
+    <div class="card"><h2>Company rules for this pull</h2><div class="grid g2">
+      <div class="field"><label>Skip companies pulled in the last … days</label><input type="number" id="cooldown" min="0" value="${p.company_cooldown ?? META.defaults.company_cooldown}"><div class="help">Across all your earlier pulls. 0 = don't skip. Default from .env: ${META.defaults.company_cooldown} days. Manage companies on the <a href="#/companies">Companies</a> page.</div></div>
+      <div class="field"><label>Max people per company in this pull</label><input type="number" id="cap0" min="0" value="${p.per_company_cap ?? META.defaults.per_company_cap}"><div class="help">0 = no limit. Default from .env: ${META.defaults.per_company_cap}.</div></div></div></div>
     <div class="row" style="justify-content:space-between"><div class="row"><input id="presetName" placeholder="Preset name" style="width:200px"><button class="btn" id="savePreset">Save as preset</button></div>
-      <button class="btn primary" id="previewBtn">Preview — about 3 credits</button></div>`;
+      <button class="btn primary" id="previewBtn">Preview — about ${Math.ceil(META.defaults.preview_size/10)} credits</button></div>`;
 }
 async function stagePreview(p) {
   const s = p.stats;
   const sample = (await api(`/api/pulls/${p.id}/contacts?view=all&limit=25`)).rows;
   const fit = s.fit || {};
   const est = n => Math.ceil(n / 10);
-  return `<div class="grid g4" style="margin-bottom:16px">
-      <div class="stat"><div class="k">Matching people in Seamless</div><div class="v">${fmt(p.total_matches)}</div><div class="h">for these filters</div></div>
+  return `${p.started_from ? `<div class="notice info">${esc(p.started_from)} ${p.started_from.startsWith("Same search") ? `<button class="btn small" id="fromTop" style="margin-left:6px">Start from the top instead</button>` : ""}</div>` : ""}
+    ${p.company_cooldown ? `<div class="small muted" style="margin:-4px 0 10px">Skipping companies pulled in the last ${fmt(p.company_cooldown)} days.</div>` : ""}
+    <div class="grid g4" style="margin-bottom:16px">
+      <div class="stat"><div class="k">Matching people in Seamless</div><div class="v">${fmt(p.total_matches)}</div><div class="h">for these filters (before skips)</div></div>
       <div class="stat"><div class="k">Sample checked</div><div class="v">${fmt(s.seen)}</div><div class="h">${fmt(s.kept)} kept · ${fmt(s.skipped)} skipped</div></div>
       <div class="stat"><div class="k">Fit in sample</div><div class="v">${fmt(fit.high||0)} <span class="small muted">good</span></div><div class="h">${fmt(fit.medium||0)} maybe · ${fmt(fit.low||0)} poor${fit.unrated?` · ${fmt(fit.unrated)} unrated`:""}</div></div>
       <div class="stat"><div class="k">Credits spent so far</div><div class="v">${fmt(p.search_credits)}</div><div class="h">balance ${fmt(p.credits.balance)}</div></div></div>
@@ -416,7 +421,11 @@ function stageResearching(p) {
 }
 async function stageDone(p) {
   const s = p.stats, rate = s.submitted ? Math.round(s.with_email / s.submitted * 100) : 0;
+  const dup = s.dup_missing || 0;
   return `${p.stop_reason ? `<div class="notice info">${esc(p.stop_reason)}</div>` : ""}
+    ${dup ? `<div class="notice warn"><b>${fmt(dup)} people were already researched in your Seamless account before</b>, so Seamless didn't return their details here (and normally didn't charge).
+      <div class="row" style="margin-top:8px"><button class="btn primary small" id="fillSaved">Fill them in from Seamless saved contacts (free)</button>
+      <span class="small muted">Matches only on the exact LinkedIn profile, or exact name + company when there's a single match.</span></div></div>` : ""}
     <div class="grid g4" style="margin-bottom:16px">
       <div class="stat"><div class="k">Researched</div><div class="v">${fmt(s.submitted)}</div><div class="h">people</div></div>
       <div class="stat"><div class="k">With email</div><div class="v">${fmt(s.with_email)}</div><div class="h">${rate}% hit rate</div></div>
@@ -474,13 +483,14 @@ function wirePull(p) {
     });
     $("#previewBtn").onclick = e => busy(e.currentTarget, async () => {
       clearTimeout(saveTimer);
-      await api("/api/pulls/" + id, {method:"PATCH", body:{filters: readFilters(ed)}});
+      await api("/api/pulls/" + id, {method:"PATCH", body:{filters: readFilters(ed), company_cooldown:+$("#cooldown").value||0, per_company_cap:+$("#cap0").value||0}});
       await api(`/api/pulls/${id}/preview`, {body:{}}); renderPull(id);
     });
   }
   if (p.status === "previewed") {
     const upd = () => { const n = +$("#target").value || 0; $("#est").textContent = n ? `about ${fmt(Math.ceil(n/10))}–${fmt(Math.ceil(n*1.6/10))} credits` : "—"; };
     $("#target").oninput = upd; upd();
+    $("#fromTop") && ($("#fromTop").onclick = e => busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/preview`, {body:{from_top:true}}); renderPull(id); }));
     $("#backBtn").onclick = e => busy(e.currentTarget, async () => { await api(`/api/pulls/${id}/back-to-filters`, {body:{}}); renderPull(id); });
     $("#collectBtn").onclick = e => busy(e.currentTarget, async () => {
       await api(`/api/pulls/${id}/collect`, {body:{target:+$("#target").value, per_company_cap:+$("#cap").value}}); renderPull(id);
@@ -533,6 +543,9 @@ function wirePull(p) {
     $("#resTabs").onclick = e => { if (!e.target.dataset.v) return; view = e.target.dataset.v;
       document.querySelectorAll("#resTabs button").forEach(b => b.classList.toggle("on", b === e.target)); load(); };
     $("#resQ").oninput = e => { clearTimeout(t); t = setTimeout(() => { q = e.target.value; load(); }, 250); };
+    $("#fillSaved") && ($("#fillSaved").onclick = e => busy(e.currentTarget, async () => {
+      const r = await api(`/api/pulls/${id}/fill-saved`, {body:{}}); const f = r.fill_result;
+      toast(`Filled in ${fmt(f.filled)} of ${fmt(f.checked)} (read ${fmt(f.saved_contacts_read)} saved contacts).`); renderPull(id); }));
     $("#risky").onchange = e => $("#dlAnav").href = `/api/pulls/${id}/export?format=anavmail&include_risky=${e.target.checked?1:0}`;
     load();
   }
@@ -593,7 +606,7 @@ async function renderCredits() {
     <div class="grid g3" style="margin-bottom:16px">
       <div class="stat"><div class="k">Seamless balance</div><div class="v">${fmt(c.balance)}</div><div class="h">${c.balance_at?"as of "+when(c.balance_at):"not checked yet"}</div></div>
       <div class="stat"><div class="k">Spent this month (this tool)</div><div class="v">${fmt(c.spent_this_month)}</div></div>
-      <div class="stat"><div class="k">Monthly budget</div><div class="v">${c.monthly_budget?fmt(c.monthly_budget):"None"}</div><div class="h">${c.budget_left!=null?fmt(c.budget_left)+" left":'<a href="#/settings">Set one</a>'}</div></div></div>
+      <div class="stat"><div class="k">Monthly budget</div><div class="v">${c.monthly_budget?fmt(c.monthly_budget):"None"}</div><div class="h">${c.budget_left!=null?fmt(c.budget_left)+" left":'MONTHLY_CREDIT_BUDGET in .env'}</div></div></div>
     <div class="row" style="margin-bottom:12px"><button class="btn" id="chk">Check balance now (free)</button></div>
     <div class="tablewrap"><table><thead><tr><th>When</th><th>Pull</th><th>What</th><th class="right">Credits</th><th class="right">Balance after</th></tr></thead><tbody>
     ${d.rows.map(r=>`<tr><td class="nowrap">${when(r.at)}</td><td>${r.pull_id?`<a href="#/pull/${r.pull_id}">${esc(r.pull_name||"#"+r.pull_id)}</a>`:""}</td><td>${esc(r.note)}</td><td class="right">${fmt(r.credits)}</td><td class="right">${fmt(r.balance_after)}</td></tr>`).join("") || '<tr><td colspan="5" class="muted">Nothing spent yet.</td></tr>'}
@@ -604,29 +617,38 @@ async function renderCredits() {
 // ------------------------------------------------------------ settings
 async function renderSettings() {
   const s = await api("/api/settings");
-  setMain(`<h1>Settings</h1><p class="sub">Keys are stored on the server only and never shown again in the browser.</p>
-    <div class="grid g2"><div class="card"><h2>Seamless.AI</h2>
-      <div class="field"><label>API key ${s.seamless_api_key?`<span class="badge b-ok">${esc(s.seamless_api_key)}</span>`:'<span class="badge b-bad">not set</span>'}</label>
-      ${s.seamless_key_from_env ? '<div class="small muted">Set on the server (SEAMLESS_API_KEY).</div>' : `<input type="password" id="sk" placeholder="Paste a new key to replace it" autocomplete="off"><div class="help">Seamless → Settings → Public API → API Key. Checked with Seamless before saving (free).</div>`}</div>
-      <button class="btn" id="testS">Test connection</button></div>
-    <div class="card"><h2>Claude</h2>
-      <div class="field"><label>API key ${s.anthropic_api_key?`<span class="badge b-ok">${esc(s.anthropic_api_key)}</span>`:'<span class="badge b-bad">not set</span>'}</label>
-      ${s.anthropic_key_from_env ? '<div class="small muted">Set on the server (ANTHROPIC_API_KEY).</div>' : `<input type="password" id="ak" placeholder="Paste a new key to replace it" autocomplete="off"><div class="help">Used to turn your request into filters and to rate fit. From console.anthropic.com.</div>`}</div>
-      <div class="grid g2"><div class="field"><label>Filter model</label><input id="cm" value="${esc(s.claude_model)}"></div><div class="field"><label>Fit-check model</label><input id="cfm" value="${esc(s.claude_fast_model)}"></div></div>
-      <button class="btn" id="testC">Test Claude</button></div></div>
-    <div class="card"><h2>Spending and rules</h2><div class="grid g3">
-      <div class="field"><label>Monthly credit budget</label><input type="number" id="budget" min="0" value="${s.monthly_budget}"><div class="help">This tool won't spend past it in a calendar month. 0 = no budget (Seamless balance still applies).</div></div>
-      <div class="field"><label>Default max people per company</label><input type="number" id="dcap" min="0" value="${s.per_company_cap}"><div class="help">0 = no limit. Can be changed per pull.</div></div>
-      <div class="field"><label>Fit check</label><label class="switch"><input type="checkbox" id="fit" ${s.fit_scoring?"checked":""}> Claude rates each person against your request</label><div class="help">Costs a few cents of Claude usage per 1,000 people. No Seamless credits.</div></div></div>
-    <button class="btn primary" id="saveS">Save settings</button></div>`);
-  $("#saveS").onclick = e => busy(e.currentTarget, async () => {
-    const body = {monthly_budget:+$("#budget").value, per_company_cap:+$("#dcap").value, fit_scoring:$("#fit").checked, claude_model:$("#cm").value, claude_fast_model:$("#cfm").value};
-    if ($("#sk") && $("#sk").value.trim()) body.seamless_api_key = $("#sk").value.trim();
-    if ($("#ak") && $("#ak").value.trim()) body.anthropic_api_key = $("#ak").value.trim();
-    await api("/api/settings", {body}); toast("Saved."); await refreshMeta(); route();
-  });
-  $("#testS").onclick = e => busy(e.currentTarget, async () => { const r = await api("/api/settings/test-seamless", {body:{}}); toast(`Connected. Balance: ${fmt(r.balance)} credits.`); });
+  setMain(`<h1>Settings</h1><p class="sub">Everything is set in the <b>.env</b> file on the server. To change a value, ask your developer to edit that line in .env and restart the app (<code>docker compose up -d</code>).</p>
+    ${s.groups.map(g=>`<div class="card"><h2>${esc(g.group)}</h2><div class="tablewrap"><table><thead><tr><th style="width:240px">.env name</th><th style="width:200px">Current value</th><th>What it does</th></tr></thead><tbody>
+      ${g.rows.map(r=>`<tr><td><code>${esc(r.key)}</code></td><td>${r.value!==""?`<b>${esc(r.value)}</b>`:'<span class="badge b-bad">not set</span>'}</td><td class="muted">${esc(r.help)}</td></tr>`).join("")}</tbody></table></div></div>`).join("")}
+    <div class="row"><button class="btn" id="testS">Test Seamless connection (free)</button><button class="btn" id="testC">Test Claude</button></div>`);
+  $("#testS").onclick = e => busy(e.currentTarget, async () => { const r = await api("/api/settings/test-seamless", {body:{}}); toast(`Connected. Balance: ${fmt(r.balance)} credits.`); await refreshMeta(); });
   $("#testC").onclick = e => busy(e.currentTarget, async () => { await api("/api/settings/test-claude", {body:{}}); toast("Claude is working."); });
+}
+
+// ------------------------------------------------------------ companies
+async function renderCompanies(q="", status="all", offset=0) {
+  const d = await api(`/api/companies?q=${encodeURIComponent(q)}&status=${status}&offset=${offset}&limit=50`);
+  setMain(`<h1>Companies</h1><p class="sub">Every company you've researched people at. Companies pulled in the last ${fmt(d.cooldown_days)} days are skipped automatically in new pulls${d.cooldown_days?"":" (cooldown is off: COMPANY_COOLDOWN_DAYS=0)"}.</p>
+    <div class="grid g3" style="margin-bottom:16px"><div class="stat"><div class="k">Companies pulled</div><div class="v">${fmt(d.counts.all)}</div></div>
+      <div class="stat"><div class="k">Skipped right now</div><div class="v">${fmt(d.counts.cooldown)}</div><div class="h">on cooldown</div></div>
+      <div class="stat"><div class="k">Available again</div><div class="v">${fmt(d.counts.all - d.counts.cooldown)}</div></div></div>
+    <div class="card"><div class="row" style="justify-content:space-between;margin-bottom:10px"><input id="cq" value="${esc(q)}" placeholder="Search company or domain" style="max-width:320px">
+      <select id="cs" style="width:auto"><option value="all">All</option><option value="cooldown" ${status==="cooldown"?"selected":""}>Skipped now (cooldown)</option><option value="available" ${status==="available"?"selected":""}>Available again</option></select></div>
+    ${d.rows.length ? `<div class="tablewrap"><table><thead><tr><th>Company</th><th class="right">People pulled</th><th>Last pulled</th><th>Status</th><th></th></tr></thead><tbody>
+      ${d.rows.map(r=>`<tr><td><b>${esc(r.name||r.domain)}</b><div class="small muted">${esc(r.domain||"no domain")}</div></td><td class="right">${fmt(r.people)}</td>
+        <td class="nowrap">${when(r.last_at)} · <a href="#/pull/${r.last_pull_id}">#${r.last_pull_id}</a></td>
+        <td>${r.blocked?'<span class="badge b-bad">Never pull</span>':r.on_cooldown?`<span class="badge b-warn">Skipped until ${new Date(r.available_at*1000).toLocaleDateString(undefined,{day:"numeric",month:"short",year:"numeric"})}</span>`:'<span class="badge b-ok">Available</span>'}</td>
+        <td class="right nowrap">${r.on_cooldown&&!r.blocked?`<button class="btn small" data-rel="${esc(r.key)}">Allow again now</button> `:""}${!r.blocked&&r.domain?`<button class="btn small danger" data-blk="${esc(r.key)}">Never pull</button>`:""}</td></tr>`).join("")}</tbody></table></div>`
+      : '<div class="muted small">No companies yet. They appear here after a pull gets emails.</div>'}
+    <div class="row small" style="justify-content:space-between;margin-top:10px"><span class="muted">${fmt(d.total)} companies</span><div class="row">
+      ${offset>0?`<button class="btn small" id="cPrev">Previous</button>`:""}${offset+50<d.total?`<button class="btn small" id="cNext">Next</button>`:""}</div></div></div>`);
+  let t; $("#cq").oninput = e => { clearTimeout(t); t = setTimeout(() => renderCompanies(e.target.value, status, 0).then(()=>{ const el=$("#cq"); el.focus(); el.setSelectionRange(el.value.length, el.value.length); }), 300); };
+  $("#cs").onchange = e => renderCompanies(q, e.target.value, 0);
+  document.querySelectorAll("[data-rel]").forEach(b => b.onclick = () => busy(b, async () => { await api("/api/companies/release", {body:{key:b.dataset.rel}}); toast("Allowed again."); renderCompanies(q, status, offset); }));
+  document.querySelectorAll("[data-blk]").forEach(b => b.onclick = async () => { if (!confirm("Never pull anyone from this company again? (Adds its domain to the do-not-pull list.)")) return;
+    await api("/api/companies/block", {body:{key:b.dataset.blk}}); renderCompanies(q, status, offset); });
+  $("#cPrev") && ($("#cPrev").onclick = () => renderCompanies(q, status, offset - 50));
+  $("#cNext") && ($("#cNext").onclick = () => renderCompanies(q, status, offset + 50));
 }
 
 route().catch(e => toast(e.message, true));

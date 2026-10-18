@@ -1,21 +1,9 @@
-# Fixed project name: this app's container, network and image are always "leadpuller-*", whatever the folder is
-# called, so docker compose commands run here can never touch AnavMail, AnavScout or anything else on the server.
-name: leadpuller
 services:
   leadpuller:
     build: .
     restart: unless-stopped
     env_file: .env
     ports:
-      - "127.0.0.1:${HOST_PORT:-8090}:8090"   # HOST_PORT in .env if 8090 is taken; put Nginx/Caddy with HTTPS in front
+      - "127.0.0.1:8090:8090"   # put Nginx/Caddy with HTTPS in front; don't expose 8090 publicly
     volumes:
       - ./data:/data
-    # Hard ceiling so this app can't take memory or CPU from the other apps on a shared server.
-    # It normally uses ~100 MB; if it ever hits the limit, only this container restarts.
-    mem_limit: 768m
-    cpus: 1.0
-    logging:                    # cap Docker's copy of the console output at 3 x 10 MB
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"

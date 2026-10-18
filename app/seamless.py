@@ -8,14 +8,11 @@ import time
 import httpx
 
 from . import db
+from .config import cfg
 
-BASE_URL = os.environ.get("SEAMLESS_BASE_URL", "https://api.seamless.ai/api/client/v1")
 # Tests swap this for an httpx.MockTransport.
 TRANSPORT = None
 
-# Seamless allows 60/min per endpoint for the whole org, shared with AnavScout on the same account.
-# Take about half so a pull here never starves AnavScout's nightly run (a 1,000-person pull needs ~50 calls).
-PER_MINUTE = int(os.environ.get("SEAMLESS_PER_MINUTE", 30))
 
 TERMINAL = {"done", "error", "missing", "duplicate", "not found", "contact-already-researched",
             "no license or credits available"}
@@ -37,12 +34,12 @@ class _Limiter:
     def wait(self, endpoint, sleep=time.sleep):
         while True:
             with self.lock:
-                now = time.time()
+                now = NOW()
                 dq = self.calls[endpoint]
                 while dq and now - dq[0] > 60:
                     dq.popleft()
                 wait_for = max(0.0, self.blocked_until[endpoint] - now)
-                if not wait_for and len(dq) >= PER_MINUTE:
+                if not wait_for and len(dq) >= cfg.RATE_LIMIT_PER_MIN:
                     wait_for = 60 - (now - dq[0]) + 0.05
                 if not wait_for:
                     dq.append(now)
@@ -54,12 +51,13 @@ class _Limiter:
             self.blocked_until[endpoint] = max(self.blocked_until[endpoint], until)
 
 
+NOW = time.time      # tests swap in a fake clock
 limiter = _Limiter()
 SLEEP = time.sleep
 
 
 def api_key():
-    return os.environ.get("SEAMLESS_API_KEY") or db.get_setting("seamless_api_key") or ""
+    return cfg.SEAMLESS_API_KEY
 
 
 def _record_headers(resp):
@@ -73,17 +71,21 @@ def _record_headers(resp):
     return resp
 
 
-def _request(method, path, endpoint, *, json=None, params=None, key=None, retries=6):
+def _request(method, path, endpoint, *, json=None, params=None, key=None, retries=6, safe_to_retry=True):
+    """safe_to_retry=False for calls that spend credits per item (research): if Seamless times out or
+    errors after receiving the request we can't know whether it charged, so we never resend automatically."""
     key = key or api_key()
     if not key:
-        raise SeamlessError("No Seamless API key yet. Add it in Settings.", code="noKey")
+        raise SeamlessError("No Seamless API key. Ask your developer to set SEAMLESS_API_KEY in .env.", code="noKey")
     headers = {"Token": key, "Content-Type": "application/json"}
     for attempt in range(retries):
         limiter.wait(endpoint, SLEEP)
         try:
             with httpx.Client(timeout=60, transport=TRANSPORT) as c:
-                resp = c.request(method, BASE_URL + path, json=json, params=params, headers=headers)
+                resp = c.request(method, cfg.SEAMLESS_BASE_URL + path, json=json, params=params, headers=headers)
         except httpx.HTTPError as e:
+            if not safe_to_retry and not isinstance(e, httpx.ConnectError):
+                raise SeamlessError(f"Seamless did not answer ({type(e).__name__}).", code="unconfirmed")
             if attempt == retries - 1:
                 raise SeamlessError(f"Could not reach Seamless: {e}", code="network")
             SLEEP(min(2 ** attempt, 30))
@@ -94,16 +96,19 @@ def _request(method, path, endpoint, *, json=None, params=None, key=None, retrie
             try:
                 until = float(reset)
             except (TypeError, ValueError):
-                until = time.time() + 20
-            limiter.block(endpoint, max(until, time.time() + 1))
+                until = NOW() + 20
+            limiter.block(endpoint, max(until, NOW() + 1))
             continue
         if resp.status_code >= 500:
+            if not safe_to_retry:
+                raise SeamlessError(f"Seamless returned a server error ({resp.status_code}).", code="unconfirmed",
+                                    status=resp.status_code)
             if attempt == retries - 1:
                 raise SeamlessError(f"Seamless server error ({resp.status_code}).", status=resp.status_code)
             SLEEP(min(2 ** attempt, 30))
             continue
         if resp.status_code in (401, 403):
-            raise SeamlessError("Seamless did not accept the API key. Check it in Settings.",
+            raise SeamlessError("Seamless did not accept the API key (SEAMLESS_API_KEY in .env).",
                                 code="badKey", status=resp.status_code)
         if resp.status_code == 422:
             body = _safe_json(resp)
@@ -163,7 +168,7 @@ def search_contacts(body, limit, next_token=None, pull_id=None):
 def research_contacts(search_result_ids, pull_id=None):
     """Submit up to 500 searchResultIds for research (1 credit each). Returns requestIds in order."""
     resp = _request("POST", "/contacts/research", "research_contacts",
-                    json={"searchResultIds": list(search_result_ids)})
+                    json={"searchResultIds": list(search_result_ids)}, safe_to_retry=False)
     data = _safe_json(resp)
     ids = data.get("requestIds") or []
     if ids:
@@ -176,4 +181,12 @@ def poll_research(request_ids):
     """Poll up to 500 requestIds. Free. Returns list of result rows (each carries its requestId)."""
     resp = _request("GET", "/contacts/research/poll", "poll",
                     params={"requestIds": ",".join(request_ids)})
+    return _safe_json(resp).get("data") or []
+
+
+def org_contacts(start_iso, end_iso, page, limit=500):
+    """Contacts already researched in your Seamless org (free). Used to fill in people Seamless reports as
+    already researched, instead of paying again."""
+    resp = _request("GET", "/contacts", "org_contacts",
+                    params={"startDate": start_iso, "endDate": end_iso, "page": page, "limit": limit})
     return _safe_json(resp).get("data") or []

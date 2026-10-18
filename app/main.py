@@ -13,10 +13,10 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, Up
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import claude, db, seamless, worker
+from .config import cfg, shown_settings
 from .filters import FILTERS, clean_filters, search_filter_count
 
 STATIC = os.path.join(os.path.dirname(__file__), "static")
-SESSION_DAYS = 30
 _worker = None
 
 
@@ -52,62 +52,24 @@ async def _claude_err(request, exc):
 
 
 # ---------------------------------------------------------------- auth
-def _hash(password, salt):
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
-
-
-def _env_users():
-    """ADMIN_USERS=email:password,email2:password2 (same format as AnavMail)."""
-    out = {}
-    for pair in os.environ.get("ADMIN_USERS", "").split(","):
-        if ":" in pair:
-            email, pw = pair.split(":", 1)
-            if email.strip() and pw.strip():
-                out[email.strip().lower()] = pw.strip()
-    return out
-
-
-def _known_user(email):
-    """With ADMIN_USERS set, only those accounts exist; otherwise the account created on first visit."""
-    env = _env_users()
-    if env:
-        return email in env
-    return email in (db.get_setting("users") or {})
-
-
-def _check_login(email, password):
-    email = (email or "").strip().lower()
-    env = _env_users()
-    if env:
-        expected = env.get(email)
-        return expected is not None and hmac.compare_digest(password.encode(), expected.encode())
-    stored = (db.get_setting("users") or {}).get(email)
-    if not stored:
-        return False
-    salt, h = stored.split("$", 1)
-    return hmac.compare_digest(_hash(password, salt), h)
-
-
-def _needs_setup():
-    return not _env_users() and not db.get_setting("users")
+def _check_password(password):
+    return bool(cfg.APP_PASSWORD) and hmac.compare_digest(password.encode(), cfg.APP_PASSWORD.encode())
 
 
 def require_login(request: Request):
-    """Returns the logged-in email. A session ends when its user is removed from ADMIN_USERS."""
     token = request.cookies.get("lp_session")
     if token:
-        row = db.q1("SELECT created_at, email FROM sessions WHERE token=?", (token,))
-        if (row and row["email"] and time.time() - row["created_at"] < SESSION_DAYS * 86400
-                and _known_user(row["email"])):
-            return row["email"]
+        row = db.q1("SELECT created_at FROM sessions WHERE token=?", (token,))
+        if row and time.time() - row["created_at"] < cfg.SESSION_DAYS * 86400:
+            return True
     raise HTTPException(401, "Please log in.")
 
 
-def _start_session(response, email):
+def _start_session(response):
     token = secrets.token_urlsafe(32)
-    db.x("INSERT INTO sessions(token, created_at, email) VALUES(?,?,?)", (token, time.time(), email))
-    response.set_cookie("lp_session", token, max_age=SESSION_DAYS * 86400, httponly=True, samesite="lax",
-                        secure=os.environ.get("COOKIE_SECURE", "0") == "1")
+    db.x("INSERT INTO sessions(token, created_at) VALUES(?,?)", (token, time.time()))
+    response.set_cookie("lp_session", token, max_age=cfg.SESSION_DAYS * 86400, httponly=True, samesite="lax",
+                        secure=cfg.COOKIE_SECURE)
 
 
 _login_fails = []
@@ -116,27 +78,11 @@ _login_fails = []
 @app.get("/api/auth/status")
 def auth_status(request: Request):
     try:
-        email = require_login(request)
+        require_login(request)
+        ok = True
     except HTTPException:
-        email = None
-    return {"logged_in": bool(email), "email": email, "needs_setup": _needs_setup()}
-
-
-@app.post("/api/auth/setup")
-async def auth_setup(request: Request, response: Response):
-    if not _needs_setup():
-        raise HTTPException(400, "An account already exists.")
-    body = await request.json()
-    email = (body.get("email") or "").strip().lower()
-    pw = (body.get("password") or "").strip()
-    if "@" not in email or "." not in email.split("@")[-1]:
-        raise HTTPException(400, "Enter a valid email address.")
-    if len(pw) < 8:
-        raise HTTPException(400, "Use at least 8 characters.")
-    salt = secrets.token_hex(8)
-    db.set_setting("users", {email: f"{salt}${_hash(pw, salt)}"})
-    _start_session(response, email)
-    return {"ok": True}
+        ok = False
+    return {"logged_in": ok, "no_password": not cfg.APP_PASSWORD}
 
 
 @app.post("/api/auth/login")
@@ -146,11 +92,12 @@ async def auth_login(request: Request, response: Response):
     if len(_login_fails) >= 10:
         raise HTTPException(429, "Too many wrong passwords. Wait 5 minutes.")
     body = await request.json()
-    email = (body.get("email") or "").strip().lower()
-    if not _check_login(email, body.get("password") or ""):
+    if not cfg.APP_PASSWORD:
+        raise HTTPException(400, "No password set. Ask your developer to set APP_PASSWORD in .env.")
+    if not _check_password(body.get("password") or ""):
         _login_fails.append(now)
-        raise HTTPException(401, "Wrong email or password.")
-    _start_session(response, email)
+        raise HTTPException(401, "Wrong password.")
+    _start_session(response)
     return {"ok": True}
 
 
@@ -171,55 +118,25 @@ def _mask(key):
 
 
 def _credit_summary():
-    budget = db.get_setting("monthly_budget") or 0
+    budget = cfg.MONTHLY_CREDIT_BUDGET
     spent = db.month_spend()
     return {"balance": db.get_setting("credit_balance"), "balance_at": db.get_setting("credit_balance_at"),
             "monthly_budget": budget, "spent_this_month": spent,
             "budget_left": max(0, budget - spent) if budget else None}
 
 
-@app.get("/api/meta")
-def meta(user: str = Depends(require_login)):
-    return {"user": user, "filters": FILTERS, "credits": _credit_summary(),
+@app.get("/api/meta", dependencies=[Depends(require_login)])
+def meta():
+    return {"filters": FILTERS, "credits": _credit_summary(),
             "has_seamless_key": bool(seamless.api_key()), "has_claude_key": bool(claude.api_key()),
-            "defaults": {"per_company_cap": db.get_setting("per_company_cap", 3),
-                         "preview_cost": 3, "page_size": worker.PAGE_LIMIT}}
+            "defaults": {"per_company_cap": cfg.MAX_PER_COMPANY, "company_cooldown": cfg.COMPANY_COOLDOWN_DAYS,
+                         "preview_size": cfg.PREVIEW_SIZE, "page_size": cfg.PAGE_SIZE}}
 
 
 @app.get("/api/settings", dependencies=[Depends(require_login)])
 def get_settings():
-    return {
-        "seamless_api_key": _mask(seamless.api_key()),
-        "seamless_key_from_env": bool(os.environ.get("SEAMLESS_API_KEY")),
-        "anthropic_api_key": _mask(claude.api_key()),
-        "anthropic_key_from_env": bool(os.environ.get("ANTHROPIC_API_KEY")),
-        "monthly_budget": db.get_setting("monthly_budget") or 0,
-        "per_company_cap": db.get_setting("per_company_cap", 3),
-        "fit_scoring": db.get_setting("fit_scoring", True),
-        "claude_model": db.get_setting("claude_model") or claude.DEFAULT_MODEL,
-        "claude_fast_model": db.get_setting("claude_fast_model") or claude.DEFAULT_FAST_MODEL,
-        "credits": _credit_summary(),
-    }
-
-
-@app.post("/api/settings", dependencies=[Depends(require_login)])
-async def save_settings(request: Request):
-    body = await request.json()
-    if body.get("seamless_api_key"):
-        key = body["seamless_api_key"].strip()
-        seamless.test_connection(key)  # refuse to save a key Seamless rejects
-        db.set_setting("seamless_api_key", key)
-    if body.get("anthropic_api_key"):
-        db.set_setting("anthropic_api_key", body["anthropic_api_key"].strip())
-    for k in ("monthly_budget", "per_company_cap"):
-        if k in body and body[k] not in (None, ""):
-            db.set_setting(k, max(0, int(body[k])))
-    if "fit_scoring" in body:
-        db.set_setting("fit_scoring", bool(body["fit_scoring"]))
-    for k in ("claude_model", "claude_fast_model"):
-        if body.get(k):
-            db.set_setting(k, body[k].strip())
-    return get_settings()
+    """Read-only: every setting lives in .env. Change it there and restart the app."""
+    return {"groups": shown_settings(), "credits": _credit_summary()}
 
 
 @app.post("/api/settings/test-seamless", dependencies=[Depends(require_login)])
@@ -267,6 +184,9 @@ def _pull_stats(pid):
                             FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL
                             AND research_status NOT IN ('queued','researching') GROUP BY 1 ORDER BY researched DESC""",
                          (pid,)),
+        "dup_missing": one("""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL
+                              AND LOWER(research_status) IN ('duplicate','contact-already-researched')
+                              AND (email IS NULL OR email='')"""),
         "research_outcomes": db.q("""SELECT research_status AS status, COUNT(*) n FROM contacts
                                      WHERE pull_id=? AND submitted_at IS NOT NULL GROUP BY 1 ORDER BY n DESC""", (pid,)),
     }
@@ -309,8 +229,7 @@ async def interpret(request: Request):
         db.x("DELETE FROM contacts WHERE pull_id=? AND submitted_at IS NULL", (pid,))
         return _pull_out(pid)
     out = claude.prompt_to_filters(prompt)
-    cap = db.get_setting("per_company_cap", 3)
-    pid = db.create_pull(out["name"], prompt, out["filters"], out["notes"], target=out["target"], per_company_cap=cap)
+    pid = db.create_pull(out["name"], prompt, out["filters"], out["notes"], target=out["target"])
     return _pull_out(pid)
 
 
@@ -318,9 +237,8 @@ async def interpret(request: Request):
 async def create_pull(request: Request):
     body = await request.json()
     filters = clean_filters(body.get("filters") or {})
-    cap = db.get_setting("per_company_cap", 3)
     pid = db.create_pull((body.get("name") or "New pull")[:80], body.get("prompt") or "", filters, [],
-                         target=int(body.get("target") or 0), per_company_cap=cap)
+                         target=int(body.get("target") or 0))
     return _pull_out(pid)
 
 
@@ -338,6 +256,11 @@ async def edit_pull(pid: int, request: Request):
     fields = {}
     if "name" in body:
         fields["name"] = (body["name"] or "Untitled")[:80]
+    for k in ("company_cooldown", "per_company_cap"):
+        if k in body and body[k] not in (None, ""):
+            if pull["status"] != "draft":
+                raise worker.PullError("Change this before Preview (or use “Edit filters”).")
+            fields[k] = max(0, int(body[k]))
     if "filters" in body:
         if pull["status"] not in ("draft", "previewed", "collected"):
             raise worker.PullError("Filters can't change while the pull is running.")
@@ -352,8 +275,12 @@ async def edit_pull(pid: int, request: Request):
 
 
 @app.post("/api/pulls/{pid}/preview", dependencies=[Depends(require_login)])
-def preview(pid: int):
-    worker.run_preview(pid)
+async def preview(pid: int, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    worker.run_preview(pid, from_top=bool(body.get("from_top")))
     return _pull_out(pid)
 
 
@@ -371,6 +298,19 @@ async def research(pid: int, request: Request):
     return _pull_out(pid)
 
 
+@app.post("/api/pulls/{pid}/fill-saved", dependencies=[Depends(require_login)])
+def fill_saved(pid: int):
+    pull = db.get_pull(pid)
+    if not pull:
+        raise HTTPException(404)
+    if pull["status"] in ("collecting", "researching"):
+        raise worker.PullError("Wait until research has finished.")
+    result = worker.fill_from_saved(pid)
+    out = _pull_out(pid)
+    out["fill_result"] = result
+    return out
+
+
 @app.post("/api/pulls/{pid}/{action}", dependencies=[Depends(require_login)])
 def pull_action(pid: int, action: str):
     if action == "pause":
@@ -382,7 +322,8 @@ def pull_action(pid: int, action: str):
     elif action == "rerun":
         pull = db.get_pull(pid)
         new_id = db.create_pull(pull["name"] + " (new people)", pull["prompt"], pull["filters"], pull["notes"],
-                                target=pull["target"], per_company_cap=pull["per_company_cap"], cloned_from=pid)
+                                target=pull["target"], per_company_cap=pull["per_company_cap"], cloned_from=pid,
+                                cooldown=pull["company_cooldown"])
         return _pull_out(new_id)
     elif action == "back-to-filters":
         pull = db.get_pull(pid)
@@ -478,6 +419,13 @@ def _export_rows(pid, only_email):
     return out
 
 
+def _cell(v):
+    """Stop spreadsheet formula injection: text starting with = + - @ (or tab/CR) is prefixed with '."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + v
+    return v
+
+
 def _risky(status):
     s = (status or "").lower()
     return s and s not in ("valid", "verified", "deliverable")
@@ -493,11 +441,18 @@ def export(pid: int, format: str = "anavmail", include_risky: int = 1):
         rows = [r for r in _export_rows(pid, True)
                 if include_risky or not _risky(r["email_status"])]
         rows = [r for r in rows if (r["email_status"] or "").lower() != "invalid"]
+        seen_emails, unique = set(), []
+        for r in rows:
+            e = r["email"].strip().lower()
+            if e not in seen_emails:
+                seen_emails.add(e)
+                unique.append(r)
+        rows = unique
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["email", "first_name", "last_name", "company", "title", "linkedin"])
         for r in rows:
-            w.writerow([r["email"], r["first_name"], r["last_name"], r["company"], r["title"], r["li_url"]])
+            w.writerow([_cell(r[k]) for k in ("email", "first_name", "last_name", "company", "title", "li_url")])
         return _download(buf.getvalue().encode("utf-8-sig"), f"{safe}-anavmail.csv", "text/csv")
     cols = [("first_name", "First name"), ("last_name", "Last name"), ("email", "Email"),
             ("email_status", "Email status"), ("email_confidence", "Email confidence"),
@@ -511,7 +466,7 @@ def export(pid: int, format: str = "anavmail", include_risky: int = 1):
     def val(r, k):
         if k == "research_status":
             return FRIENDLY_STATUS.get((r[k] or "").lower(), r[k])
-        return r[k]
+        return _cell(r[k])
 
     if format == "xlsx":
         from openpyxl import Workbook
@@ -570,8 +525,7 @@ def use_preset(preset_id: int):
     p = db.q1("SELECT * FROM presets WHERE id=?", (preset_id,))
     if not p:
         raise HTTPException(404)
-    cap = db.get_setting("per_company_cap", 3)
-    pid = db.create_pull(p["name"], p["prompt"], json.loads(p["filters_json"]), [], per_company_cap=cap)
+    pid = db.create_pull(p["name"], p["prompt"], json.loads(p["filters_json"]), [])
     return _pull_out(pid)
 
 
@@ -679,6 +633,59 @@ def clear_exclusions(key: str = ""):
     else:
         db.x("DELETE FROM exclusions")
     return list_exclusions()
+
+
+# ---------------------------------------------------------------- company memory
+@app.get("/api/companies", dependencies=[Depends(require_login)])
+def list_companies(q: str = "", status: str = "all", offset: int = 0, limit: int = 50):
+    days = cfg.COMPANY_COOLDOWN_DAYS
+    now = time.time()
+    where, args = ["1=1"], []
+    if q:
+        where.append("(name LIKE ? OR domain LIKE ?)")
+        args += [f"%{q}%", f"%{q}%"]
+    cool = "(last_at > ? AND (released_at IS NULL OR released_at < last_at))"
+    if status == "cooldown":
+        where.append(cool)
+        args.append(now - days * 86400)
+    elif status == "available":
+        where.append("NOT " + cool)
+        args.append(now - days * 86400)
+    w = " AND ".join(where)
+    total = db.q1(f"SELECT COUNT(*) n FROM companies WHERE {w}", args)["n"]
+    rows = db.q(f"SELECT * FROM companies WHERE {w} ORDER BY last_at DESC LIMIT ? OFFSET ?",
+                (*args, min(limit, 200), max(offset, 0)))
+    blocked = {r["key"] for r in db.q("SELECT key FROM exclusions WHERE kind='domain'")}
+    for r in rows:
+        released = r["released_at"] and r["released_at"] >= r["last_at"]
+        r["available_at"] = None if released else r["last_at"] + days * 86400
+        r["on_cooldown"] = bool(days and not released and r["available_at"] > now)
+        r["blocked"] = bool(r["domain"]) and ("domain:" + r["domain"]) in blocked
+    counts = {
+        "all": db.q1("SELECT COUNT(*) n FROM companies")["n"],
+        "cooldown": db.q1(f"SELECT COUNT(*) n FROM companies WHERE {cool}", (now - days * 86400,))["n"] if days else 0,
+    }
+    return {"total": total, "rows": rows, "counts": counts, "cooldown_days": days}
+
+
+@app.post("/api/companies/release", dependencies=[Depends(require_login)])
+async def release_company(request: Request):
+    body = await request.json()
+    db.x("UPDATE companies SET released_at=? WHERE key=?", (time.time(), body.get("key")))
+    return {"ok": True}
+
+
+@app.post("/api/companies/block", dependencies=[Depends(require_login)])
+async def block_company(request: Request):
+    body = await request.json()
+    row = db.q1("SELECT * FROM companies WHERE key=?", (body.get("key"),))
+    if not row:
+        raise HTTPException(404)
+    if row["domain"]:
+        _add_exclusion("domain", row["domain"], "company memory")
+    else:
+        raise worker.PullError("This company has no domain on record, so it can't be blocked by domain.")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------- page

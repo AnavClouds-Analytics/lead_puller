@@ -6,14 +6,16 @@ import threading
 import time
 from contextlib import contextmanager
 
-DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(os.path.dirname(__file__)), "data"))
+from .config import cfg
+
+DATA_DIR = cfg.DATA_DIR
 DB_PATH = os.path.join(DATA_DIR, "leadpuller.db")
 _lock = threading.RLock()
 _conn = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, created_at REAL, email TEXT);
+CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, created_at REAL);
 CREATE TABLE IF NOT EXISTS presets (
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, prompt TEXT, filters_json TEXT, created_at REAL);
 CREATE TABLE IF NOT EXISTS pulls (
@@ -46,15 +48,16 @@ CREATE TABLE IF NOT EXISTS research_requests (
 CREATE INDEX IF NOT EXISTS ix_rr_pull ON research_requests(pull_id, resolved_at);
 CREATE TABLE IF NOT EXISTS seen (key TEXT PRIMARY KEY, pull_id INTEGER, created_at REAL);
 CREATE TABLE IF NOT EXISTS exclusions (key TEXT PRIMARY KEY, kind TEXT, value TEXT, source TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS companies (
+  key TEXT PRIMARY KEY, name TEXT, domain TEXT, first_at REAL, last_at REAL, first_pull_id INTEGER,
+  last_pull_id INTEGER, people INTEGER DEFAULT 0, released_at REAL);
+CREATE TABLE IF NOT EXISTS searches (
+  hash TEXT PRIMARY KEY, filters_json TEXT, cursor TEXT, cursor_pull_id INTEGER, cursor_at REAL,
+  results_seen INTEGER DEFAULT 0, exhausted_at REAL, runs INTEGER DEFAULT 0, last_pull_id INTEGER, updated_at REAL);
 CREATE TABLE IF NOT EXISTS ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at REAL, pull_id INTEGER, kind TEXT, credits INTEGER,
   balance_after INTEGER, note TEXT);
 """
-
-# Columns added after a database may already exist (SCHEMA's CREATE IF NOT EXISTS won't add them).
-MIGRATIONS = [
-    ("sessions", "email", "ALTER TABLE sessions ADD COLUMN email TEXT"),
-]
 
 
 def connect():
@@ -67,9 +70,12 @@ def connect():
             _conn.execute("PRAGMA journal_mode=WAL")
             _conn.execute("PRAGMA foreign_keys=ON")
             _conn.executescript(SCHEMA)
-            for table, column, sql in MIGRATIONS:
-                if column not in [r["name"] for r in _conn.execute(f"PRAGMA table_info({table})")]:
-                    _conn.execute(sql)
+            for col, typ in (("company_cooldown", "INTEGER"), ("search_hash", "TEXT"), ("started_from", "TEXT"),
+                             ("from_top", "INTEGER DEFAULT 0")):
+                try:
+                    _conn.execute(f"ALTER TABLE pulls ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass
         return _conn
 
 
@@ -116,6 +122,14 @@ def x(sql, args=()):
 
 
 # ---------- settings ----------
+def company_key(company, domain):
+    d = norm_domain(domain)
+    if d:
+        return "d:" + d
+    n = norm(company)
+    return ("n:" + n) if n else None
+
+
 def get_setting(key, default=None):
     row = q1("SELECT value FROM settings WHERE key=?", (key,))
     if row is None:
@@ -150,11 +164,13 @@ def update_pull(pull_id, **fields):
     x(f"UPDATE pulls SET {cols} WHERE id=?", (*fields.values(), pull_id))
 
 
-def create_pull(name, prompt, filters, notes, target=0, per_company_cap=0, cloned_from=None):
+def create_pull(name, prompt, filters, notes, target=0, per_company_cap=None, cloned_from=None, cooldown=None):
     now = time.time()
-    return x("""INSERT INTO pulls(name,prompt,filters_json,notes_json,status,target,per_company_cap,
-                cloned_from,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-             (name, prompt, json.dumps(filters), json.dumps(notes), "draft", target, per_company_cap,
+    cap = cfg.MAX_PER_COMPANY if per_company_cap is None else per_company_cap
+    cooldown = cfg.COMPANY_COOLDOWN_DAYS if cooldown is None else cooldown
+    return x("""INSERT INTO pulls(name,prompt,filters_json,notes_json,status,target,per_company_cap,company_cooldown,
+                cloned_from,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+             (name, prompt, json.dumps(filters), json.dumps(notes), "draft", target, cap, cooldown,
               cloned_from, now, now))
 
 

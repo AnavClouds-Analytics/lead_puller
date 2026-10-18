@@ -1,78 +1,80 @@
-# Lead Puller (AnavClouds × Seamless.AI)
+# Lead Puller (AnavClouds × Seamless.AI) — v1.1.1
 
 Type who you want in plain English → Claude turns it into Seamless filters → preview a small sample →
 collect the list → choose who to research → download an AnavMail-ready CSV.
+
+**All settings live in `.env`.** To change one, edit that line and run `docker compose up -d`.
+The Settings page in the app shows the current values (secrets masked) but can't change them.
 
 ## How a pull works
 
 | Step | What happens | Seamless credits |
 |---|---|---|
-| 1. Filters | Claude reads the request, fills the filter form, lists every assumption it made. You can edit any filter, or adjust in words. | 0 |
-| 2. Preview | One search page of 25. Shows total matches, a sample, fit ratings, country/size breakdown. Non-US locations are checked against Seamless's location list first (free). | ~3 |
-| 3. Collect | Pages of 50 until your target is reached. Skips: do-not-pull list, anyone pulled before, duplicates, per-company limit, "skip" words/industries/domains. Stops early if most results are being skipped. | 1 per 10 results returned (skipped ones count) |
-| 4. Choose | Everyone / good + maybe fit / good only / first N, plus tick boxes. Checks your monthly budget and live balance before starting. | 0 |
-| 5. Research | Batches of 100, polled every 4 s. Results are matched to each person by Seamless's `searchResultId`, never by order. Pause/resume/stop any time. | 1 per person |
-| 6. Results | Hit rate by country, AnavMail CSV, full CSV, Excel. "Run again, new people only" repeats the search and skips everyone already pulled. | 0 |
+| 1. Filters | Claude fills the filter form and lists every assumption. Edit any filter, or adjust in words. Set company rules for this pull (cooldown days, max per company). | 0 |
+| 2. Preview | One small search page. Non-US locations are checked against Seamless's location list first (free). If the same filters were run before, it **continues where that run stopped** (button to start from the top instead). | ~3 |
+| 3. Collect | Pages until the target is reached. Skips: do-not-pull list, anyone pulled before, **companies pulled within the cooldown**, duplicates, per-company limit, skip words/industries/domains. Stops early if most results are being skipped. | 1 per 10 results returned (skipped ones count) |
+| 4. Choose | Everyone / good + maybe fit / good only / first N, plus tick boxes. Checks the monthly budget and live balance first. | 0 |
+| 5. Research | Batches sent for research and checked every few seconds. Right before paying, each person and company is re-checked (another pull may have taken them meanwhile). | 1 per person |
+| 6. Results | Hit rate by country, AnavMail CSV, full CSV, Excel, "Run again, new people only", and **Fill in from Seamless saved contacts** for people Seamless says were already researched. | 0 |
 
-Everything runs on the server in small steps with all state in SQLite, so closing the browser or restarting
-the server does not lose or double-charge anything. Out of credits / budget / bad key → the pull pauses with
-the reason and a Resume button.
+## Company memory and cooldown
+Every company someone is researched at is remembered (by website domain, else company name). New pulls skip
+those companies for `COMPANY_COOLDOWN_DAYS` (default 90). The **Companies** page lists them with
+"Skipped until <date>", **Allow again now**, and **Never pull** (adds the domain to the do-not-pull list).
 
-**AnavMail CSV columns:** `email, first_name, last_name, company, title, linkedin` — people with an email only,
-invalid emails and do-not-pull entries removed, "risky" emails optional.
+## Money and data safety (what the tests prove)
+`tests/test_money.py` runs every scenario against a deliberately awkward fake Seamless that charges exactly
+as Seamless's docs say and keeps its own books. After each scenario it checks:
+- the tool's credit ledger equals what "Seamless" charged, to the credit;
+- nobody is ever charged for twice — across pulls, two pulls at once, restarts, pause/stop;
+- every email/phone is attached to the right person (emails in the fake encode the person's id), even when
+  results come back shuffled, partial, duplicated, without their searchResultId, or with requestIds reordered;
+- exports have no duplicate emails, no invalid emails, nothing on the do-not-pull list, and no spreadsheet formulas;
+- the monthly budget is never exceeded; the 60-calls/min limit is never exceeded;
+- if Seamless times out or errors **after** a research request (so it may have charged), the tool pauses and
+  never resends on its own.
 
-## Credits — facts from Seamless's docs
-- Search: 1 credit per 10 rows returned. Research: 1 credit per person submitted. Polling and location lookups are free.
+The tests were also checked by deliberately breaking the tool 17 ways (matching by order, skipping the re-check,
+ignoring the cooldown, retrying research, loose fill-in matching, …): every real breakage makes a test fail.
+Run: `python -m pytest -q` (≈15 s). Run the chaos tests with other random seeds: `FAKE_SEED=7 python -m pytest -q`.
+
+## Facts from Seamless's docs the tool relies on
+- Search: 1 credit per 10 rows returned. Research: 1 credit per person submitted. Polling, location lookups
+  and reading your org's saved contacts are free.
 - Live balance comes back in the `X-PublicAPI-Credits` header on every call; the app shows it.
-- Rate limit is 60 requests/min per endpoint for the whole Seamless org; the app stays at 55 and backs off on 429.
 - `duplicate` / `contact-already-researched`: someone in your Seamless org researched that person before;
-  Seamless doesn't return them again here. They're in your Seamless saved contacts.
+  Seamless's de-duplication normally doesn't charge them, and doesn't return their details. The ledger books
+  them as 1 at submit and credits it back when the answer comes. The live balance is always the source of truth.
+- Fill-in from saved contacts matches only on the exact LinkedIn profile (with one consistent email), or exact
+  name + company when exactly one saved contact has it. Anything less certain is left blank.
+
+## Before the first real pull (things only real data can confirm)
+1. Run a pull of ~30 people and compare the Credits page with Seamless → Settings → Billing.
+2. Open the AnavMail CSV and spot-check 5 people against their LinkedIn.
+3. If anyone shows "Already researched before", try Fill-in and spot-check those too.
 
 ## Run it on the server (Docker)
-On a server that already runs other apps, first run the read-only check (port, folder, Docker access, memory,
-disk, Nginx hostname): `bash deploy/preflight.sh [leads.yourdomain.com]`. The compose project is pinned to the name
-`leadpuller`, capped at 768 MB / 1 CPU, and listens on 127.0.0.1 only.
 ```bash
-cp .env.example .env        # set ADMIN_USERS (and the keys, or add them later in Settings)
+cp .env.example .env        # fill in APP_PASSWORD, SEAMLESS_API_KEY, ANTHROPIC_API_KEY, MONTHLY_CREDIT_BUDGET
 docker compose up -d --build
 ```
-Then put HTTPS in front (Caddy example: `leads.yourdomain.com { reverse_proxy 127.0.0.1:8090 }`).
-Data lives in `./data/leadpuller.db` — back it up; it holds history, the already-pulled list and the do-not-pull list.
-Run **one** uvicorn worker only (the job runner is inside the process).
-
-Updating later (backs up the database, replaces the code, rebuilds, waits for `/healthz`; `.env` and `data/` are kept):
-```bash
-bash deploy/update.sh /tmp/lead-puller.zip   # uploaded package (.zip, .tgz or .tar.gz)
-bash deploy/update.sh                        # or, in a git checkout: latest commit of $DEPLOY_BRANCH (default main)
-```
-Backups: `bash deploy/backup.sh` writes `data/backups/leadpuller-<date>.db` and keeps the newest 14.
-Nightly, from `crontab -e`: `0 3 * * * cd /path/to/lead-puller && bash deploy/backup.sh >> data/backups/cron.log 2>&1`
-
-Without Docker:
-```bash
-pip install -r requirements.txt
-ADMIN_USERS=you@company.com:password DATA_DIR=./data uvicorn app.main:app --host 127.0.0.1 --port 8090 --workers 1
-```
+Put HTTPS in front (Caddy: `leads.yourdomain.com { reverse_proxy 127.0.0.1:8090 }`).
+Data lives in `./data/leadpuller.db` — back it up: it holds history, the already-pulled people, the company
+memory and the do-not-pull list. Run **one** app process only (the job runner lives inside it).
 
 ## Try it with fake data (no credits)
 ```bash
-python -m tests.demo_server     # http://localhost:8765, login demo@anavclouds.test / demo-pass-1
-python -m pytest -q             # end-to-end tests against fake Seamless + Claude
+python -m tests.demo_server     # http://localhost:8765, password demo-pass-1
 ```
 
 ## Code map
-- `app/filters.py` — every Seamless search filter and allowed value (one source for the form, Claude and validation)
-- `app/seamless.py` — API client: auth header `Token`, rate limiter, 429/5xx retries, 422 credit/licence errors, balance header
-- `app/claude.py` — request → filters (tool use), fit rating (matched by id)
-- `app/worker.py` — preview, collect, research, pause/resume/stop, background loop
-- `app/main.py` — login, REST API, exports, presets, do-not-pull list
+- `app/config.py` — every setting, read from `.env`
+- `app/filters.py` — Seamless search filters and allowed values
+- `app/seamless.py` — API client: rate limiter, safe retries, never auto-resends research, balance header
+- `app/claude.py` — request → filters, fit rating (matched by id)
+- `app/worker.py` — preview, collect, research, company memory, search memory, fill-in, background loop
+- `app/main.py` — login, REST API, exports, presets, companies, do-not-pull list
 - `app/static/index.html` — the whole UI (no build step)
-- `tests/` — fake Seamless/Claude, end-to-end tests, demo server
+- `tests/` — awkward fake Seamless/Claude, money tests, demo server
 
-## Notes for the devs
-- Keys can be set in `.env` (override the Settings page) or in Settings (stored in the SQLite file — keep `./data` readable only by the app user).
-- Login: email + password. `ADMIN_USERS=a@x.com:pw1,b@x.com:pw2` in env (one pair per team member), or, if that's
-  empty, the first visitor creates a single account. Sessions last 30 days; removing someone from `ADMIN_USERS`
-  (and restarting) ends their sessions.
-- Not in v1: pushing straight into AnavMail campaigns, reply-likelihood scoring, a daily automatic pull.
-# lead_puller
+Not in this version: pushing straight into AnavMail campaigns, reply-likelihood scoring, a daily automatic pull.
