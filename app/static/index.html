@@ -23,15 +23,17 @@ a{color:var(--brand);text-decoration:none} a:hover{text-decoration:underline}
 button,input,select,textarea{font:inherit;color:var(--ink)}
 input,select,textarea{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;width:100%}
 input:focus,select:focus,textarea:focus{outline:2px solid var(--brand-soft);border-color:var(--brand)}
-header.top{background:var(--panel);border-bottom:1px solid var(--line)}
-.topin{max-width:1240px;margin:0 auto;padding:0 24px;display:flex;flex-wrap:wrap;align-items:center;gap:8px 24px;min-height:60px}
-.logo{font-weight:700;font-size:16px;letter-spacing:-.01em}
-nav.main{display:flex;flex-wrap:wrap;gap:4px}
-nav.main a{padding:8px 12px;border-radius:8px;color:var(--ink2);font-weight:500}
+.app{display:flex;min-height:100vh}
+aside.sidebar{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;overflow-y:auto}
+.logo{font-weight:700;font-size:16px;letter-spacing:-.01em;padding:4px 10px 16px}
+nav.main{display:flex;flex-direction:column;gap:2px}
+nav.main a{padding:8px 10px;border-radius:8px;color:var(--ink2);font-weight:500}
 nav.main a:hover{background:var(--line2);text-decoration:none}
 nav.main a.on{background:var(--brand-soft);color:var(--brand);font-weight:600}
-.bal{margin-left:auto;display:flex;flex-wrap:wrap;gap:6px 16px;font-size:13px;color:var(--ink2);align-items:center}
+.bal{margin-top:auto;padding:16px 4px 0;display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--ink2)}
 .bal b{color:var(--ink)}
+.bal .btn{margin-top:6px;text-align:center}
+.content{flex:1;min-width:0}
 main{max-width:1240px;margin:0 auto;padding:28px 24px 72px}
 main.narrow{max-width:1000px}
 h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em} h2{font-size:16px;margin:0 0 12px} h3{font-size:14px;margin:0 0 8px}
@@ -41,7 +43,10 @@ h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em} h2{font-size:16px;margin
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .between{justify-content:space-between}
 .grid{display:grid;gap:12px} .g2{grid-template-columns:repeat(2,minmax(0,1fr))} .g3{grid-template-columns:repeat(3,minmax(0,1fr))} .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-@media (max-width:860px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))} .g2{grid-template-columns:1fr} main{padding:18px 16px 60px} .topin{padding:0 16px}}
+@media (max-width:860px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))} .g2{grid-template-columns:1fr} main{padding:18px 16px 60px}
+  .app{flex-direction:column} aside.sidebar{width:auto;height:auto;position:static;padding:10px 16px;border-right:none;border-bottom:1px solid var(--line)}
+  .logo{padding:4px 0 8px} nav.main{flex-direction:row;flex-wrap:wrap;gap:4px}
+  .bal{flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px 16px;padding:10px 0 0} .bal .btn{margin-top:0}}
 .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:9px 14px;border-radius:8px;font-weight:600;white-space:nowrap;cursor:pointer;display:inline-block}
 .btn:hover{border-color:var(--ink3);text-decoration:none}
 .btn.primary{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
@@ -196,10 +201,10 @@ function alerts(ov) {
 }
 function shell(content, narrow) {
   const h = location.hash || "#/new";
-  return `<header class="top"><div class="topin"><div class="logo">Lead Puller</div>
+  return `<div class="app"><aside class="sidebar"><div class="logo">Lead Puller</div>
     <nav class="main" aria-label="Main">${NAV.map(([href,l])=>`<a href="${href}" class="${h.startsWith(href)||(href==="#/history"&&h.startsWith("#/pull/"))?"on":""}">${l}</a>`).join("")}</nav>
-    <div class="bal" id="bal">${balHtml(META.overview)}</div></div></header>
-    <div id="alerts">${alerts(META.overview)}</div><main id="main" class="${narrow?"narrow":""}">${content}</main>`;
+    <div class="bal" id="bal">${balHtml(META.overview)}</div></aside>
+    <div class="content"><div id="alerts">${alerts(META.overview)}</div><main id="main" class="${narrow?"narrow":""}">${content}</main></div></div>`;
 }
 function refreshTop(ov) { if (!ov) return; META.overview = ov; $("#bal") && ($("#bal").innerHTML = balHtml(ov)); $("#alerts") && ($("#alerts").innerHTML = alerts(ov)); }
 const setMain = h => { $("#main").innerHTML = h; };
