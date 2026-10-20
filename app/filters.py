@@ -1,9 +1,17 @@
-"""Seamless contact-search filter definitions.
+"""Seamless contact-search filters, with Include and Exclude.
 
-Single source of truth for the filter editor (served to the browser), the
-Claude prompt-to-filters tool schema, and request validation.
-Values come from Seamless's POST /search/contacts reference.
+Stored per pull as {"jobTitle": {"in": [...], "out": [...]}, "titlesExactMatch": true, ...}.
+
+How an Exclude is applied, cheapest first:
+  seamless    Seamless leaves them out itself ("-value"): no credits at all.
+  complement  Exclude from a fixed list = include every other value, so Seamless leaves them out: no credits.
+  tool        Seamless can't exclude this; the tool skips them when the page arrives (0.1 credit to see each,
+              never researched).
+  none        Can't be excluded through the API (the box is greyed out).
 """
+import time
+
+from .config import cfg
 
 INDUSTRIES = [
     "Aerospace & Defense", "Airlines & Aviation", "Aviation & Aerospace", "Defense & Space", "Military",
@@ -48,14 +56,13 @@ INDUSTRIES = [
     "Translation & Localization", "Transportation/Trucking/Railroad", "Wholesale & Distribution",
     "Business Supplies & Equipment", "Import & Export", "Warehousing", "Wholesale",
 ]
-
 MONEY = ["$0 - $100K", "$100K - $1M", "$1M - $5M", "$5M - $20M", "$20M - $50M", "$50M - $100M",
          "$100M - $500M", "$500M - $1B", "$1B+"]
-
-import time
-
-from .config import cfg
-
+SIZES = ["0 - 1 (Self-employed)", "2 - 10", "11 - 50", "51 - 200", "201 - 500", "501 - 1,000",
+         "1,001 - 5,000", "5,001 - 10,000", "10,001+"]
+SENIORITY = ["C-Level", "VP", "Director", "Manager", "Senior", "Mid-Level", "Entry Level", "Other"]
+DEPARTMENTS = ["Sales", "Marketing", "Engineering", "Human Resources", "Finance", "IT", "Operations",
+               "Support", "Legal", "Project Management", "Other"]
 TIMEZONES = ["Eastern (EST)", "Central (CST)", "Mountain (MST)", "Pacific (PST)", "Alaska (AKST)", "Hawaii (HST)",
              "New Zealand (NST)", "Solomon (SST)", "Australia Eastern (AET)", "Australia Central (ACT)", "Japan (JST)",
              "China Taiwan (CTT)", "Vietnam (VST)", "Bangladesh (BST)", "India (IST)", "Indiana Eastern (IET)",
@@ -63,164 +70,164 @@ TIMEZONES = ["Eastern (EST)", "Central (CST)", "Mountain (MST)", "Pacific (PST)"
              "(Arabic) Egypt (ART)", "Eastern European (EET)", "European Central (ECT)", "Greenwich Mean (GMT)",
              "Central African (CAT)", "Argentina (AGT)", "Brazil Eastern (BET)", "Canada Newfoundland (CNT)",
              "Puerto Rico and US Virgin Islands (PRT)", "Midway Islands (MIT)"]
-LOC_TYPES = {"bothOR": "Person or company HQ", "contact": "Person's location only",
-             "company": "Company HQ only", "bothAND": "Both person and company HQ"}
+LOC_TYPES = {"contact": "Person's location", "company": "Company HQ", "bothOR": "Person or company HQ",
+             "bothAND": "Person and company HQ"}
 
-SENIORITY = ["C-Level", "VP", "Director", "Manager", "Senior", "Mid-Level", "Entry Level", "Other"]
+# Common technologies, so the box suggests names from day one. Names Seamless returns in your own pulls are
+# added automatically (with how many companies they were seen at).
+TECH_COMMON = [
+    "Salesforce", "Salesforce Sales Cloud", "Salesforce Service Cloud", "Salesforce Marketing Cloud",
+    "Salesforce Commerce Cloud", "Salesforce Experience Cloud", "Salesforce CPQ", "Pardot",
+    "Salesforce Account Engagement", "MuleSoft", "Tableau", "Slack", "Heroku", "HubSpot", "HubSpot CRM",
+    "Zoho CRM", "Microsoft Dynamics 365", "Microsoft Dynamics CRM", "Pipedrive", "SugarCRM", "Freshsales",
+    "Zendesk", "Freshdesk", "Intercom", "ServiceNow", "Jira", "Confluence", "Asana", "Monday.com", "Trello",
+    "Marketo", "Mailchimp", "Klaviyo", "ActiveCampaign", "Eloqua", "Outreach", "Salesloft", "Gong", "ZoomInfo",
+    "Google Analytics", "Google Tag Manager", "Segment", "Mixpanel", "Amplitude", "Hotjar", "Optimizely",
+    "Amazon Web Services", "AWS", "Microsoft Azure", "Google Cloud Platform", "Cloudflare", "Akamai",
+    "DigitalOcean", "Heroku", "Vercel", "Netlify", "Kubernetes", "Docker", "Terraform", "GitHub", "GitLab",
+    "Bitbucket", "Jenkins", "CircleCI", "Datadog", "New Relic", "Splunk", "Sentry", "PagerDuty",
+    "Snowflake", "Databricks", "BigQuery", "Amazon Redshift", "MongoDB", "PostgreSQL", "MySQL", "Oracle Database",
+    "Microsoft SQL Server", "Elasticsearch", "Redis", "Kafka", "Looker", "Power BI", "Qlik", "Domo",
+    "SAP", "SAP S/4HANA", "Oracle NetSuite", "NetSuite", "Oracle ERP Cloud", "Microsoft Dynamics 365 Business Central",
+    "Sage Intacct", "QuickBooks", "Xero", "Workday", "BambooHR", "ADP", "Gusto", "Rippling", "Greenhouse", "Lever",
+    "Shopify", "Shopify Plus", "Magento", "Adobe Commerce", "BigCommerce", "WooCommerce", "Salesforce B2C Commerce",
+    "WordPress", "Drupal", "Webflow", "Wix", "Squarespace", "Contentful", "Adobe Experience Manager", "Sitecore",
+    "Stripe", "PayPal", "Braintree", "Adyen", "Square", "Chargebee", "Recurly", "Zuora",
+    "Okta", "Auth0", "Microsoft 365", "Office 365", "Google Workspace", "Zoom", "Microsoft Teams", "Twilio",
+    "SendGrid", "DocuSign", "Dropbox", "Box", "Atlassian", "Figma", "Miro", "Notion", "Airtable",
+    "React", "Angular", "Vue.js", "Node.js", "Python", "Java", ".NET", "Ruby on Rails", "PHP", "Laravel",
+    "OpenAI", "Anthropic", "TensorFlow", "PyTorch", "UiPath", "Automation Anywhere", "Zapier", "Workato",
+    "Veeva", "Epic", "Cerner", "athenahealth", "Guidewire", "Duck Creek", "nCino", "Temenos", "FIS", "Fiserv",
+]
+TECH_BUNDLES = {
+    "Uses Salesforce (any cloud)": ["Salesforce", "Salesforce Sales Cloud", "Salesforce Service Cloud",
+                                     "Salesforce Marketing Cloud", "Pardot", "MuleSoft", "Tableau", "Salesforce CPQ",
+                                     "Salesforce Experience Cloud", "Salesforce Commerce Cloud"],
+    "Uses a competing CRM": ["HubSpot", "HubSpot CRM", "Zoho CRM", "Microsoft Dynamics 365", "Microsoft Dynamics CRM",
+                             "Pipedrive", "SugarCRM", "Freshsales"],
+    "AWS / Azure / Google Cloud": ["Amazon Web Services", "AWS", "Microsoft Azure", "Google Cloud Platform"],
+    "Online stores": ["Shopify", "Shopify Plus", "Magento", "Adobe Commerce", "BigCommerce", "WooCommerce"],
+}
 
-# kind: "enum_list" (pick from options), "text_list" (free text tags), "choice" (single),
-#       "bool" (tick box), "int" (whole number, min..max)
-# group: how the editor groups fields
-FILTERS = [
-    {"key": "savedSearchId", "label": "Run a Seamless saved search (ID)", "kind": "int", "min": 0, "max": 10 ** 12,
-     "group": "Seamless saved search",
-     "help": "Build the search in the Seamless app (it has exclude on every filter), save it, paste its ID here. "
-             "When set, Seamless uses ONLY the saved search; the Seamless filters below are ignored. "
-             "This tool's skips (blocked companies, cooldown, people already pulled, Better matches, Skip) still apply."},
-    {"key": "jobTitle", "label": "Job titles", "kind": "text_list", "max": 10, "group": "People",
-     "help": "Matched by relevance. Include common variations (CTO, Chief Technology Officer, VP Engineering)."},
-    {"key": "titlesExactMatch", "label": "Exact title match (Seamless)", "kind": "bool", "group": "People",
-     "help": "Only titles exactly as typed above. Stricter than “Title must contain”."},
-    {"key": "seniority", "label": "Seniority", "kind": "enum_list", "max": 5, "group": "People",
-     "options": SENIORITY},
-    {"key": "department", "label": "Department", "kind": "enum_list", "max": 5, "group": "People",
-     "options": ["Sales", "Marketing", "Engineering", "Human Resources", "Finance", "IT", "Operations",
-                 "Support", "Legal", "Project Management", "Other"]},
-    {"key": "contactKeyword", "label": "Profile keywords", "kind": "text_list", "max": 10, "group": "People",
-     "help": "Words in the person's profile, skills or bio."},
-    {"key": "keywordsIsOr", "label": "Keywords: match any (instead of all)", "kind": "bool", "group": "People"},
-    {"key": "contactCountry", "label": "Countries", "kind": "text_list", "max": 10, "group": "Location", "lookup": "country",
-     "help": "Full country names, e.g. United States, Canada, Israel, Germany."},
-    {"key": "contactState", "label": "States / regions", "kind": "text_list", "max": 10, "group": "Location",
-     "lookup": "state-country"},
-    {"key": "contactZipCode", "label": "Zip / postal codes", "kind": "text_list", "max": 10, "group": "Location",
-     "lookup": "postcode"},
-    {"key": "locations", "label": "Cities / places", "kind": "text_list", "max": 10, "group": "Location",
-     "lookup": "city-state-country,city-country",
-     "help": "City level, e.g. “Austin, Texas”, “Toronto, Ontario”. Checked against Seamless's place list (free)."},
+# kind: list (in/out), bool, choice, int, text.  exclude: seamless | complement | tool | none
+# row: search-result field the tool checks for a "tool" exclude.
+FIELDS = [
+    {"key": "jobTitle", "label": "Job title", "kind": "list", "group": "People", "max": 10, "exclude": "tool",
+     "row": "title", "help": "Include: titles Seamless should match. Exclude: skip anyone whose title contains these words."},
+    {"key": "titlesExactMatch", "label": "Exact title match only", "kind": "bool", "group": "People"},
+    {"key": "seniority", "label": "Seniority", "kind": "list", "group": "People", "options": SENIORITY, "max": 5,
+     "exclude": "complement", "row": "seniority"},
+    {"key": "department", "label": "Department", "kind": "list", "group": "People", "options": DEPARTMENTS, "max": 5,
+     "exclude": "complement", "row": "department"},
+    {"key": "contactKeyword", "label": "Profile keywords", "kind": "list", "group": "People", "max": 10,
+     "exclude": "none"},
+    {"key": "keywordsIsOr", "label": "Keywords: match any (not all)", "kind": "bool", "group": "People"},
+
+    {"key": "contactCountry", "label": "Country", "kind": "list", "group": "Location", "max": 10,
+     "exclude": "seamless", "lookup": "country"},
+    {"key": "contactState", "label": "State / region", "kind": "list", "group": "Location", "max": 10,
+     "exclude": "seamless", "lookup": "state-country"},
+    {"key": "locations", "label": "City", "kind": "list", "group": "Location", "max": 10,
+     "exclude": "seamless", "lookup": "city-state-country,city-country"},
+    {"key": "contactZipCode", "label": "Zip / postal code", "kind": "list", "group": "Location", "max": 10,
+     "exclude": "seamless", "lookup": "postcode"},
     {"key": "locationRadius", "label": "Widen cities by (miles)", "kind": "choice", "group": "Location",
      "options": ["25", "50", "100", "250"]},
-    {"key": "timezones", "label": "Time zones", "kind": "enum_list", "max": 10, "group": "Location",
-     "options": TIMEZONES},
     {"key": "locationType", "label": "Location applies to", "kind": "choice", "group": "Location",
-     "options": ["bothOR", "contact", "company", "bothAND"],
-     "option_labels": LOC_TYPES, "default_from_env": "LOCATION_APPLIES_TO",
-     "help": "Not set = the .env default (LOCATION_APPLIES_TO). “Person's location only” keeps out people who live "
-             "elsewhere but work for a company based in your country."},
-    {"key": "timezoneType", "label": "Time zone applies to", "kind": "choice", "group": "Location",
-     "options": ["bothOR", "contact", "company", "bothAND"], "option_labels": LOC_TYPES},
-    {"key": "industry", "label": "Industries", "kind": "enum_list", "max": 5, "group": "Company",
-     "options": INDUSTRIES},
-    {"key": "industrySicCodes", "label": "SIC codes", "kind": "text_list", "max": 5, "group": "Company",
-     "help": "e.g. 7372 (software). Combined with Industries."},
-    {"key": "industryNaicsCodes", "label": "NAICS codes", "kind": "text_list", "max": 5, "group": "Company",
-     "help": "e.g. 541511."},
-    {"key": "companySize", "label": "Company size (employees)", "kind": "enum_list", "max": 10, "group": "Company",
-     "options": ["0 - 1 (Self-employed)", "2 - 10", "11 - 50", "51 - 200", "201 - 500", "501 - 1,000",
-                 "1,001 - 5,000", "5,001 - 10,000", "10,001+"]},
-    {"key": "companyRevenue", "label": "Company revenue", "kind": "enum_list", "max": 10, "group": "Company",
-     "options": MONEY},
-    {"key": "technologies", "label": "Technologies used", "kind": "text_list", "max": 10, "group": "Company",
-     "help": "e.g. Salesforce, HubSpot, AWS."},
-    {"key": "technologiesIsOr", "label": "Technologies match", "kind": "choice", "group": "Company",
-     "options": [True, False], "option_labels": {"true": "Any of them", "false": "All of them"}},
-    {"key": "companyName", "label": "Only these companies", "kind": "text_list", "max": 100, "group": "Company"},
-    {"key": "companyDomain", "label": "Only these company domains", "kind": "text_list", "max": 100, "group": "Company"},
+     "options": list(LOC_TYPES), "option_labels": LOC_TYPES},
+    {"key": "timezones", "label": "Time zone", "kind": "list", "group": "Location", "options": TIMEZONES, "max": 10,
+     "exclude": "none"},
+
+    {"key": "industry", "label": "Industry", "kind": "list", "group": "Company", "options": INDUSTRIES, "max": 5,
+     "exclude": "tool", "row": "industries"},
+    {"key": "companySize", "label": "Company size (employees)", "kind": "list", "group": "Company", "options": SIZES,
+     "max": 10, "exclude": "complement", "row": "size"},
+    {"key": "companyRevenue", "label": "Company revenue", "kind": "list", "group": "Company", "options": MONEY,
+     "max": 10, "exclude": "complement"},
+    {"key": "technologies", "label": "Technologies", "kind": "list", "group": "Company", "max": 10,
+     "exclude": "none", "suggest": "tech",
+     "help": "Seamless matches technology names as written. Names seen in your own pulls are marked ✓."},
+    {"key": "technologiesIsOr", "label": "Technologies: uses any (not all)", "kind": "bool", "group": "Company",
+     "default": True},
+    {"key": "companyName", "label": "Company name", "kind": "list", "group": "Company", "max": 100,
+     "exclude": "tool", "row": "company"},
+    {"key": "companyDomain", "label": "Company website", "kind": "list", "group": "Company", "max": 100,
+     "exclude": "tool", "row": "domain"},
+    {"key": "industrySicCodes", "label": "SIC code", "kind": "list", "group": "Company", "max": 5,
+     "exclude": "seamless"},
+    {"key": "industryNaicsCodes", "label": "NAICS code", "kind": "list", "group": "Company", "max": 5,
+     "exclude": "seamless"},
     {"key": "companyType", "label": "Public or private", "kind": "choice", "group": "Company",
      "options": ["Public", "Private"]},
-    {"key": "companyFoundedOn", "label": "Company founded", "kind": "enum_list", "max": 4, "group": "Company",
-     "options": ["Less than 1 Year", "Last 1-3 Years", "Last 4-10 Years", "10+ Years"]},
-    {"key": "companyLatestFundingClassifications", "label": "Latest funding round", "kind": "enum_list",
-     "max": 14, "group": "Signals",
+    {"key": "companyFoundedOn", "label": "Company founded", "kind": "list", "group": "Company",
+     "options": ["Less than 1 Year", "Last 1-3 Years", "Last 4-10 Years", "10+ Years"], "max": 4,
+     "exclude": "complement"},
+
+    {"key": "companyLatestFundingClassifications", "label": "Latest funding round", "kind": "list",
+     "group": "Signals", "max": 14, "exclude": "complement",
      "options": ["Angel", "Pre-Seed", "Seed", "Series A", "Series B", "Series C", "Series D", "Series E",
                  "Series F", "Series G", "Series H", "Series I", "Series J", "Other"]},
-    {"key": "companyLatestFundingDates", "label": "Funded within (days)", "kind": "enum_list", "max": 1,
-     "group": "Signals", "options": ["90", "180", "365", "1095"]},
-    {"key": "companyLatestFundingTotals", "label": "Total funding raised", "kind": "enum_list", "max": 9,
-     "group": "Signals", "options": MONEY},
-    {"key": "newsTypes", "label": "Recent company news", "kind": "enum_list", "max": 8, "group": "Signals",
-     "options": ["Acquisition", "Corporate Challenges", "Cost Cutting", "Expansion", "Investment",
-                 "Leadership", "Partnership", "Recognition"]},
-    {"key": "newsTypeDates", "label": "News within (days)", "kind": "enum_list", "max": 1, "group": "Signals",
+    {"key": "companyLatestFundingDates", "label": "Funded within (days)", "kind": "choice", "group": "Signals",
+     "options": ["90", "180", "365", "1095"]},
+    {"key": "companyLatestFundingTotals", "label": "Total funding raised", "kind": "list", "group": "Signals",
+     "options": MONEY, "max": 9, "exclude": "complement"},
+    {"key": "newsTypes", "label": "Recent company news", "kind": "list", "group": "Signals", "max": 8,
+     "exclude": "none", "options": ["Acquisition", "Corporate Challenges", "Cost Cutting", "Expansion", "Investment",
+                                    "Leadership", "Partnership", "Recognition"]},
+    {"key": "newsTypeDates", "label": "News within (days)", "kind": "choice", "group": "Signals",
      "options": ["60", "90", "180", "365"]},
     {"key": "jobChangeType", "label": "Recent job change", "kind": "choice", "group": "Signals",
      "options": ["New Hire", "New Promotion", "New Hire or New Promotion"]},
     {"key": "jobChangeDays", "label": "Job change within", "kind": "choice", "group": "Signals",
      "options": ["Last 60 Days", "Last 90 Days", "Last 180 Days", "Last 365 Days"]},
-    {"key": "updatedWithinMonths", "label": "Only contacts updated in the last … months", "kind": "int", "min": 0,
-     "max": 120, "group": "Better matches",
-     "help": "Fresher records mean more emails found and fewer bounces. 0 = any age."},
-    {"key": "pastCompany", "label": "Used to work at", "kind": "text_list", "max": 100, "group": "Better matches",
-     "help": "Company names from their job history."},
-    {"key": "pastCompanyRecentOnly", "label": "Only their most recent previous job", "kind": "bool",
-     "group": "Better matches"},
-    {"key": "titleMustContain", "label": "Title must contain", "kind": "text_list", "max": 30,
-     "group": "Better matches", "local": True,
-     "help": "Seamless matches titles loosely. People whose title has none of these words are skipped before any research credit is spent."},
-    {"key": "requireCompanyWebsite", "label": "Must have a company website", "kind": "bool",
-     "group": "Better matches", "local": True, "help": "No company website means no work email to find."},
-    {"key": "requireLinkedIn", "label": "Must have a LinkedIn profile", "kind": "bool", "group": "Better matches",
-     "local": True, "help": "Records without LinkedIn are more often out of date."},
-    {"key": "roleMinMonths", "label": "At least … months in current role", "kind": "int", "min": 0, "max": 600,
-     "group": "Better matches", "local": True, "help": "People whose start date is unknown are kept."},
-    {"key": "roleMaxYears", "label": "At most … years in current role", "kind": "int", "min": 0, "max": 60,
-     "group": "Better matches", "local": True},
-    # Local exclusions: Seamless search has no "exclude" filters, so these are applied by this tool
-    # to every result before it is kept (and before any research credit is spent).
-    {"key": "excludeTitleWords", "label": "Skip titles containing", "kind": "text_list", "max": 30,
-     "group": "Skip", "local": True,
-     "help": "e.g. intern, assistant, recruiter. Case-insensitive."},
-    {"key": "excludeCompanyWords", "label": "Skip companies containing", "kind": "text_list", "max": 30,
-     "group": "Skip", "local": True, "help": "e.g. staffing, consulting, agency."},
-    {"key": "excludeIndustries", "label": "Skip industries", "kind": "enum_list", "max": 30,
-     "group": "Skip", "local": True, "options": INDUSTRIES},
-    {"key": "excludeDomains", "label": "Skip company domains", "kind": "text_list", "max": 200,
-     "group": "Skip", "local": True},
-    {"key": "excludeCountries", "label": "Skip countries", "kind": "text_list", "max": 10, "group": "Skip", "lookup": "country",
-     "native": "contactCountry", "help": "Excluded by Seamless itself (no credits spent on them). e.g. “Europe but not the UK”."},
-    {"key": "excludeStates", "label": "Skip states / regions", "kind": "text_list", "max": 10, "group": "Skip",
-     "lookup": "state-country",
-     "native": "contactState", "help": "Excluded by Seamless itself."},
-    {"key": "excludeLocations", "label": "Skip cities / places", "kind": "text_list", "max": 10, "group": "Skip",
-     "lookup": "city-state-country,city-country",
-     "native": "locations", "help": "Excluded by Seamless itself."},
-    {"key": "excludeZipCodes", "label": "Skip zip / postal codes", "kind": "text_list", "max": 10, "group": "Skip",
-     "lookup": "postcode",
-     "native": "contactZipCode", "help": "Excluded by Seamless itself."},
-    {"key": "excludeSicCodes", "label": "Skip SIC codes", "kind": "text_list", "max": 5, "group": "Skip",
-     "native": "industrySicCodes", "help": "Excluded by Seamless itself."},
-    {"key": "excludeNaicsCodes", "label": "Skip NAICS codes", "kind": "text_list", "max": 5, "group": "Skip",
-     "native": "industryNaicsCodes", "help": "Excluded by Seamless itself."},
-    {"key": "excludeSeniority", "label": "Skip seniority", "kind": "enum_list", "max": 8,
-     "group": "Skip", "local": True, "options": SENIORITY},
+    {"key": "pastCompany", "label": "Used to work at", "kind": "list", "group": "Signals", "max": 100,
+     "exclude": "none"},
+
+    {"key": "updatedWithinMonths", "label": "Only records updated in the last … months", "kind": "int",
+     "group": "Quality", "min": 0, "max": 120, "help": "Fresher records = more emails found. 0 = any age."},
+    {"key": "requireLinkedIn", "label": "Must have a LinkedIn profile", "kind": "bool", "group": "Quality"},
 ]
+FIELD = {f["key"]: f for f in FIELDS}
+LOCATION_KEYS = ("contactCountry", "contactState", "contactZipCode", "locations")
 
-FILTER_BY_KEY = {f["key"]: f for f in FILTERS}
-LOCAL_KEYS = {f["key"] for f in FILTERS if f.get("local")}
+
+def default_filters():
+    f = {"technologiesIsOr": True}
+    if cfg.UPDATED_WITHIN_MONTHS:
+        f["updatedWithinMonths"] = cfg.UPDATED_WITHIN_MONTHS
+    return f
 
 
-def clean_filters(raw: dict) -> dict:
-    """Drop unknown keys, empty values and out-of-list options; enforce max counts."""
+def clean(raw):
+    """Keep only known filters with valid values; lists become {"in": [...], "out": [...]}."""
     out = {}
     for key, val in (raw or {}).items():
-        spec = FILTER_BY_KEY.get(key)
-        if spec is None or val is None or val == "" or val == []:
+        spec = FIELD.get(key)
+        if not spec or val in (None, "", [], {}):
             continue
         kind = spec["kind"]
-        if kind in ("enum_list", "text_list"):
-            if isinstance(val, str):
-                val = [val]
-            items = []
-            for v in val:
-                v = str(v).strip()
-                if not v or v in items:
-                    continue
-                if kind == "enum_list" and v not in spec["options"]:
-                    continue
-                items.append(v)
-            items = items[: spec.get("max", 100)]
-            if items:
-                out[key] = items
+        if kind == "list":
+            if isinstance(val, (list, str)):
+                val = {"in": val if isinstance(val, list) else [val], "out": []}
+            if not isinstance(val, dict):
+                continue
+            res = {}
+            for side in ("in", "out"):
+                items = []
+                for v in val.get(side) or []:
+                    v = str(v).strip()
+                    if not v or v in items:
+                        continue
+                    if spec.get("options") and v not in spec["options"]:
+                        continue
+                    items.append(v)
+                if side == "out" and spec.get("exclude", "none") == "none":
+                    items = []
+                limit = spec.get("max", 100) if side == "in" else 200
+                if items:
+                    res[side] = items[:limit]
+            if res:
+                out[key] = res
         elif kind == "bool":
             if isinstance(val, str):
                 val = val.strip().lower() in ("1", "true", "yes", "on")
@@ -235,61 +242,14 @@ def clean_filters(raw: dict) -> dict:
             if n > 0:
                 out[key] = n
         elif kind == "choice":
-            if isinstance(val, str) and val.lower() in ("true", "false") and True in spec["options"]:
-                val = val.lower() == "true"
-            if val in spec["options"]:
-                out[key] = val
-    if out.get("technologiesIsOr") is True and "technologies" not in out:
-        out.pop("technologiesIsOr")
+            if str(val) in [str(o) for o in spec["options"]]:
+                out[key] = str(val)
     return out
 
 
-NATIVE_EXCLUDES = {f["key"]: f["native"] for f in FILTERS if f.get("native")}
-LOCATION_KEYS = ("contactCountry", "contactState", "contactZipCode", "locations")
-NATIVE_LIMITS = {"contactCountry": 10, "contactState": 10, "locations": 10, "contactZipCode": 10,
-                 "industrySicCodes": 5, "industryNaicsCodes": 5}
-
-
-def to_search_body(filters: dict) -> dict:
-    """Turn cleaned filters into a Seamless POST /search/contacts body (no paging fields).
-    Exclusions Seamless supports natively are sent as "-value" in the matching include list."""
-    if filters.get("savedSearchId"):
-        return {"savedSearchId": int(filters["savedSearchId"])}
-    body = {}
-    special = ("jobChangeType", "jobChangeDays", "updatedWithinMonths", "pastCompany", "pastCompanyRecentOnly",
-               "savedSearchId")
-    for key, val in filters.items():
-        if key in LOCAL_KEYS or key in special or key in NATIVE_EXCLUDES:
-            continue
-        if key in ("titlesExactMatch", "keywordsIsOr") and val is not True:
-            continue
-        body[key] = val
-    for ex_key, target in NATIVE_EXCLUDES.items():
-        if filters.get(ex_key):
-            inc = list(body.get(target, []))
-            room = NATIVE_LIMITS[target] - len(inc)
-            body[target] = inc + ["-" + v.lstrip("-") for v in filters[ex_key][:max(0, room)]]
-    if any(body.get(k) for k in LOCATION_KEYS) and not body.get("locationType"):
-        body["locationType"] = cfg.LOCATION_APPLIES_TO
-    if body.get("locationRadius") and not body.get("locations"):
-        body.pop("locationRadius")
-    if body.get("timezoneType") and not body.get("timezones"):
-        body.pop("timezoneType")
-    if filters.get("updatedWithinMonths"):
-        body["lastModifiedAfter"] = months_ago_iso(filters["updatedWithinMonths"])
-    if filters.get("pastCompany"):
-        body["pastCompany"] = {"names": filters["pastCompany"],
-                               "onlyMostRecentDeparture": bool(filters.get("pastCompanyRecentOnly"))}
-    if filters.get("jobChangeType"):
-        jc = {"changeType": filters["jobChangeType"]}
-        if filters.get("jobChangeDays"):
-            jc["dayRange"] = filters["jobChangeDays"]
-        body["jobChanges"] = jc
-    return body
-
-
 def months_ago_iso(months, now=None):
-    """First day of the month N months back, so the value (and the saved search position) only changes monthly."""
+    """First day of the month N months back: the value only changes once a month, so saved search positions
+    stay valid all month."""
     t = time.gmtime(now if now is not None else time.time())
     y, m = t.tm_year, t.tm_mon - int(months)
     while m <= 0:
@@ -298,9 +258,103 @@ def months_ago_iso(months, now=None):
     return f"{y:04d}-{m:02d}-01T00:00:00Z"
 
 
-NOT_ENOUGH_ALONE = ("locationType", "technologiesIsOr", "updatedWithinMonths", "pastCompanyRecentOnly",
-                    "titlesExactMatch", "keywordsIsOr", "locationRadius", "timezoneType") + tuple(NATIVE_EXCLUDES)
+def _ins(f, key):
+    return list((f.get(key) or {}).get("in") or [])
 
 
-def search_filter_count(filters: dict) -> int:
-    return len([k for k in filters if k not in LOCAL_KEYS and k not in NOT_ENOUGH_ALONE])
+def _outs(f, key):
+    return list((f.get(key) or {}).get("out") or [])
+
+
+def search_body(f):
+    """Seamless POST /search/contacts body (no paging, no slice). Excludes Seamless can apply are put in here."""
+    body = {}
+    for spec in FIELDS:
+        key, kind = spec["key"], spec["kind"]
+        if key not in f or key in ("updatedWithinMonths", "requireLinkedIn", "pastCompany", "jobChangeType",
+                                   "jobChangeDays"):
+            continue
+        if kind == "list":
+            inc, out = _ins(f, key), _outs(f, key)
+            mode = spec.get("exclude")
+            if mode == "seamless" and out:
+                room = spec.get("max", 10) - len(inc)
+                inc = inc + ["-" + v for v in out[:max(0, room)]]
+            elif mode == "complement" and out:
+                base = inc or spec["options"]
+                left = [o for o in base if o not in out]
+                if len(left) <= spec.get("max", 10):
+                    inc = left
+                elif not inc:
+                    inc = []                      # too many to list: the tool skips them instead
+            if inc:
+                body[key] = inc
+        elif kind == "bool":
+            if key == "technologiesIsOr":
+                if f.get("technologies"):
+                    body[key] = True
+            elif f[key] is True:
+                body[key] = True
+        elif kind == "choice":
+            body[key] = f[key]
+        elif kind == "int":
+            body[key] = f[key]
+    if f.get("technologies") and "technologiesIsOr" not in f:
+        body["technologiesIsOr"] = False
+    if any(body.get(k) for k in LOCATION_KEYS) and not body.get("locationType"):
+        body["locationType"] = cfg.LOCATION_APPLIES_TO
+    if body.get("locationRadius") and not body.get("locations"):
+        body.pop("locationRadius")
+    if f.get("updatedWithinMonths"):
+        body["lastModifiedAfter"] = months_ago_iso(f["updatedWithinMonths"])
+    if f.get("pastCompany"):
+        body["pastCompany"] = {"names": _ins(f, "pastCompany"), "onlyMostRecentDeparture": False}
+    if f.get("jobChangeType"):
+        jc = {"changeType": f["jobChangeType"]}
+        if f.get("jobChangeDays"):
+            jc["dayRange"] = f["jobChangeDays"]
+        body["jobChanges"] = jc
+    return body
+
+
+def tool_excludes(f):
+    """Excludes Seamless can't apply: [(key, row field, values, label)] checked by the tool on each result."""
+    out = []
+    for spec in FIELDS:
+        if spec["kind"] != "list":
+            continue
+        vals = _outs(f, spec["key"])
+        if not vals:
+            continue
+        mode = spec.get("exclude")
+        if mode == "tool":
+            out.append((spec["key"], spec["row"], vals, spec["label"]))
+        elif mode == "complement":
+            base = _ins(f, spec["key"]) or spec["options"]
+            if len([o for o in base if o not in vals]) > spec.get("max", 10) and spec.get("row"):
+                out.append((spec["key"], spec["row"], vals, spec["label"]))
+    return out
+
+
+def size_slices(f):
+    """The company sizes this search covers, one slice each (None = no sizes chosen, so all of them)."""
+    inc, out = _ins(f, "companySize"), _outs(f, "companySize")
+    sizes = inc or list(SIZES)
+    sizes = [s for s in sizes if s not in out]
+    return sizes, bool(inc or out)
+
+
+def summary(f):
+    parts = []
+    for key in ("jobTitle", "seniority", "contactCountry", "locations", "industry", "companySize", "technologies"):
+        inc = _ins(f, key)
+        if inc:
+            parts.append(", ".join(inc[:3]) + ("…" if len(inc) > 3 else ""))
+    return " · ".join(parts) or "No filters"
+
+
+def meaningful(f):
+    """At least one real search filter (not just switches), so a pull never asks Seamless for 'everyone'."""
+    body = search_body(f)
+    return any(k for k in body if k not in ("locationType", "technologiesIsOr", "lastModifiedAfter",
+                                            "titlesExactMatch", "keywordsIsOr", "locationRadius"))

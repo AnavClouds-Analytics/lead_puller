@@ -1,520 +1,563 @@
-"""Money and data-safety tests. Every scenario ends by checking the books (credits logged == credits
-Seamless charged) and the people (nobody paid for twice, nobody gets someone else's details)."""
-import time
+"""Money and data safety: every scenario ends with the books checked against what 'Seamless' charged, per
+account, and with proof that nobody was paid for twice and every email belongs to its person."""
+import os
+import json
 
 import pytest
 
-from app import db, worker
-from tests.conftest import (anavmail_rows, check_books, check_people, full_pull, new_pull, pid_from_email,
-                            run_until)
-from tests.fakes import email_for, make_people
+from app import db, engine, memory
+from tests.conftest import US, add_account, check_books, check_people, run, start
+from tests.fakes import email_for
 
-US_CA = [p for p in make_people() if p["country"] in ("United States", "Canada")]
+ISRAEL = {"contactCountry": {"in": ["Israel", "Germany", "Canada"]}}
 
 
-# ---------------------------------------------------------------- the normal path
-def test_full_pull_books_and_people(env):
-    client, fake, _, _ = env
-    p = full_pull(client, target=120, cap=2, choice="high_medium")
-    assert p["status"] == "done"
+def research_charges(fake, key=None):
+    return sum(n for k, kind, n in fake.charges if kind == "research" and (key is None or k == key))
+
+
+def search_bodies(fake, key=None):
+    return [b for k, b in fake.searches if key is None or k == key]
+
+
+# ---------------------------------------------------------------- the basics
+def test_pull_reaches_target_and_books_balance(env):
+    client, fake, clock = env
+    pid = start(client, US, target=60, max_credits=500)
+    p = run(client, pid)
+    s = p["stats"]
+    assert s["emails"] >= 60 and "Reached your target" in p["stop_reason"]
+    # Researched only about as many as needed: no big overshoot.
+    assert s["researched"] <= 60 / 0.75 + 15, s
+    assert s["credits"] == s["search_credits"] + s["research_credits"]
     check_books(fake)
-    check_people(client, fake)
-    # cap held, staffing skipped, low-fit not researched
-    kept = db.q("SELECT company, domain, fit, submitted_at FROM contacts WHERE pull_id=? AND kept=1", (p["id"],))
-    per = {}
-    for r in kept:
-        k = db.company_key(r["company"], r["domain"])
-        per[k] = per.get(k, 0) + 1
-        assert "Staffing" not in r["company"]
-        if r["fit"] == "low":
-            assert r["submitted_at"] is None
-    assert max(per.values()) <= 2
-    assert len(kept) == 120
+    check_people(fake)
 
 
-def test_chaotic_seamless_answers(env):
-    """Shuffled, partial and duplicated poll rows, rows missing searchResultId, 500s and 429s."""
-    client, fake, _, _ = env
-    fake.chaos_poll = True
-    fake.flaky_rate = 0.15
-    p = full_pull(client, target=150, cap=0)
-    assert p["status"] == "done", p.get("error")
+def test_max_credits_is_never_exceeded(env):
+    client, fake, clock = env
+    for target, cap in ((200, 37), (50, 12), (30, 1)):
+        pid = start(client, US, target=target, max_credits=cap)
+        p = run(client, pid)
+        assert db.pull_spend(pid) <= cap, (cap, db.pull_spend(pid))
+        assert "max" in p["stop_reason"].lower() or p["stats"]["emails"] >= target
     check_books(fake)
-    check_people(client, fake)
-    res = db.q("SELECT research_status FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (p["id"],))
-    assert all(r["research_status"] in ("done", "not found", "duplicate") for r in res)
+    check_people(fake)
 
 
-def test_requestids_in_a_different_order_never_mix_people(env):
-    """Seamless returns requestIds in another order AND some answers lack searchResultId."""
-    client, fake, _, _ = env
+def test_monthly_budgets_are_never_exceeded(env, monkeypatch):
+    client, fake, clock = env
+    monkeypatch.setenv("MONTHLY_CREDIT_BUDGET", "45")
+    pid = start(client, US, target=500, max_credits=5000)
+    p = run(client, pid, until=("done", "paused"))
+    assert db.month_spend() <= 45
+    assert p["status"] == "paused" and p["pause_kind"] == "account"
+    for _ in range(20):
+        engine.tick()
+    assert db.month_spend() <= 45
+    check_books(fake)
+
+
+def test_per_account_budget_then_next_account(env):
+    client, fake, clock = env
+    a = db.q1("SELECT id FROM accounts WHERE name='Account A'")["id"]
+    client.patch(f"/api/accounts/{a}", json={"monthly_budget": 40})
+    add_account(client, fake)
+    pid = start(client, US, target=120, max_credits=1000)
+    p = run(client, pid)
+    assert db.month_spend(a) <= 40
+    assert p["stats"]["emails"] >= 120
+    assert fake.charged_by_key.get("key-bravo-2222", 0) > 0
+    check_books(fake)
+    check_people(fake)
+
+
+# ---------------------------------------------------------------- never twice
+def test_never_pay_twice_across_pulls_and_search_continues(env):
+    client, fake, clock = env
+    run(client, start(client, US, target=80, max_credits=500))
+    n_search = len(fake.searches)
+    pid2 = start(client, US, target=80, max_credits=500)
+    p2 = run(client, pid2)
+    assert p2["stats"]["emails"] >= 80
+    later = search_bodies(fake)[n_search:]
+    # The second pull continued where the first stopped (or used people found earlier) instead of paying to
+    # see the same pages again.
+    assert any(b.get("nextToken") for b in later) or p2["stats"]["search_credits"] < 5
+    check_books(fake)
+    check_people(fake)
+
+
+def test_people_found_with_one_key_never_appear_with_the_other(env):
+    client, fake, clock = env
+    b = add_account(client, fake)
+    a = db.q1("SELECT id FROM accounts WHERE name='Account A'")["id"]
+    p1 = run(client, start(client, US, target=100, max_credits=600, account=a))
+    first = {c["email"] for c in db.q("SELECT email FROM contacts WHERE pull_id=? AND email IS NOT NULL", (p1["id"],))}
+    p2 = run(client, start(client, US, target=100, max_credits=600, account=b["id"]))
+    second = {c["email"] for c in db.q("SELECT email FROM contacts WHERE pull_id=? AND email IS NOT NULL", (p2["id"],))}
+    assert not first & second
+    # Account B saw some of A's people in its search results and skipped them without paying.
+    skipped = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_kind LIKE 'mem%'", (p2["id"],))["n"]
+    assert skipped > 0
+    assert research_charges(fake, "key-bravo-2222") == p2["stats"]["researched"]
+    check_books(fake)
+    check_people(fake)
+
+
+def test_people_researched_in_seamless_itself_are_never_paid_for(env):
+    client, fake, clock = env
+    # 40 US people were researched by hand in the Seamless app before this tool existed.
+    org = fake.org("key-alpha-1111")
+    before = [p for p in fake.people if p["country"] == "United States"][:40]
+    for p in before:
+        fake.researched_in(org)[p["pid"]] = 1
+        fake.saved.setdefault(org, {})[p["pid"]] = fake.record(p)
+    db.x("DELETE FROM saved_sync")
+    pid = start(client, US, target=60, max_credits=500)
+    p = run(client, pid)
+    sent = {fake.sid_to_pid[c["sid"]] for c in db.q("SELECT sid FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL",
+                                                    (pid,))}
+    assert not sent & {x["pid"] for x in before}
+    kinds = {r["kind"] for r in p["stats"]["skips"]}
+    assert kinds & {"seamless", "mem_email"}
+    fake.researched[org] = {k: v for k, v in fake.researched[org].items() if k not in {x["pid"] for x in before}}
+    check_books(fake)
+    check_people(fake)
+
+
+def test_email_shown_in_search_results_is_checked_against_memory(env, monkeypatch):
+    client, fake, clock = env
+    monkeypatch.setenv("PAUSE_BELOW_EMAIL_RATE", "0")
+    run(client, start(client, US, target=50, max_credits=400))
+    # Same filters from the top, as if Seamless lost the position: people already pulled come back with their
+    # email shown in the search results, and are skipped on that email alone.
+    db.x("UPDATE scan_state SET next_token=NULL, exhausted_at=NULL, body_hash='x'")
+    db.x("UPDATE contacts SET state='skipped' WHERE state='banked'")
+    db.x("DELETE FROM memory WHERE key NOT LIKE 'em:%'")
+    pid = start(client, US, target=40, max_credits=400)
+    p = run(client, pid)
+    kinds = {r["kind"]: r["n"] for r in p["stats"]["skips"]}
+    assert kinds.get("mem_email", 0) > 0
+    check_books(fake)
+    check_people(fake)
+
+
+# ---------------------------------------------------------------- saving search credits
+def test_people_found_but_not_needed_are_used_first_next_time(env):
+    client, fake, clock = env
+    p1 = run(client, start(client, US, target=40, max_credits=500))
+    banked = db.q1("SELECT COUNT(*) n FROM contacts WHERE state='banked'")["n"]
+    if not banked:
+        pytest.skip("this seed left nobody over")
+    n_search = len(fake.searches)
+    p2 = run(client, start(client, US, target=max(1, banked // 2), max_credits=500))
+    # The second pull got its people from the bank: no new search page at all.
+    assert len(fake.searches) == n_search
+    assert p2["stats"]["search_credits"] == 0 and p2["stats"]["emails"] >= 1
+    check_books(fake)
+    check_people(fake)
+
+
+def test_fully_scanned_slices_are_later_asked_only_for_fresh_people(env, monkeypatch):
+    client, fake, clock = env
+    small = {"contactCountry": {"in": ["Israel"]}}
+    p1 = run(client, start(client, small, target=5000, max_credits=5000))
+    assert "no more new people" in p1["stop_reason"]
+    n = len(fake.searches)
+    clock.t += 3 * 86400
+    p2 = run(client, start(client, small, target=50, max_credits=500))
+    later = search_bodies(fake)[n:]
+    assert later and all(b.get("lastModifiedAfter") for b in later)
+    # Nothing new was updated since: Seamless returns (and charges for) nobody old.
+    assert p2["stats"]["search_credits"] == 0
+    check_books(fake)
+    check_people(fake)
+
+
+def test_fresh_slices_go_first_and_a_slice_full_of_old_people_is_left_after_one_page(env, monkeypatch):
+    client, fake, clock = env
+    monkeypatch.setenv("MOVE_ON_PAGES", "1")
+    mid = {"contactCountry": {"in": ["United States"]}, "companySize": {"in": ["51 - 200"]}}
+    run(client, start(client, mid, target=5000, max_credits=5000))       # takes everyone in that slice
+    # Seamless loses the saved position: the slice would show only people you already have.
+    db.x("UPDATE scan_state SET next_token=NULL, exhausted_at=NULL, body_hash='x'")
+    db.x("UPDATE contacts SET state='skipped' WHERE state='banked'")
+    both = {"contactCountry": {"in": ["United States"]}, "companySize": {"in": ["51 - 200", "201 - 500"]}}
+    pid = start(client, both, target=5000, max_credits=5000)
+    p = run(client, pid)
+    by = {s["label"]: s for s in p["slices"]}
+    assert p["slices"][0]["label"] == "201 - 500"            # the fresh slice went first
+    assert by["51 - 200"]["state"] == "expensive"             # the old one was left after one page…
+    assert by["51 - 200"]["pages"] == 1                       # …instead of paying to see all of it again
+    assert by["201 - 500"]["state"] == "done"
+    check_books(fake)
+    check_people(fake)
+
+
+def test_a_first_batch_without_emails_pauses_before_spending_more(env):
+    client, fake, clock = env
+    il = [p for p in fake.people if p["country"] == "Israel"]
+    for p in il:
+        fake.email_override[p["pid"]] = ""            # nobody in Israel has an email
+    pid = start(client, {"contactCountry": {"in": ["Israel"]}}, target=60, max_credits=500)
+    p = run(client, pid, until=("paused", "done"))
+    assert p["status"] == "paused" and p["pause_kind"] == "low_rate"
+    assert p["stats"]["researched"] <= 25                 # only the small first batch was paid for
+    spent = fake.charged
+    for _ in range(20):
+        engine.tick()
+    assert fake.charged == spent                          # nothing more until you decide
+    client.post(f"/api/pulls/{pid}/stop")
+    p = run(client, pid)
+    assert fake.charged == spent
+    check_books(fake)
+
+
+def test_page_size_follows_what_is_still_needed(env):
+    client, fake, clock = env
+    run(client, start(client, US, target=8, max_credits=200))
+    limits = [b["limit"] for b in search_bodies(fake)]
+    assert limits and max(limits) <= 20, limits
+
+
+# ---------------------------------------------------------------- accounts
+def test_account_runs_low_mid_pull_and_the_next_one_continues(env):
+    client, fake, clock = env
+    fake.pools["key-alpha-1111"] = 70
+    client.post(f"/api/accounts/{db.q1('SELECT id FROM accounts')['id']}/check")
+    add_account(client, fake)
+    pid = start(client, US, target=150, max_credits=2000)
+    p = run(client, pid)
+    assert p["stats"]["emails"] >= 150
+    assert fake.balance_of("key-alpha-1111") >= 0
+    assert fake.charged_by_key.get("key-bravo-2222", 0) > 0
+    check_books(fake)
+    check_people(fake)
+
+
+def test_shared_pool_is_detected(env):
+    client, fake, clock = env
+    fake.shared_pool = True
+    add_account(client, fake)
+    for a in db.q("SELECT id FROM accounts"):
+        client.post(f"/api/accounts/{a['id']}/check")
+    ov = client.get("/api/overview").json()
+    assert ov["shared_pools"] and len(ov["shared_pools"][0]["names"]) == 2
+
+
+def test_bad_key_is_never_saved_and_says_why(env):
+    client, fake, clock = env
+    r = client.post("/api/accounts", json={"name": "Wrong", "api_key": "not-a-real-key-123"})
+    assert r.status_code == 400 and "error 401" in r.json()["error"]
+    fake.add_key("key-charlie-3333", 1000)
+    r = client.post("/api/accounts", json={"name": "Pasted", "api_key": ' "key-charlie-3333​"\n'})
+    assert r.status_code == 200
+    names = [a["name"] for a in r.json()["accounts"]]
+    assert "Pasted" in names and "Wrong" not in names
+
+
+# ---------------------------------------------------------------- research errors
+@pytest.mark.parametrize("mode", ["500_after_charge", "timeout_after_charge", "500_before_charge"])
+def test_research_that_may_have_charged_is_never_resent(env, mode):
+    client, fake, clock = env
+    pid = start(client, US, target=80, max_credits=600)
+    for _ in range(4):
+        engine.tick()
+    fake.research_fail_next = mode
+    p = run(client, pid, until=("done", "paused"))
+    if p["status"] == "paused":
+        assert p["pause_kind"] == "unconfirmed"
+        client.post(f"/api/pulls/{pid}/resume")
+        p = run(client, pid)
+    check_people(fake)                     # nobody charged twice: the failed batch was never resent blindly
+    check_books(fake)
+    if mode != "500_before_charge":
+        assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('unconfirmed') "
+                     "OR filled_free=1", (pid,))["n"] > 0
+
+
+def test_answers_out_of_order_partial_and_repeated_never_mix_people(env):
+    client, fake, clock = env
     fake.chaos_poll = True
     fake.shuffle_request_ids = True
-    p = full_pull(client, target=200, cap=0)
-    assert p["status"] == "done"
+    fake.flaky_rate = 0.1
+    p = run(client, start(client, US, target=120, max_credits=900), clock=clock)
+    assert p["stats"]["emails"] > 60
+    check_people(fake)
     check_books(fake)
-    check_people(client, fake)
 
 
-def test_shared_email_appears_once_in_export(env):
-    client, fake, _, _ = env
-    for person in US_CA[:40]:
-        fake.email_override[person["pid"]] = f"info.p{US_CA[0]['pid']}@{US_CA[0]['domain']}"
-    p = full_pull(client, target=60, cap=0)
-    emails = [r[0] for r in anavmail_rows(client, p["id"])]
-    assert len(emails) == len(set(e.lower() for e in emails))
-    assert emails.count(f"info.p{US_CA[0]['pid']}@{US_CA[0]['domain']}") <= 1
-
-
-def test_same_name_different_companies_not_merged(env):
-    client, fake, _, _ = env
-    p = full_pull(client, target=200, cap=0)
-    names = db.q("""SELECT name, COUNT(DISTINCT company) n FROM contacts WHERE pull_id=? AND kept=1
-                    GROUP BY name HAVING n > 1""", (p["id"],))
-    assert names, "test data should contain the same name at different companies"
-    check_people(client, fake)
-
-
-def test_same_company_name_different_domains_are_different_companies(env):
-    client, fake, _, _ = env
-    full_pull(client, target=250, cap=1)
-    keys = {r["key"] for r in db.q("SELECT key FROM companies")}
-    assert "d:acme6.com" in keys or "d:acme6-labs.io" in keys
-    rows = db.q("SELECT domain FROM contacts WHERE kept=1 AND company='Acme Software 6'")
-    assert len({r["domain"] for r in rows}) <= 2 and len(rows) <= 2  # one per real company
-
-
-# ---------------------------------------------------------------- never pay twice
-def test_never_pay_twice_across_pulls(env):
-    client, fake, _, _ = env
-    a = full_pull(client, target=100, cap=0, filters={"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]})
-    b = full_pull(client, target=100, cap=0, cooldown=0,
-                  filters={"contactCountry": ["United States", "Canada"], "seniority": ["C-Level", "VP"]})
+def test_expired_search_position_starts_over_without_paying_twice(env):
+    client, fake, clock = env
+    run(client, start(client, US, target=40, max_credits=400))
+    fake.token_ttl = 10
+    clock.t += 1000
+    p = run(client, start(client, US, target=40, max_credits=400))
+    assert p["stats"]["emails"] >= 40
+    check_people(fake)
     check_books(fake)
-    check_people(client, fake)
-    a_people = {fake.sid_to_pid[r["search_result_id"]] for r in
-                db.q("SELECT search_result_id FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (a["id"],))}
-    b_people = {fake.sid_to_pid[r["search_result_id"]] for r in
-                db.q("SELECT search_result_id FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (b["id"],))}
-    assert not (a_people & b_people)
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Already pulled before%'",
-                 (b["id"],))["n"] > 0
 
 
-@pytest.mark.parametrize("hold", ["0", "14"])
-def test_two_pulls_collected_at_once_dont_both_pay(env, monkeypatch, hold):
-    """Both pulls look at the same people before either researches. Only the first may pay.
-    hold=0: both collect them, the re-check right before paying stops the second.
-    hold=14: the second pull already skips them at collect ("In another open pull")."""
-    monkeypatch.setenv("OPEN_PULL_HOLD_DAYS", hold)
-    client, fake, _, _ = env
-    f = {"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]}
-    ids = []
-    for _ in range(2):
-        p = new_pull(client)
-        client.patch(f"/api/pulls/{p['id']}", json={"filters": f, "company_cooldown": 0})
-        client.post(f"/api/pulls/{p['id']}/preview", json={"from_top": True})
-        client.post(f"/api/pulls/{p['id']}/collect", json={"target": 60, "per_company_cap": 0})
-        run_until(client, p["id"], {"collected"})
-        ids.append(p["id"])
-    for pid in ids:
-        assert client.post(f"/api/pulls/{pid}/research", json={"choice": "all"}).status_code == 200
-    for pid in ids:
-        run_until(client, pid, {"done"})
+def test_slow_answers_finish_then_late_ones_fill_in_free(env, monkeypatch):
+    client, fake, clock = env
+    monkeypatch.setenv("RESEARCH_WAIT_MINUTES", "5")
+    us = [p["pid"] for p in fake.people if p["country"] == "United States"]
+    fake.slow_pids.update(us[:30])
+    pid = start(client, US, target=40, max_credits=500)
+    p = run(client, pid, clock=clock, ticks=20000)
+    late = p["stats"]["late"]
+    if not late:
+        pytest.skip("no slow person was researched with this seed")
+    charged = fake.charged
+    fake.slow_pids.clear()
+    clock.t += 60
+    engine.tick()
+    filled = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND research_message LIKE 'Arrived late%'",
+                   (pid,))["n"]
+    assert filled > 0 and fake.charged == charged
     check_books(fake)
-    check_people(client, fake)
-    kind = "pulled_before" if hold == "0" else "other_pull"
-    second = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_kind=?", (ids[1], kind))["n"]
-    assert second > 0
+    check_people(fake)
 
 
-def test_linkedin_url_variants_are_the_same_person(env):
-    a, b = db.person_keys("X Y", "Co", "https://www.linkedin.com/in/anna-4/"), \
-        db.person_keys("X Y", "Co", "http://linkedin.com/in/anna-4?trk=abc")
-    assert a[0] == b[0]
-
-
-# ---------------------------------------------------------------- company memory and cooldown
-def test_company_cooldown_skips_and_release(env):
-    client, fake, _, _ = env
-    f = {"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]}
-    a = full_pull(client, target=80, cap=0, filters=f)
-    tried = {db.company_key(r["company"], r["domain"]) for r in
-             db.q("SELECT company, domain FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (a["id"],))}
-    a_companies = {db.company_key(r["company"], r["domain"]) for r in
-                   db.q("""SELECT company, domain FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL
-                           AND email IS NOT NULL AND email!=''""", (a["id"],))}
-    no_email_only = tried - a_companies
-    assert db.q1("SELECT COUNT(*) n FROM companies")["n"] == len(tried)
-    assert db.q1("SELECT COUNT(*) n FROM companies WHERE last_at IS NOT NULL")["n"] == len(a_companies)
-    assert no_email_only, "test data should have companies where nobody got an email"
-
-    b = full_pull(client, target=60, cap=0, filters={"contactCountry": ["United States", "Canada"], "seniority": ["C-Level", "VP"]})
-    b_kept = db.q("SELECT company, domain FROM contacts WHERE pull_id=? AND kept=1", (b["id"],))
-    assert not ({db.company_key(r["company"], r["domain"]) for r in b_kept} & a_companies)
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company emailed%'",
-                 (b["id"],))["n"] > 0
-    # companies where nobody got an email are NOT on cooldown: their other people can come through
-    b_all = {db.company_key(r["company"], r["domain"]) for r in
-             db.q("SELECT company, domain FROM contacts WHERE pull_id=?", (b["id"],))}
-    for r in db.q("SELECT company, domain, skip_reason FROM contacts WHERE pull_id=?", (b["id"],)):
-        if db.company_key(r["company"], r["domain"]) in no_email_only:
-            assert not (r["skip_reason"] or "").startswith("Company emailed")
-
-    # release one company -> it can come back; block one -> never
-    rel = sorted(a_companies)[0]
-    blk = [k for k in sorted(a_companies) if k.startswith("d:")][1]
-    assert client.post("/api/companies/release", json={"key": rel}).status_code == 200
-    assert client.post("/api/companies/block", json={"key": blk}).status_code == 200
-    lst = client.get("/api/companies?status=all&limit=200").json()
-    row = {r["key"]: r for r in lst["rows"]}
-    assert row[rel]["on_cooldown"] is False and row[blk]["blocked"] is True
-    c = new_pull(client)
-    client.patch(f"/api/pulls/{c['id']}", json={"filters": f})
-    client.post(f"/api/pulls/{c['id']}/preview", json={"from_top": True})
-    client.post(f"/api/pulls/{c['id']}/collect", json={"target": 400, "per_company_cap": 0})
-    run_until(client, c["id"], {"collected"})
-    kept_keys = {db.company_key(r["company"], r["domain"]) for r in
-                 db.q("SELECT company, domain FROM contacts WHERE pull_id=? AND kept=1", (c["id"],))}
-    assert blk not in kept_keys
-    assert (kept_keys & a_companies) <= {rel}
-    check_people(client, fake)
-
-
-def test_cooldown_expires(env):
-    client, fake, _, _ = env
-    f = {"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]}
-    full_pull(client, target=40, cap=0, filters=f)
-    db.x("UPDATE companies SET last_at=last_at-?", (91 * 86400,))
-    c = new_pull(client)
-    client.patch(f"/api/pulls/{c['id']}", json={"filters": f})
-    client.post(f"/api/pulls/{c['id']}/preview", json={"from_top": True})
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company emailed%'",
-                 (c["id"],))["n"] == 0
-
-
-def test_cooldown_zero_means_off(env, monkeypatch):
-    client, fake, _, _ = env
-    f = {"contactCountry": ["United States"], "seniority": ["C-Level", "VP"]}
-    full_pull(client, target=40, cap=0, filters=f)
-    monkeypatch.setenv("COMPANY_COOLDOWN_DAYS", "0")
-    c = new_pull(client)
-    assert c["company_cooldown"] == 0
-    client.patch(f"/api/pulls/{c['id']}", json={"filters": f})
-    client.post(f"/api/pulls/{c['id']}/preview", json={"from_top": True})
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Company emailed%'",
-                 (c["id"],))["n"] == 0
-
-
-# ---------------------------------------------------------------- search memory
-def test_same_search_continues_where_it_stopped(env):
-    client, fake, _, _ = env
-    a = full_pull(client, target=60, cap=0)
-    spent_a = fake.charges.copy()
-    b = new_pull(client)
-    b = client.post(f"/api/pulls/{b['id']}/preview", json={}).json()
-    assert b["started_from"] and b["started_from"].startswith("Same search as pull #%d" % a["id"])
-    # nobody in the preview is a person already pulled -> no credits wasted re-buying known people
-    # (people at companies already pulled can still appear further down the list; those are skipped by cooldown)
-    skipped_known = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_reason LIKE 'Already pulled%'",
-                          (b["id"],))["n"]
-    assert skipped_known == 0
-    # "start from the top" goes back to the beginning (and then skips known people)
-    b = client.post(f"/api/pulls/{b['id']}/preview", json={"from_top": True}).json()
-    assert not b["started_from"]
-    assert db.q1("""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND
-                    (skip_reason LIKE 'Already pulled%' OR skip_reason LIKE 'Company emailed%')""", (b["id"],))["n"] > 0
-
-
-def test_expired_saved_position_falls_back_to_top(env):
-    client, fake, _, clock = env
-    full_pull(client, target=30, cap=0)
-    fake.token_ttl = 60
+def test_finish_now_and_stop(env):
+    client, fake, clock = env
+    fake.slow_pids.update(p["pid"] for p in fake.people)
+    pid = start(client, US, target=200, max_credits=900)
+    for _ in range(6):
+        engine.tick()
+    spent = fake.charged
+    client.post(f"/api/pulls/{pid}/finish-now")
+    for _ in range(30):
+        engine.tick()
+    p = client.get(f"/api/pulls/{pid}").json()
+    assert p["status"] == "done" and fake.charged == spent
+    fake.slow_pids.clear()
     clock.t += 3600
-    b = new_pull(client)
-    b = client.post(f"/api/pulls/{b['id']}/preview", json={}).json()
-    assert b["status"] == "previewed"
-    assert "no longer accepted" in b["started_from"]
-    check_people(client, fake)
-
-
-def test_end_of_search_starts_from_top(env):
-    client, fake, _, _ = env
-    f = {"contactCountry": ["United States"], "jobTitle": ["Head of IT"]}
-    full_pull(client, target=500, cap=0, filters=f, cooldown=0)
-    b = new_pull(client)
-    client.patch(f"/api/pulls/{b['id']}", json={"filters": f, "company_cooldown": 0})
-    b = client.post(f"/api/pulls/{b['id']}/preview", json={}).json()
-    assert "went through every result" in b["started_from"]
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND kept=1", (b["id"],))["n"] == 0
-
-
-# ---------------------------------------------------------------- failures that could cost money
-@pytest.mark.parametrize("mode", ["500_after_charge", "timeout_after_charge"])
-def test_unconfirmed_research_is_never_resent_automatically(env, mode):
-    client, fake, _, _ = env
-    p = new_pull(client)
-    pid = p["id"]
-    client.post(f"/api/pulls/{pid}/preview", json={})
-    client.post(f"/api/pulls/{pid}/collect", json={"target": 150, "per_company_cap": 0})
-    run_until(client, pid, {"collected"})
-    client.post(f"/api/pulls/{pid}/research", json={"choice": "all"})
-    fake.research_fail_next = mode
-    p = run_until(client, pid, {"paused", "done"})
-    assert p["status"] == "paused" and "did not resend" in p["error"]
-    research_calls = [c for c in fake.calls if c[2] == "/contacts/research"]
-    assert len(research_calls) == 1
-    for _ in range(20):
-        worker.tick()          # paused: must not resend on its own
-    assert len([c for c in fake.calls if c[2] == "/contacts/research"]) == 1
-    charged_once = fake.charged
-    client.post(f"/api/pulls/{pid}/resume")
-    p = run_until(client, pid, {"done"})
-    # the resend is answered "duplicate" and not charged; the second batch is charged normally
-    dups = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND research_status='duplicate'", (pid,))["n"]
-    assert dups > 0
-    first_batch = 100
-    assert dups >= first_batch                              # the resent first batch came back as duplicates
-    assert fake.charged - charged_once == p["stats"]["submitted"] - first_batch   # only the new people were charged
-    # The tool didn't see the first charge, so its ledger is short by exactly that batch -- the
-    # live Seamless balance (shown everywhere) is the truth. Fill-in recovers the details free.
-    r = client.post(f"/api/pulls/{pid}/fill-saved").json()
-    assert r["fill_result"]["filled"] > 0
-    check_people(client, fake)
-
-
-def test_research_500_before_charge_pauses_and_resumes_cleanly(env):
-    client, fake, _, _ = env
-    p = new_pull(client)
-    pid = p["id"]
-    client.post(f"/api/pulls/{pid}/preview", json={})
-    client.post(f"/api/pulls/{pid}/collect", json={"target": 50, "per_company_cap": 0})
-    run_until(client, pid, {"collected"})
-    client.post(f"/api/pulls/{pid}/research", json={"choice": "all"})
-    fake.research_fail_next = "500_before_charge"
-    p = run_until(client, pid, {"paused"})
-    client.post(f"/api/pulls/{pid}/resume")
-    run_until(client, pid, {"done"})
-    check_books(fake)
-    check_people(client, fake)
-
-
-def test_out_of_credits_mid_research_pauses_then_resumes(env):
-    client, fake, _, _ = env
-    p = new_pull(client)
-    pid = p["id"]
-    client.post(f"/api/pulls/{pid}/preview", json={})
-    client.post(f"/api/pulls/{pid}/collect", json={"target": 150, "per_company_cap": 0})
-    run_until(client, pid, {"collected"})
-    fake.balance = 120
-    client.post(f"/api/pulls/{pid}/research", json={"choice": "all"})
-    p = run_until(client, pid, {"paused", "done"})
-    assert p["status"] == "paused" and "credits" in p["error"].lower()
-    fake.balance = 1000
-    client.post(f"/api/pulls/{pid}/resume")
-    p = run_until(client, pid, {"done"})
-    assert p["stats"]["submitted"] == p["stats"]["selected"]
-    check_books(fake)
-    check_people(client, fake)
-
-
-def test_monthly_budget_is_never_exceeded(env, monkeypatch):
-    client, fake, _, _ = env
-    monkeypatch.setenv("MONTHLY_CREDIT_BUDGET", "100")
-    p = new_pull(client)
-    pid = p["id"]
-    client.post(f"/api/pulls/{pid}/preview", json={})
-    client.post(f"/api/pulls/{pid}/collect", json={"target": 300, "per_company_cap": 0})
-    p = run_until(client, pid, {"collected", "paused"})
-    assert fake.charged <= 100
-    if p["status"] == "collected":
-        r = client.post(f"/api/pulls/{pid}/research", json={"choice": "all"})
-        assert r.status_code == 400 and "budget" in r.json()["error"]
-        r = client.post(f"/api/pulls/{pid}/research", json={"choice": "first_n", "first_n": 100 - fake.charged})
-        assert r.status_code == 200
-        run_until(client, pid, {"done", "paused"})
-    assert fake.charged <= 100
-    check_people(client, fake)
-
-
-def test_low_balance_short_search_page(env):
-    client, fake, _, _ = env
-    fake.balance = 2           # can pay for 20 rows only
-    p = new_pull(client)
-    p = client.post(f"/api/pulls/{p['id']}/preview", json={}).json()
-    assert p["stats"]["seen"] == 20 and fake.charged == 2
+    engine.tick()
+    check_people(fake)
     check_books(fake)
 
 
-def test_pause_and_stop_never_charge_extra(env):
-    client, fake, _, _ = env
-    p = new_pull(client)
-    pid = p["id"]
-    client.post(f"/api/pulls/{pid}/preview", json={})
-    client.post(f"/api/pulls/{pid}/collect", json={"target": 250, "per_company_cap": 0})
-    run_until(client, pid, {"collected"})
-    client.post(f"/api/pulls/{pid}/research", json={"choice": "all"})
-    worker.tick()                                  # first batch of 100 sent
-    client.post(f"/api/pulls/{pid}/pause")
-    before = fake.charged
-    for _ in range(10):
-        worker.tick()
-    assert fake.charged == before
-    client.post(f"/api/pulls/{pid}/resume")
-    client.post(f"/api/pulls/{pid}/cancel")        # stop: finish the 100 already sent, send no more
-    p = run_until(client, pid, {"done"})
-    assert p["stats"]["submitted"] == 100
+def test_stop_all_and_spending_switch(env, monkeypatch):
+    client, fake, clock = env
+    a = start(client, US, target=300, max_credits=900)
+    b = start(client, ISRAEL, target=300, max_credits=900)
+    for _ in range(3):
+        engine.tick()
+    client.post("/api/stop-all")
+    for _ in range(50):
+        engine.tick()
+    spent = fake.charged
+    for pid in (a, b):
+        assert client.get(f"/api/pulls/{pid}").json()["status"] == "done"
+    monkeypatch.setenv("SPENDING_ENABLED", "0")
+    c = start(client, US, target=50)
+    for _ in range(30):
+        engine.tick()
+    assert fake.charged == spent
+    assert client.get(f"/api/pulls/{c}").json()["pause_kind"] == "spending"
     check_books(fake)
-    check_people(client, fake)
 
 
-def test_restart_in_the_middle(env):
-    """Server restarts while research is running: nothing lost, nothing paid twice."""
-    client, fake, _, _ = env
-    p = new_pull(client)
-    pid = p["id"]
-    client.post(f"/api/pulls/{pid}/preview", json={})
-    client.post(f"/api/pulls/{pid}/collect", json={"target": 220, "per_company_cap": 0})
-    run_until(client, pid, {"collected"})
-    client.post(f"/api/pulls/{pid}/research", json={"choice": "all"})
-    worker.tick()
-    worker.tick()
-    path = db.DB_PATH
-    db.reset_for_tests(path)        # drop the connection, like a process restart
-    worker._last_poll.clear()
-    worker._failures.clear()
-    p = run_until(client, pid, {"done"})
-    assert p["stats"]["submitted"] == p["stats"]["selected"]
+# ---------------------------------------------------------------- skips before paying
+def test_do_not_pull_list_is_never_researched_or_downloaded(env):
+    client, fake, clock = env
+    us = [p for p in fake.people if p["country"] == "United States" and p["domain"]]
+    client.post("/api/exclusions", json={"text": f"{email_for(us[0])}\n{us[1]['domain']}\n{us[2]['company']}\n"
+                                                 f"{us[3]['liUrl'] or 'linkedin.com/in/none'}"})
+    blocked_dom = {us[1]["domain"]}
+    pid = start(client, US, target=150, max_credits=900)
+    run(client, pid)
+    for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (pid,)):
+        assert c["domain"] not in blocked_dom
+        assert db.norm_company(c["company"]) != db.norm_company(us[2]["company"])
+    # Added after research: left out of the download.
+    got = db.q("SELECT email, company FROM contacts WHERE pull_id=? AND email IS NOT NULL LIMIT 1", (pid,))[0]
+    client.post("/api/exclusions", json={"text": got["email"]})
+    csv_text = client.get(f"/api/pulls/{pid}/download").content.decode("utf-8-sig")
+    assert got["email"] not in csv_text
     check_books(fake)
-    check_people(client, fake)
 
 
-# ---------------------------------------------------------------- already-researched people
-def test_fill_in_from_saved_contacts_is_strict(env):
-    client, fake, _, _ = env
-    pool = [p for p in US_CA if p["title"] in ("Chief Technology Officer", "CTO", "VP Engineering")]
-    fake.already_in_org = {p["pid"] for p in pool[:40]}
-    # decoys: same name + company as a real saved contact but a different person/email and no LinkedIn
-    for p in pool[:40]:
-        if not p["liUrl"]:
-            d = fake.contact_record(p)
-            d.update(email=f"decoy.p{p['pid'] + 100000}@other.example", email1=None, lIProfileUrl="")
-            fake.org_decoys.append(d)
-    # a decoy with the same LinkedIn but a different email -> ambiguous -> must not be used
-    amb = next(p for p in pool[:40] if p["liUrl"])
-    d = fake.contact_record(amb)
-    d.update(email=f"wrong.p{amb['pid'] + 200000}@other.example")
-    fake.org_decoys.append(d)
-
-    p = full_pull(client, target=150, cap=0)
-    dups = db.q("SELECT * FROM contacts WHERE pull_id=? AND research_status='duplicate'", (p["id"],))
-    assert dups and all(not d["email"] for d in dups)
-    check_books(fake)     # duplicates were logged then credited back, matching Seamless (no charge)
-    r = client.post(f"/api/pulls/{p['id']}/fill-saved").json()["fill_result"]
-    assert 0 < r["filled"] < r["checked"]
-    for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND research_status='duplicate'", (p["id"],)):
-        pid = fake.sid_to_pid[c["search_result_id"]]
-        if c["email"]:
-            assert pid_from_email(c["email"]) == pid
-        if pid == amb["pid"]:
-            assert not c["email"] or pid_from_email(c["email"]) == pid
-    check_people(client, fake)
+def test_excludes_go_to_seamless_where_possible(env):
+    client, fake, clock = env
+    f = {"contactCountry": {"in": ["United States", "Canada"], "out": ["Germany"]},
+         "companySize": {"out": ["10,001+", "5,001 - 10,000"]},
+         "jobTitle": {"in": ["CTO"], "out": ["intern", "recruiter"]},
+         "industry": {"out": ["Staffing & Recruiting"]}}
+    pid = start(client, f, target=40, max_credits=400)
+    run(client, pid)
+    body = search_bodies(fake)[0]
+    assert "-Germany" in body["contactCountry"]
+    assert "10,001+" not in json.dumps(body.get("companySize"))
+    for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (pid,)):
+        assert "intern" not in c["title"].lower() and "recruiter" not in c["title"].lower()
+        assert "Staffing" not in (c["industry"] or "")
+    check_books(fake)
 
 
-# ---------------------------------------------------------------- exports
-def test_export_rules(env):
-    client, fake, _, _ = env
-    p = full_pull(client, target=150, cap=0)
-    rows = anavmail_rows(client, p["id"])
-    strict = anavmail_rows(client, p["id"], risky=0)
-    assert len(strict) < len(rows)
-    statuses = {r["email"].lower(): r["email_status"] for r in
-                db.q("SELECT email, email_status FROM contacts WHERE pull_id=? AND email IS NOT NULL", (p["id"],))}
-    assert all(statuses[r[0].lower()] != "invalid" for r in rows)
-    assert all(statuses[r[0].lower()] == "valid" for r in strict)
-    # add a domain to the do-not-pull list after the fact -> dropped from the export
-    dom = rows[0][0].split("@")[1]
-    client.post("/api/exclusions", json={"text": dom})
-    assert all(r[0].split("@")[1] != dom for r in anavmail_rows(client, p["id"]))
-    check_people(client, fake)
+def test_no_website_no_mail_server_and_max_per_company(env):
+    client, fake, clock = env
+    pid = start(client, US, target=150, max_credits=900, max_per_company=2)
+    run(client, pid)
+    per = {}
+    for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (pid,)):
+        assert c["domain"], "researched someone with no company website"
+        assert c["domain"] not in ("acme13.com", "acme26.com"), "researched a company that can't receive email"
+        per[c["domain"]] = per.get(c["domain"], 0) + 1
+    assert max(per.values()) <= 2
+    check_books(fake)
 
 
-def test_spreadsheet_formula_injection_neutralised(env):
-    client, fake, _, _ = env
-    for person in fake.people[:30]:
-        person["title"] = '=HYPERLINK("http://evil.example","x")'
-    p = full_pull(client, target=20, cap=0)
-    for r in anavmail_rows(client, p["id"]):
-        assert not r[4].startswith("=")
-    full = client.get(f"/api/pulls/{p['id']}/export?format=full").content.decode("utf-8-sig")
-    assert ',=HYPERLINK' not in full
+def test_shared_email_goes_out_once(env):
+    client, fake, clock = env
+    us = [p for p in fake.people if p["country"] == "United States" and p["domain"]][:40]
+    for p in us:
+        fake.email_override[p["pid"]] = "info@shared-inbox.com"
+    pid = start(client, US, target=60, max_credits=600)
+    run(client, pid)
+    text = client.get(f"/api/pulls/{pid}/download").content.decode("utf-8-sig")
+    assert text.count("info@shared-inbox.com") <= 1
+    # Counted once too: the other people with the same address are marked, not counted as emails.
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE email='info@shared-inbox.com' AND dup_email=0")["n"] <= 1
+    check_books(fake)
 
 
-# ---------------------------------------------------------------- rate limit
-def test_never_exceeds_rate_limit(env, monkeypatch):
-    client, fake, _, _ = env
-    monkeypatch.setenv("PAGE_SIZE", "10")
-    monkeypatch.setenv("RESEARCH_BATCH", "5")
-    fake.people = make_people(1500)
-    fake.by_pid = {p["pid"]: p for p in fake.people}
-    fake.chaos_poll = True
-    full_pull(client, target=700, cap=0)
-    assert max(sum(1 for c in fake.calls if c[2] == ep) for ep in ("/search/contacts", "/contacts/research")) > 60
-    from collections import defaultdict
-    by_ep = defaultdict(list)
-    for t, m, path in fake.calls:
-        by_ep[path].append(t)
-    for path, ts in by_ep.items():
-        ts.sort()
-        j = 0
-        for i in range(len(ts)):
-            while ts[i] - ts[j] >= 60:
-                j += 1
-            assert i - j + 1 <= 55, f"{path}: {i - j + 1} calls in one minute"
+def test_check_count_costs_one_credit_and_is_logged(env):
+    client, fake, clock = env
+    r = client.post("/api/check-count", json={"filters": US}).json()
+    assert r["total"] > 0 and r["credits"] == 1
+    assert fake.charged == 1
+    check_books(fake)
 
 
-# ---------------------------------------------------------------- inputs from Claude / locations
-def test_bad_filters_from_claude_are_dropped(env):
-    client, fake, claude_fake, _ = env
-    claude_fake.filters = {"industry": ["Software Developmentt"], "seniority": ["CEO"], "companySize": ["50-500"],
-                           "contactCountry": ["Isreal", "Germany"], "jobTitle": ["CTO"] * 3 + [""]}
-    p = new_pull(client)
-    assert p["filters"] == {"contactCountry": ["Isreal", "Germany"], "jobTitle": ["CTO"]}
-    p = client.post(f"/api/pulls/{p['id']}/preview", json={}).json()
-    assert p["filters"]["contactCountry"] == ["Germany"]
-    assert any("Isreal" in n for n in p["notes"])
+# ---------------------------------------------------------------- each safety layer on its own
+def test_people_are_checked_again_right_before_paying(env):
+    client, fake, clock = env
+    b = add_account(client, fake)
+    a = db.q1("SELECT id FROM accounts WHERE name='Account A'")["id"]
+    pa = start(client, US, target=40, max_credits=400, account=a)
+    engine.tick()                                          # A searches and keeps people, hasn't paid yet
+    held = db.q("SELECT name FROM contacts WHERE pull_id=? AND state='kept'", (pa,))
+    assert held and not db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL")["n"]
+    client.post(f"/api/pulls/{pa}/pause")
+    run(client, start(client, US, target=60, max_credits=400, account=b["id"]))   # B pays for the same people
+    client.post(f"/api/pulls/{pa}/resume")
+    run(client, pa)
+    rechecked = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_kind='recheck'", (pa,))["n"]
+    assert rechecked > 0
+    check_people(fake)                                     # nobody paid for on both accounts
+    check_books(fake)
 
 
-def test_fit_ratings_matched_by_id_not_order(env):
-    client, fake, _, _ = env
-    p = new_pull(client)
-    client.post(f"/api/pulls/{p['id']}/preview", json={})
-    for r in db.q("SELECT title, fit FROM contacts WHERE pull_id=? AND kept=1", (p["id"],)):
-        bad = "Intern" in r["title"] or "Recruiter" in r["title"]
-        assert r["fit"] == ("low" if bad else "high")
+def test_blocked_website_covers_its_subdomains(env):
+    client, fake, clock = env
+    us = [p for p in fake.people if p["country"] == "United States"][:25]
+    for p in us:
+        p["domain"] = "eu.blockedco.com"
+        p["company"] = "Blocked Co Europe"
+    client.post("/api/exclusions", json={"text": "blockedco.com"})
+    pid = start(client, US, target=100, max_credits=600)
+    run(client, pid)
+    assert not db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL AND domain LIKE '%blockedco.com'")["n"]
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE skip_kind='dnp' AND domain LIKE '%blockedco.com'")["n"] > 0
+    check_books(fake)
 
 
-def test_claude_down_still_works(env):
-    client, fake, claude_fake, _ = env
-    p = new_pull(client)
-    claude_fake.fail = True
-    p = client.post(f"/api/pulls/{p['id']}/preview", json={}).json()
-    assert p["status"] == "previewed" and "Fit check skipped" in (p["error"] or "")
+def test_companies_without_an_email_server_are_never_paid_for(env):
+    client, fake, clock = env
+    us = [p for p in fake.people if p["country"] == "United States"][:20]
+    for p in us:
+        p["domain"] = "acme13.com"                         # the fake DNS says: no email server
+    pid = start(client, US, target=100, max_credits=600)
+    run(client, pid)
+    assert not db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL AND domain='acme13.com'")["n"]
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE skip_kind='no_mx'")["n"] > 0
 
 
-def test_model_that_rejects_forced_tool_use(env):
-    """Seen live: 'tool_choice: type "tool" and "any" are not supported for this model.'"""
-    from app import claude
-    client, fake, claude_fake, _ = env
-    claude._NO_FORCED_TOOL.clear()
-    claude_fake.no_forced_tool = True
-    assert client.post("/api/settings/test-claude", json={}).status_code == 200
-    p = new_pull(client)
-    assert p["filters"]["contactCountry"] == ["United States", "Canada"]
-    p = client.post(f"/api/pulls/{p['id']}/preview", json={}).json()
-    assert p["status"] == "previewed" and not p["error"]          # fit check worked too
-    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND fit IS NOT NULL", (p["id"],))["n"] > 0
-    claude_fake.text_answer = True                                 # model answers in text, not the tool
-    p = new_pull(client)
-    assert p["filters"]["contactCountry"] == ["United States", "Canada"]
-    claude._NO_FORCED_TOOL.clear()
+def test_exclude_from_a_fixed_list_is_sent_to_seamless(env):
+    client, fake, clock = env
+    f = {"contactCountry": {"in": ["United States"]}, "companyRevenue": {"out": ["$1B+", "$500M - $1B"]}}
+    run(client, start(client, f, target=10, max_credits=100))
+    body = search_bodies(fake)[0]
+    assert "$1B+" not in body["companyRevenue"] and len(body["companyRevenue"]) == 7
+
+
+
+
+def test_old_lead_puller_database_is_imported_so_nobody_is_paid_for_again(env, tmp_path):
+    import shutil
+    from app import importer
+    client, fake, clock = env
+    old = tmp_path / "leadpuller.db"
+    shutil.copy(os.path.join(os.path.dirname(__file__), "data", "leadpuller-v1.2.db"), old)
+    out = importer.import_v1(str(old))
+    assert out["people"] > 50
+    import sqlite3
+    con = sqlite3.connect(str(old))
+    paid = con.execute("SELECT name, company, li_url, email FROM contacts WHERE submitted_at IS NOT NULL").fetchall()
+    for name, company, li, email in paid:
+        assert memory.find(db.person_keys(name, company, li, email)), name
+    # Old people come back in new searches (same LinkedIn profiles): none is paid for again, all are skipped.
+    old_li = {db.norm_li(li) for _, _, li, _ in paid if db.norm_li(li)}
+    pid = start(client, US, target=80, max_credits=600)
+    run(client, pid)
+    paid_now = db.q("SELECT li_url FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL", (pid,))
+    assert not [c for c in paid_now if db.norm_li(c["li_url"]) in old_li]
+    skipped_old = [c for c in db.q("SELECT li_url FROM contacts WHERE pull_id=? AND state='skipped'", (pid,))
+                   if db.norm_li(c["li_url"]) in old_li]
+    assert skipped_old, "the test needs old people to show up again"
+
+
+def test_old_database_is_imported_once_on_first_start(env, tmp_path):
+    import shutil
+    from app import importer
+    shutil.copy(os.path.join(os.path.dirname(__file__), "data", "leadpuller-v1.2.db"), tmp_path / "leadpuller.db")
+    db.x("DELETE FROM meta WHERE k='old_import'")
+    first = importer.auto_import()
+    assert first["people"] > 50 and db.get_meta("old_import")["found"]
+    assert importer.auto_import() is None  # only once
+    client, _, _ = env
+    assert client.get("/api/settings").json()["old_import"]["people"] == first["people"]
+
+
+def test_old_database_accounts_and_do_not_pull_are_imported(env, tmp_path):
+    """The 1.3 shape: accounts table, do-not-pull entries of every kind, downloaded emails, seen without outcome."""
+    import sqlite3
+    from app import importer
+    client, fake, _ = env
+    old = str(tmp_path / "leadpuller.db")
+    con = sqlite3.connect(old)
+    con.executescript("""
+    CREATE TABLE seen (key TEXT PRIMARY KEY, pull_id INTEGER, created_at REAL);
+    CREATE TABLE exclusions (key TEXT PRIMARY KEY, kind TEXT, value TEXT, source TEXT, created_at REAL);
+    CREATE TABLE downloaded (email TEXT PRIMARY KEY, batch_id INTEGER, at REAL);
+    CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, api_key TEXT, priority INTEGER DEFAULT 0,
+      enabled INTEGER DEFAULT 1, monthly_budget INTEGER DEFAULT 0, source TEXT DEFAULT 'ui', balance INTEGER,
+      balance_at REAL, last_error TEXT, created_at REAL);
+    INSERT INTO seen VALUES ('li:linkedin.com/in/old-person-9', 1, 0), ('nc:jane doe|old co inc', 1, 0);
+    INSERT INTO downloaded VALUES ('Sent.Before@Example.com', 1, 0);
+    INSERT INTO exclusions VALUES ('em:boss@client.com','email','boss@client.com','ui',0),
+      ('domain:client.com','domain','client.com','ui',0),
+      ('li:linkedin.com/in/ceo-x','linkedin','https://www.linkedin.com/in/ceo-x/','ui',0),
+      ('cn:rival corp','company_name','Rival Corp','ui',0),
+      ('nc:sam lee|partner llc','name_company','Sam Lee @ Partner LLC','ui',0);
+    INSERT INTO accounts(name, api_key, priority, monthly_budget) VALUES ('Account A', 'key-alpha-1111', 1, 0),
+      ('Gaurav old', 'key-old-3333', 2, 4000);
+    """)
+    con.commit()
+    con.close()
+    out = importer.import_v1(old)
+    assert out == {"people": 0, "emails": 1, "do_not_pull": 5, "accounts": 1}  # Account A was already there
+    assert memory.find(db.person_keys("X", "Y", "https://linkedin.com/in/old-person-9")) 
+    assert memory.find(db.person_keys("Jane Doe", "Old Co"))
+    assert memory.find(db.person_keys("A B", "C", None, "sent.before@example.com"))
+    block = memory.Blocklist()
+    assert block.reason("Any One", "Whatever", "mail.client.com", None, None)
+    assert block.reason("Any One", "Rival Corp", None, None, None)
+    assert block.reason("Sam Lee", "Partner", None, None, None)
+    assert block.reason("Z Z", "Q", None, "http://linkedin.com/in/ceo-x?trk=1", None)
+    acc = db.q1("SELECT * FROM accounts WHERE api_key='key-old-3333'")
+    assert acc["name"] == "Gaurav old" and acc["monthly_budget"] == 4000
+    assert importer.import_v1(old)["do_not_pull"] == 0  # running it again adds nothing twice
