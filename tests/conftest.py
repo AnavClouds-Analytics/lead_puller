@@ -1,22 +1,20 @@
+import csv
+import io
 import os
+import re
 
 os.environ["DISABLE_WORKER"] = "1"
-os.environ["ENV_FILE"] = "/nonexistent.env"
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import claude, db, dnscheck, engine, seamless
-from tests.fakes import FakeClaude, FakeSeamless, email_for
-
-ENV = {"APP_PASSWORD": "test-pass-123", "COOKIE_SECURE": "0", "POLL_SECONDS": "0", "RATE_LIMIT_PER_MIN": "100000",
-       "MONTHLY_CREDIT_BUDGET": "0", "ACCOUNT_RESERVE": "0", "LOW_BALANCE_WARNING": "0", "UPDATED_WITHIN_MONTHS": "0",
-       "ANTHROPIC_API_KEY": "claude-key", "SEAMLESS_API_KEY": "", "LATE_POLL_MINUTES": "0",
-       "EXPECTED_EMAIL_RATE": "80", "MAX_PER_COMPANY": "0", "SYNC_SEAMLESS_SAVED": "1"}
+from app import claude, db, dnscheck, main, seamless, worker
+from tests.fakes import FakeClaude, FakeSeamless
 
 
 class Clock:
+    """Fake time for the rate limiter, so tests can check the per-minute limit without waiting."""
     def __init__(self):
         self.t = 1_800_000_000.0
 
@@ -24,83 +22,173 @@ class Clock:
         return self.t
 
     def sleep(self, s):
-        self.t += max(s, 0.01)
+        self.t += max(s, 0.001)
 
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    for k, v in ENV.items():
+    for k, v in {"APP_PASSWORD": "secret-pass", "SEAMLESS_API_KEY": "good-key", "ANTHROPIC_API_KEY": "claude-key",
+                 "DATA_DIR": str(tmp_path), "MONTHLY_CREDIT_BUDGET": "0", "MAX_PER_COMPANY": "3",
+                 "COMPANY_COOLDOWN_DAYS": "90", "FIT_CHECK": "1", "CONTINUE_SAME_SEARCH": "1",
+                 # v1.2 features are off here unless a test turns them on, so the v1.1 money tests stay exact
+                 "UPDATED_WITHIN_MONTHS": "0", "REQUIRE_COMPANY_WEBSITE": "0", "REQUIRE_LINKEDIN": "0",
+                 "TEST_BATCH_SIZE": "0", "SKIP_NO_EMAIL_SERVER": "1", "NO_EMAIL_RETRY_DAYS": "0",
+                 "LOW_BALANCE_WARNING": "0", "SPENDING_ENABLED": "1", "EMAIL_PICK": "best",
+                 "DEFAULT_EXPORT_COLUMNS": "email,first_name,last_name,company",
+                 # v1.3 collecting guards are off here unless a test turns them on (tests in test_v13.py do)
+                 "COLLECT_CLOSE_ENOUGH_PCT": "0", "COLLECT_LOW_KEEP_PCT": "0", "COLLECT_EMPTY_PAGES_STOP": "100000",
+                 "COLLECT_SPEND_CAP_PCT": "100000", "OPEN_PULL_HOLD_DAYS": "0", "ACCOUNT_RESERVE": "0",
+                 "LATE_ANSWER_HOURS": "24", "RESEARCH_WAIT_MINUTES": "15"}.items():
         monkeypatch.setenv(k, v)
+    dnscheck.LOOKUP = lambda d: "yes"
     db.reset_for_tests(str(tmp_path / "t.db"))
     clock = Clock()
-    fake = FakeSeamless(seed=int(os.environ.get("FAKE_SEED", "1")))
-    fake.clock = clock
-    monkeypatch.setattr(seamless, "TRANSPORT", httpx.MockTransport(fake.handler))
-    monkeypatch.setattr(seamless, "NOW", clock)
-    monkeypatch.setattr(seamless, "SLEEP", clock.sleep)
-    monkeypatch.setattr(engine, "NOW", clock)
-    monkeypatch.setattr(seamless, "limiter", seamless._Limiter())
-    monkeypatch.setattr(claude, "TRANSPORT", httpx.MockTransport(FakeClaude().handler))
-    monkeypatch.setattr(dnscheck, "LOOKUP", lambda d: "no" if d in ("acme13.com", "acme26.com") else "yes")
-    from app import main
+    fake_s, fake_c = FakeSeamless(seed=int(os.environ.get("FAKE_SEED", "1"))), FakeClaude()
+    fake_s.clock = clock
+    seamless.TRANSPORT = httpx.MockTransport(fake_s.handler)
+    claude.TRANSPORT = httpx.MockTransport(fake_c.handler)
+    seamless.NOW = clock
+    seamless.SLEEP = clock.sleep
+    seamless.limiter = seamless._Limiter()
+    worker.POLL_EVERY = 0
+    worker._last_poll.clear()
+    worker._failures.clear()
+    worker._saved_cache.clear()
+    worker._fill_stop.clear()
     client = TestClient(main.app)
     client.__enter__()
-    assert client.post("/api/auth/login", json={"password": "test-pass-123"}).status_code == 200
-    r = client.post("/api/accounts", json={"name": "Account A", "api_key": "key-alpha-1111"})
-    assert r.status_code == 200, r.text
-    yield client, fake, clock
+    assert client.post("/api/auth/login", json={"password": "secret-pass"}).status_code == 200
+    yield client, fake_s, fake_c, clock
     client.__exit__(None, None, None)
 
 
-def add_account(client, fake, key="key-bravo-2222", balance=100_000, name="Account B", budget=0):
-    fake.add_key(key, balance)
-    r = client.post("/api/accounts", json={"name": name, "api_key": key, "monthly_budget": budget})
+# ---------------------------------------------------------------- helpers used by tests
+def new_pull(client, prompt="tech leaders"):
+    r = client.post("/api/pulls/interpret", json={"prompt": prompt})
     assert r.status_code == 200, r.text
-    return next(a for a in r.json()["accounts"] if a["name"] == name)
+    return r.json()
 
 
-def start(client, filters, target=50, max_credits=None, account="auto", max_per_company=None, name=None):
-    r = client.post("/api/pulls", json={"name": name, "filters": filters, "target": target, "max_credits": max_credits,
-                                        "account": account, "max_per_company": max_per_company})
-    assert r.status_code == 200, r.text
-    return r.json()["id"]
-
-
-def run(client, pid, until=("done",), ticks=5000, clock=None):
-    for _ in range(ticks):
+def run_until(client, pid, statuses, max_ticks=3000):
+    p = None
+    for _ in range(max_ticks):
         p = client.get(f"/api/pulls/{pid}").json()
-        if p["status"] in until:
+        if p["status"] in statuses:
             return p
-        engine.tick()
-        if clock:
-            clock.t += 1
-    raise AssertionError(f"pull {pid} stuck in {p['status']}: {p.get('error')} / {p.get('stop_reason')}")
+        worker.tick()
+    raise AssertionError(f"pull {pid} stuck in {p['status']}: {p.get('error')}")
+
+
+def full_pull(client, target=120, cap=3, choice="all", prompt="tech leaders", filters=None, cooldown=None):
+    p = new_pull(client, prompt)
+    pid = p["id"]
+    patch = {}
+    if filters is not None:
+        patch["filters"] = filters
+    if cooldown is not None:
+        patch["company_cooldown"] = cooldown
+    if patch:
+        assert client.patch(f"/api/pulls/{pid}", json=patch).status_code == 200
+    r = client.post(f"/api/pulls/{pid}/preview", json={})
+    assert r.status_code == 200, r.text
+    r = client.post(f"/api/pulls/{pid}/collect", json={"target": target, "per_company_cap": cap})
+    assert r.status_code == 200, r.text
+    run_until(client, pid, {"collected"})
+    r = client.post(f"/api/pulls/{pid}/research", json={"choice": choice})
+    assert r.status_code == 200, r.text
+    return run_until(client, pid, {"done", "paused"})
+
+
+def anavmail_rows(client, pid, risky=1):
+    text = client.get(f"/api/pulls/{pid}/export?format=anavmail&include_risky={risky}").content.decode("utf-8-sig")
+    rows = list(csv.reader(io.StringIO(text)))
+    assert rows[0] == ["email", "first_name", "last_name", "company", "title", "linkedin"]
+    return rows[1:]
+
+
+def pid_from_email(email):
+    m = re.search(r"\.p(\d+)@", email or "")
+    return int(m.group(1)) if m else None
 
 
 def check_books(fake):
-    """Per account: the tool's credit ledger equals what that Seamless key was charged, to the credit."""
-    open_ = db.q1("SELECT COUNT(*) n FROM research_requests WHERE resolved_at IS NULL")["n"]
-    assert open_ == 0, "check_books needs every research answer back"
-    for a in db.q("SELECT * FROM accounts"):
-        logged = db.q1("SELECT COALESCE(SUM(credits),0) s FROM ledger WHERE account_id=?", (a["id"],))["s"]
-        assert logged == fake.charged_by_key.get(a["api_key"], 0), (a["name"], logged, fake.charged_by_key)
-    assert db.q1("SELECT COUNT(*) n FROM ledger WHERE account_id IS NULL AND credits!=0")["n"] == 0
-    assert fake.foreign_sid_rejected == 0, "sent one account's search results to another account"
+    """The tool's own credit ledger must equal what the (fake) Seamless actually charged, to the credit."""
+    pending = db.q1("SELECT COUNT(*) n FROM research_requests WHERE resolved_at IS NULL")["n"]
+    assert pending == 0, "check_books needs every research request resolved"
+    logged = db.q1("SELECT COALESCE(SUM(credits),0) s FROM ledger")["s"]
+    assert logged == fake.charged, f"ledger says {logged}, Seamless charged {fake.charged}"
+    for p in db.q("SELECT id, search_credits, research_credits FROM pulls"):
+        s = db.q1("SELECT COALESCE(SUM(credits),0) s FROM ledger WHERE pull_id=?", (p["id"],))["s"]
+        assert s == p["search_credits"] + p["research_credits"]
 
 
-def check_people(fake):
-    """Nobody is ever paid for twice (across pulls AND accounts), and every email belongs to its person."""
-    total = {}
-    for org, done in fake.researched.items():
-        for pid, n in done.items():
-            total[pid] = total.get(pid, 0) + n
-    twice = {pid: n for pid, n in total.items() if n > 1}
-    assert not twice, f"paid for these people more than once: {twice}"
-    for c in db.q("SELECT * FROM contacts WHERE email IS NOT NULL AND email!=''"):
-        pid = int(c["email"].split(".p")[-1].split("@")[0])
-        p = fake.by_pid[pid]
-        assert c["email"] == email_for(p) or c["email"] == fake.email_override.get(pid)
-        assert c["name"] == p["name"] and c["company"] == p["company"], (c["name"], p["name"])
+def check_people(client, fake, retries_allowed=False):
+    """No one is paid for twice, nobody gets someone else's details, and exports are clean."""
+    # 1. each person charged for research at most once, ever (unless a test turned on paid retries)
+    if not retries_allowed:
+        assert all(n <= 1 for n in fake.researched_pids.values()), "someone was charged twice"
+    # 2. each searchResultId sent for research at most once
+    sent = [r["sid"] for r in fake.requests.values()]
+    resent = {s for s in sent if sent.count(s) > 1}
+    # (re-sends are only allowed after an unconfirmed batch, and then Seamless doesn't charge)
+    for s in resent:
+        assert retries_allowed or fake.researched_pids.get(fake.sid_to_pid[s], 0) <= 1
+    # 3. every stored detail belongs to the right person
+    for c in db.q("SELECT * FROM contacts WHERE submitted_at IS NOT NULL"):
+        pid = fake.sid_to_pid[c["search_result_id"]]
+        person = fake.by_pid[pid]
+        assert c["kept"] == 1, f"skipped person {c['name']} was researched"
+        if c["email"]:
+            assert pid_from_email(c["email"]) == pid, f"{c['name']} got {c['email']}"
+            assert c["first_name"] == person["first"] and c["last_name"] == person["last"]
+            assert c["company"] == person["company"]
+            assert c["phone"] in (None, f"415.555.{pid:04d}")
+    # 4. exports
+    excluded = {r["value"] for r in db.q("SELECT value FROM exclusions WHERE kind='domain'")}
+    for p in db.q("SELECT id FROM pulls WHERE status='done'"):
+        rows = anavmail_rows(client, p["id"])
+        emails = [r[0].lower() for r in rows]
+        assert len(emails) == len(set(emails)), "duplicate email in AnavMail export"
+        for email, first, last, company, title, li in rows:
+            pid = pid_from_email(email)
+            person = fake.by_pid[pid]
+            assert (first, last, company) == (person["first"], person["last"], person["company"]), email
+            assert email.split("@")[1] not in excluded
+            c = db.q1("SELECT email_status FROM contacts WHERE pull_id=? AND LOWER(email)=?", (p["id"], email))
+            assert (c["email_status"] or "").lower() != "invalid"
+
+    check_batches(client, fake)
 
 
-US = {"contactCountry": {"in": ["United States"]}, "seniority": {"in": ["C-Level", "VP"]}}
+def batch_rows(client, bid):
+    r = client.get(f"/api/batches/{bid}/download")
+    assert r.status_code == 200, r.text
+    if r.headers["content-type"].startswith("application/zip"):
+        import zipfile
+        out = {}
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            for name in z.namelist():
+                out[name] = list(csv.DictReader(io.StringIO(z.read(name).decode("utf-8-sig"))))
+        return out
+    return list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+
+
+def check_batches(client, fake):
+    """Across ALL batches ever made: no email twice, every row is the right person, no invalid emails."""
+    all_emails = []
+    for b in db.q("SELECT * FROM batches"):
+        got = batch_rows(client, b["id"])
+        rows = [r for rs in got.values() for r in rs] if isinstance(got, dict) else got
+        assert len(rows) == b["count"], f"batch {b['id']} file has {len(rows)} rows, says {b['count']}"
+        for r in rows:
+            e = r["email"].lower()
+            all_emails.append(e)
+            pid = pid_from_email(e) if ".p" in e else None
+            c = db.q1("SELECT * FROM contacts WHERE LOWER(email)=? AND batch_id=?", (e, b["id"]))
+            assert c, f"{e} in batch file but not in batch"
+            assert (c["email_status"] or "").lower() != "invalid"
+            if pid is not None and "first_name" in r:
+                assert r["first_name"] == fake.by_pid[pid]["first"]
+            if pid is not None and "company" in r:
+                assert r["company"] == fake.by_pid[pid]["company"]
+    assert len(all_emails) == len(set(all_emails)), "the same email went out in two batches"
