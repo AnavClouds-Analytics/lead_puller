@@ -1,21 +1,22 @@
-"""Seamless.AI v1 API client with per-endpoint rate limiting, 429 back-off and credit tracking."""
+"""Seamless.AI v1 API client: per-endpoint rate limiting, 429 back-off, the live balance from every answer,
+and never an automatic resend of a call that may already have been charged."""
 import collections
 import math
-import os
 import threading
 import time
 
 import httpx
 
-from . import accounts, db
+from . import db
 from .config import cfg
 
-# Tests swap this for an httpx.MockTransport.
-TRANSPORT = None
-
+TRANSPORT = None          # tests swap in an httpx.MockTransport
+NOW = time.time           # tests swap in a fake clock
+SLEEP = time.sleep
 
 TERMINAL = {"done", "error", "missing", "duplicate", "not found", "contact-already-researched",
             "no license or credits available"}
+NOT_CHARGED = {"duplicate", "contact-already-researched", "error"}
 
 
 class SeamlessError(Exception):
@@ -31,7 +32,7 @@ class _Limiter:
         self.blocked_until = collections.defaultdict(float)
         self.lock = threading.Lock()
 
-    def wait(self, endpoint, sleep=time.sleep):
+    def wait(self, endpoint):
         while True:
             with self.lock:
                 now = NOW()
@@ -44,58 +45,70 @@ class _Limiter:
                 if not wait_for:
                     dq.append(now)
                     return
-            sleep(min(wait_for, 5))
+            SLEEP(min(wait_for, 5))
 
     def block(self, endpoint, until):
         with self.lock:
             self.blocked_until[endpoint] = max(self.blocked_until[endpoint], until)
 
 
-NOW = time.time      # tests swap in a fake clock
 limiter = _Limiter()
-SLEEP = time.sleep
 
 
-def api_key():
-    """True when at least one Seamless account is set up (kept for older callers)."""
-    return bool(accounts.enabled())
+def clean_key(raw):
+    """A pasted key often carries extras: spaces, line breaks, invisible characters, quotes or a 'Token' prefix."""
+    k = "".join(ch for ch in (raw or "") if ch.isprintable() and not ch.isspace())
+    k = k.strip("'\"`")
+    for prefix in ("Token:", "Token", "Bearer"):
+        if k.lower().startswith(prefix.lower()) and len(k) > len(prefix) + 8:
+            k = k[len(prefix):].lstrip(":")
+    return k
 
 
-def any_account():
-    """Some enabled account, for free calls (place lookups)."""
-    acc = accounts.enabled()
-    if not acc:
-        raise SeamlessError("No Seamless account is set up. Add your API key on the Seamless accounts page.",
-                            code="noKey")
-    return acc[0]
-
-
-def _balance_of(resp):
-    bal = resp.headers.get("X-PublicAPI-Credits")
+def _says(resp):
     try:
-        return int(float(bal)) if bal is not None else None
+        body = resp.json()
+    except Exception:
+        return (resp.text or "").strip()[:160]
+    if isinstance(body, dict):
+        for k in ("message", "msg", "error", "detail", "code"):
+            if isinstance(body.get(k), str) and body[k].strip():
+                return body[k].strip()[:160]
+    return ""
+
+
+def _json(resp):
+    try:
+        return resp.json() or {}
+    except Exception:
+        return {}
+
+
+def balance_of(resp):
+    v = resp.headers.get("X-PublicAPI-Credits")
+    try:
+        return int(float(v)) if v is not None else None
     except ValueError:
         return None
 
 
-def _record_headers(resp, account):
-    bal = _balance_of(resp)
+def _record_balance(resp, account):
+    bal = balance_of(resp)
     if bal is not None and account and account.get("id"):
-        accounts.record_balance(account["id"], bal)
+        db.x("UPDATE accounts SET balance=?, balance_at=?, last_error=NULL WHERE id=?", (bal, time.time(), account["id"]))
         account["balance"] = bal
-    return resp
+    return bal
 
 
 def _request(method, path, endpoint, *, account, json=None, params=None, retries=6, safe_to_retry=True):
-    """safe_to_retry=False for calls that spend credits per item (research): if Seamless times out or
-    errors after receiving the request we can't know whether it charged, so we never resend automatically."""
+    """safe_to_retry=False for research: if Seamless errors or times out after receiving the request we can't
+    know whether it charged, so the call is never resent automatically (code 'unconfirmed')."""
     key = (account or {}).get("api_key")
     if not key:
-        raise SeamlessError("No Seamless API key for this account. Add it on the Seamless accounts page.",
-                            code="noKey")
-    headers = {"Token": key, "Content-Type": "application/json"}
+        raise SeamlessError("No Seamless API key. Add one on the Accounts page.", code="noKey")
+    headers = {"Token": key, "Content-Type": "application/json", "Accept": "application/json"}
     for attempt in range(retries):
-        limiter.wait(endpoint, SLEEP)
+        limiter.wait(endpoint)
         try:
             with httpx.Client(timeout=60, transport=TRANSPORT) as c:
                 resp = c.request(method, cfg.SEAMLESS_BASE_URL + path, json=json, params=params, headers=headers)
@@ -106,116 +119,98 @@ def _request(method, path, endpoint, *, account, json=None, params=None, retries
                 raise SeamlessError(f"Could not reach Seamless: {e}", code="network")
             SLEEP(min(2 ** attempt, 30))
             continue
-        _record_headers(resp, account)
-        if resp.status_code == 429:
-            reset = resp.headers.get("X-RateLimit-Reset")
+        _record_balance(resp, account)
+        st = resp.status_code
+        if st == 429:
             try:
-                until = float(reset)
+                until = float(resp.headers.get("X-RateLimit-Reset"))
             except (TypeError, ValueError):
                 until = NOW() + 20
             limiter.block(endpoint, max(until, NOW() + 1))
             continue
-        if resp.status_code >= 500:
+        if st >= 500:
             if not safe_to_retry:
-                raise SeamlessError(f"Seamless returned a server error ({resp.status_code}).", code="unconfirmed",
-                                    status=resp.status_code)
+                raise SeamlessError(f"Seamless returned a server error ({st}).", code="unconfirmed", status=st)
             if attempt == retries - 1:
-                raise SeamlessError(f"Seamless server error ({resp.status_code}).", status=resp.status_code)
+                raise SeamlessError(f"Seamless server error ({st}).", code="server", status=st)
             SLEEP(min(2 ** attempt, 30))
             continue
-        if resp.status_code in (401, 403):
-            name = account.get("name") or "this account"
+        if st in (401, 403):
+            said = _says(resp)
+            why = ("the key is wrong, incomplete or was replaced in Seamless" if st == 401 else
+                   "the key is valid but this Seamless user isn't allowed to use the Public API")
+            msg = (f"Seamless did not accept the API key of {account.get('name') or 'this account'} (error {st}: {why}"
+                   + (f"; Seamless said: “{said}”" if said else "") + "). Copy the key again from that user's "
+                   "Seamless → Settings → Public API, or ask Seamless to switch the Public API on for that user.")
             if account.get("id"):
-                db.x("UPDATE accounts SET last_error=? WHERE id=?", ("Seamless did not accept this API key.",
-                                                                    account["id"]))
-            raise SeamlessError(f"Seamless did not accept the API key of {name}.",
-                                code="badKey", status=resp.status_code)
-        if resp.status_code == 422:
-            body = _safe_json(resp)
-            code = body.get("code")
-            if code == "missingLicense":
-                msg = "Your Seamless account has no active Public API license."
-            elif code == "insufficientCredits":
-                need = (body.get("data") or {}).get("additionalCreditsNeeded")
-                msg = f"Not enough Seamless credits on {account.get('name') or 'this account'}" + \
-                    (f" ({need} more needed)." if need else ".")
+                db.x("UPDATE accounts SET last_error=? WHERE id=?", (msg, account["id"]))
+            raise SeamlessError(msg, code="badKey", status=st)
+        if st == 422:
+            body = _json(resp)
+            code = body.get("code") or "422"
+            if code == "insufficientCredits":
+                msg = f"Not enough Seamless credits on {account.get('name') or 'this account'}."
+            elif code == "missingLicense":
+                msg = f"{account.get('name') or 'This account'} has no active Seamless Public API license."
             else:
-                msg = body.get("msg") or body.get("message") or "Seamless rejected the request (422)."
-            raise SeamlessError(msg, code=code or "422", status=422)
-        if resp.status_code >= 400:
-            body = _safe_json(resp)
-            raise SeamlessError(body.get("message") or body.get("msg") or f"Seamless error {resp.status_code}",
-                                status=resp.status_code)
+                msg = _says(resp) or "Seamless rejected the request (422)."
+            raise SeamlessError(msg, code=code, status=422)
+        if st >= 400:
+            raise SeamlessError(_says(resp) or f"Seamless error {st}", code="bad_request", status=st)
         return resp
-    raise SeamlessError("Seamless kept rate-limiting the request; will try again shortly.", code="rateLimited")
+    raise SeamlessError("Seamless kept rate-limiting the request; trying again shortly.", code="rateLimited")
 
 
-def _safe_json(resp):
-    try:
-        return resp.json() or {}
-    except Exception:
-        return {}
-
-
-# ---------- endpoints ----------
+# ---------------------------------------------------------------- endpoints
 def test_connection(account):
-    """Free call: location lookup costs no credits but returns the credit balance header."""
+    """Free: a place lookup costs nothing and its answer carries the live credit balance."""
     resp = _request("GET", "/search/locations", "locations", params={"q": "new york", "limit": 1}, account=account)
-    return {"ok": True, "balance": _balance_of(resp)}
+    return balance_of(resp)
 
 
-def lookup_location(text, types, limit=5, account=None):
+def lookup_location(text, types, account, limit=10):
     params = {"q": text, "limit": limit}
     if types:
         params["types"] = types
-    resp = _request("GET", "/search/locations", "locations", params=params, account=account or any_account())
-    return _safe_json(resp).get("data") or []
+    resp = _request("GET", "/search/locations", "locations", params=params, account=account)
+    return _json(resp).get("data") or []
 
 
-def search_contacts(body, limit, next_token=None, pull_id=None, account=None):
-    """One page of contact search. Costs 1 credit per 10 rows returned (rounded up)."""
+def search_contacts(body, limit, next_token, account, pull_id=None, note="search page"):
+    """One page of contact search. Seamless charges 1 credit per 10 rows returned (rounded up)."""
     payload = dict(body)
-    payload["limit"] = limit
-    payload["nextToken"] = next_token
+    payload["limit"] = int(limit)
+    if next_token:
+        payload["nextToken"] = next_token
     resp = _request("POST", "/search/contacts", "search_contacts", json=payload, account=account)
-    data = _safe_json(resp)
+    data = _json(resp)
     rows = data.get("data") or []
     sup = data.get("supplementalData") or {}
     credits = math.ceil(len(rows) / 10) if rows else 0
     if credits:
-        db.log_credits(pull_id, "search", credits, _balance_of(resp), f"search page, {len(rows)} rows",
-                       account_id=account.get("id"))
-    return rows, sup
+        db.log_credits(pull_id, account.get("id"), "search", credits, balance_of(resp), f"{note}, {len(rows)} rows")
+    return rows, sup, credits
 
 
-def research_contacts(search_result_ids, pull_id=None, skip_dedup=False, account=None):
-    """Submit up to 500 searchResultIds for research (1 credit each). Returns requestIds.
-    skip_dedup=True asks Seamless to look again at people your org researched before (charged)."""
+def research_contacts(search_result_ids, account, pull_id=None):
+    """Submit searchResultIds for research (1 credit each). Returns requestIds (same order as sent)."""
     body = {"searchResultIds": list(search_result_ids)}
-    if skip_dedup:
-        body["skipDeduplicationCheck"] = True
     resp = _request("POST", "/contacts/research", "research_contacts", json=body, safe_to_retry=False, account=account)
-    data = _safe_json(resp)
-    ids = data.get("requestIds") or []
+    ids = _json(resp).get("requestIds") or []
     if ids:
-        db.log_credits(pull_id, "research", len(ids), _balance_of(resp),
-                       f"research {len(ids)} contacts" + (" (retry, fresh look)" if skip_dedup else ""),
-                       account_id=account.get("id"))
+        db.log_credits(pull_id, account.get("id"), "research", len(ids), balance_of(resp), f"research {len(ids)} people")
     return ids
 
 
-def poll_research(request_ids, account=None):
-    """Poll up to 500 requestIds. Free. Returns list of result rows (each carries its requestId).
-    Must use the account that sent the research request."""
-    resp = _request("GET", "/contacts/research/poll", "poll",
-                    params={"requestIds": ",".join(request_ids)}, account=account)
-    return _safe_json(resp).get("data") or []
-
-
-def org_contacts(start_iso, end_iso, page, limit=500, account=None):
-    """Contacts already researched in your Seamless org (free). Used to fill in people Seamless reports as
-    already researched, instead of paying again."""
-    resp = _request("GET", "/contacts", "org_contacts",
-                    params={"startDate": start_iso, "endDate": end_iso, "page": page, "limit": limit},
+def poll_research(request_ids, account):
+    """Free. Must use the account that sent the research request."""
+    resp = _request("GET", "/contacts/research/poll", "poll", params={"requestIds": ",".join(request_ids)},
                     account=account)
-    return _safe_json(resp).get("data") or []
+    return _json(resp).get("data") or []
+
+
+def saved_contacts(start_iso, end_iso, page, account, limit=500):
+    """Free: contacts already researched in this Seamless account."""
+    resp = _request("GET", "/contacts", "org_contacts",
+                    params={"startDate": start_iso, "endDate": end_iso, "page": page, "limit": limit}, account=account)
+    return _json(resp).get("data") or []

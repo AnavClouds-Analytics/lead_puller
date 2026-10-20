@@ -38,16 +38,15 @@ def has_mail_server(domain):
     domain = db.norm_domain(domain)
     if not domain or "." not in domain:
         return "unknown"
-    row = db.q1("SELECT has_mx, checked_at FROM domains WHERE domain=?", (domain,))
-    if row and time.time() - row["checked_at"] < cfg.DNS_CACHE_DAYS * 86400:
-        return {1: "yes", 0: "no"}.get(row["has_mx"], "unknown")
+    row = db.q1("SELECT result, at FROM dns WHERE domain=?", (domain,))
+    if row and time.time() - row["at"] < cfg.DNS_CACHE_DAYS * 86400:
+        return row["result"]
     if LOOKUP:
         out = LOOKUP(domain)
         result, detail = (out if isinstance(out, tuple) else (out, ""))
     else:
         result, detail = _real_lookup(domain)
     if result in ("yes", "no"):          # don't cache "unknown": try again next time
-        db.x("INSERT INTO domains(domain,has_mx,detail,checked_at) VALUES(?,?,?,?) ON CONFLICT(domain) DO UPDATE "
-             "SET has_mx=excluded.has_mx, detail=excluded.detail, checked_at=excluded.checked_at",
-             (domain, 1 if result == "yes" else 0, detail, time.time()))
+        db.x("INSERT INTO dns(domain,result,at) VALUES(?,?,?) ON CONFLICT(domain) DO UPDATE "
+             "SET result=excluded.result, at=excluded.at", (domain, result, time.time()))
     return result

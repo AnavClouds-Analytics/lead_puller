@@ -1,30 +1,28 @@
-"""Run the app against the fake Seamless + Claude so the screens can be tried without spending credits.
+"""Run Lead Puller against the fake Seamless (no credits spent), to try the screens.
 
-    python -m tests.demo_server      # then open http://localhost:8765 , password: demo-pass-1
-    A second fake Seamless key to try on the "Seamless accounts" page: demo-second-key-2222
+    python -m tests.demo_server        # http://localhost:8765  password: demo-pass-1
+    A second fake Seamless key to add on the Accounts page: demo-second-key-2222
 """
 import os
 import tempfile
 
-os.environ.update({"APP_PASSWORD": "demo-pass-1", "SEAMLESS_API_KEY": "good-key", "ANTHROPIC_API_KEY": "claude-key",
-                   "POLL_SECONDS": "1", "TEST_BATCH_SIZE": "30", "TEST_BATCH_MIN_EMAIL_RATE": "60",
-                   "LOW_BALANCE_WARNING": "500", "UPDATED_WITHIN_MONTHS": "12", "EMAIL_CHANCE_MIN_SAMPLES": "20"})
-os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="leadpuller-demo-"))
-os.environ["ENV_FILE"] = os.path.join(os.environ["DATA_DIR"], "no.env")
+os.environ.update({"APP_PASSWORD": "demo-pass-1", "COOKIE_SECURE": "0", "POLL_SECONDS": "1",
+                   "ANTHROPIC_API_KEY": "claude-key", "MONTHLY_CREDIT_BUDGET": "19000", "UPDATED_WITHIN_MONTHS": "0",
+                   "SEAMLESS_API_KEY": "key-alpha-1111", "ENV_FILE": "/nonexistent.env"})
+os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="leadpuller2-demo-"))
 
 import httpx
 import uvicorn
 
-from app import claude, db, dnscheck, seamless
+from app import claude, dnscheck, seamless
 from tests.fakes import FakeClaude, FakeSeamless
 
-fake_s = FakeSeamless()
-fake_s.chaos_poll = True
-fake_s.add_key("demo-second-key-2222", 9_400)    # a second Seamless account to add on the accounts page
-seamless.TRANSPORT = httpx.MockTransport(fake_s.handler)
+fake = FakeSeamless(balance=9_400)
+fake.chaos_poll = True
+fake.add_key("demo-second-key-2222", 10_000)
+seamless.TRANSPORT = httpx.MockTransport(fake.handler)
 claude.TRANSPORT = httpx.MockTransport(FakeClaude().handler)
 dnscheck.LOOKUP = lambda d: "no" if d in ("acme13.com", "acme26.com") else "yes"
-db.reset_for_tests(os.path.join(os.environ["DATA_DIR"], "leadpuller.db"))
 
 if __name__ == "__main__":
     from app.main import app
