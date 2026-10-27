@@ -146,12 +146,16 @@ def test_email_shown_in_search_results_is_checked_against_memory(env, monkeypatc
 # ---------------------------------------------------------------- saving search credits
 def test_people_found_but_not_needed_are_used_first_next_time(env):
     client, fake, clock = env
-    p1 = run(client, start(client, US, target=40, max_credits=500))
-    banked = db.q1("SELECT COUNT(*) n FROM contacts WHERE state='banked'")["n"]
-    if not banked:
-        pytest.skip("this seed left nobody over")
+    banked = 0
+    for target in (40, 30, 20, 35, 25):
+        db.x("DELETE FROM contacts WHERE state='banked'")
+        p1 = run(client, start(client, US, target=target, max_credits=500))
+        banked = db.q1("SELECT COUNT(*) n FROM contacts WHERE state='banked'")["n"]
+        if banked >= 8:
+            break
+    assert banked >= 8, "the test needs people left over"
     n_search = len(fake.searches)
-    p2 = run(client, start(client, US, target=max(1, banked // 2), max_credits=500))
+    p2 = run(client, start(client, US, target=max(1, banked // 3), max_credits=500))
     # The second pull got its people from the bank: no new search page at all.
     assert len(fake.searches) == n_search
     assert p2["stats"]["search_credits"] == 0 and p2["stats"]["emails"] >= 1
@@ -302,13 +306,13 @@ def test_expired_search_position_starts_over_without_paying_twice(env):
 def test_slow_answers_finish_then_late_ones_fill_in_free(env, monkeypatch):
     client, fake, clock = env
     monkeypatch.setenv("RESEARCH_WAIT_MINUTES", "5")
+    # Every third US person answers slowly, so whatever the order, some of the people researched are slow.
     us = [p["pid"] for p in fake.people if p["country"] == "United States"]
-    fake.slow_pids.update(us[:30])
+    fake.slow_pids.update(us[::3])
     pid = start(client, US, target=40, max_credits=500)
     p = run(client, pid, clock=clock, ticks=20000)
     late = p["stats"]["late"]
-    if not late:
-        pytest.skip("no slow person was researched with this seed")
+    assert late, "the test needs slow answers"
     charged = fake.charged
     fake.slow_pids.clear()
     clock.t += 60
@@ -561,3 +565,19 @@ def test_old_database_accounts_and_do_not_pull_are_imported(env, tmp_path):
     acc = db.q1("SELECT * FROM accounts WHERE api_key='key-old-3333'")
     assert acc["name"] == "Gaurav old" and acc["monthly_budget"] == 4000
     assert importer.import_v1(old)["do_not_pull"] == 0  # running it again adds nothing twice
+
+
+def test_old_database_without_its_seen_table_is_still_imported(env, tmp_path):
+    import shutil
+    import sqlite3
+    from app import importer
+    old = tmp_path / "leadpuller.db"
+    shutil.copy(os.path.join(os.path.dirname(__file__), "data", "leadpuller-v1.2.db"), old)
+    con = sqlite3.connect(str(old))
+    con.execute("DROP TABLE seen")
+    con.commit()
+    paid = con.execute("SELECT name, company, li_url, email FROM contacts WHERE submitted_at IS NOT NULL").fetchall()
+    con.close()
+    importer.import_v1(str(old))
+    for name, company, li, email in paid:
+        assert memory.find(db.person_keys(name, company, li, email)), name

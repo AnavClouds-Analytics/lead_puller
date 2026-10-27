@@ -29,6 +29,9 @@ COLUMNS = [
     ("email_2", "Other email 1", lambda c: c["email_2"]),
     ("email_3", "Other email 2", lambda c: c["email_3"]),
     ("technologies", "Technologies", lambda c: c["technologies"]),
+    ("email_source", "How we got the email", lambda c: {"guessed": "guessed (MillionVerifier: valid)",
+                                                        "seamless": "seamless"}.get(c.get("email_source") or "", "")),
+    ("signal", "Signal", lambda c: c.get("signal") or ""),
     ("result", "Seamless result", lambda c: c["research_status"]),
     ("note", "Note", lambda c: c["research_message"]),
 ]
@@ -71,16 +74,30 @@ def anavmail_rows(pid):
             continue
         seen.add(e)
         out.append(c)
-    return out
+    return _signals(pid, out)
+
+
+def _signals(pid, rows):
+    """Company lists: each person gets their company's signal from your file (e.g. 'Hiring: Salesforce Developer')."""
+    sig = {r["domain"]: r["signal"] for r in db.q("SELECT domain, signal FROM pull_companies WHERE pull_id=? AND "
+                                                    "status='ready'", (pid,))}
+    if not sig:
+        return rows
+    for c in rows:
+        d = db.norm_domain(c.get("domain"))
+        parts = d.split(".") if d else []
+        c["signal"] = next((sig[".".join(parts[i:])] for i in range(len(parts) - 1) if ".".join(parts[i:]) in sig), "")
+    return rows
 
 
 def all_rows(pid):
-    return db.q("SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL ORDER BY id", (pid,))
+    return _signals(pid, db.q("SELECT * FROM contacts WHERE pull_id=? AND (submitted_at IS NOT NULL OR "
+                              "email_source='guessed') ORDER BY id", (pid,)))
 
 
 def no_email_rows(pid):
-    return db.q("""SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL AND (email IS NULL OR email='')
-                   AND state NOT IN ('queued') ORDER BY id""", (pid,))
+    return _signals(pid, db.q("""SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL AND
+                   (email IS NULL OR email='') AND state NOT IN ('queued') ORDER BY id""", (pid,)))
 
 
 def to_csv(rows, cols):

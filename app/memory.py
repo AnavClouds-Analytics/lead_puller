@@ -150,6 +150,9 @@ def sync_saved(account, force=False, now=None):
             if not find(keys):
                 added += 1
             remember(keys, "seamless", None, account["id"], "email" if email else "no_email")
+            if email:
+                from . import guess
+                guess.learn_from_record(rec, None, "seamless")
             li_key = next((k for k in keys if k.startswith("li:")), None)
             nc_key = next((k for k in keys if k.startswith("nc:")), None)
             if db.q1("SELECT 1 x FROM saved_contacts WHERE account_id=? AND COALESCE(email,'')=? AND "

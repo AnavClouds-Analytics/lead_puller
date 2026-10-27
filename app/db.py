@@ -64,7 +64,26 @@ CREATE INDEX IF NOT EXISTS l_acct ON ledger(account_id, at);
 CREATE TABLE IF NOT EXISTS techs(name TEXT PRIMARY KEY, seen INTEGER DEFAULT 0, checked_total INTEGER, checked_at REAL);
 CREATE TABLE IF NOT EXISTS dns(domain TEXT PRIMARY KEY, result TEXT, at REAL);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS pull_companies(
+  id INTEGER PRIMARY KEY, pull_id INTEGER, idx INTEGER, name TEXT, domain TEXT, signal TEXT, status TEXT);
+CREATE INDEX IF NOT EXISTS pc_pull ON pull_companies(pull_id, domain);
+CREATE TABLE IF NOT EXISTS verifier(id INTEGER PRIMARY KEY CHECK(id=1), api_key TEXT, enabled INTEGER DEFAULT 1,
+  credits INTEGER, credits_at REAL, last_error TEXT, errors_in_row INTEGER DEFAULT 0, paused_until REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS email_examples(email TEXT PRIMARY KEY, domain TEXT, email_domain TEXT, first TEXT,
+  last TEXT, patterns TEXT, source TEXT, at REAL);
+CREATE INDEX IF NOT EXISTS ee_dom ON email_examples(domain);
+CREATE TABLE IF NOT EXISTS domain_guess(domain TEXT PRIMARY KEY, catch_all INTEGER DEFAULT 0, tried INTEGER DEFAULT 0,
+  valid INTEGER DEFAULT 0, updated_at REAL);
+CREATE TABLE IF NOT EXISTS verify_log(id INTEGER PRIMARY KEY, at REAL, pull_id INTEGER, contact_id INTEGER,
+  email TEXT, result TEXT, cached INTEGER DEFAULT 0, credits_after INTEGER, note TEXT);
+CREATE INDEX IF NOT EXISTS vl_pull ON verify_log(pull_id);
+CREATE INDEX IF NOT EXISTS vl_email ON verify_log(email, at);
 """
+# Columns added after 2.0 (old databases get them on start).
+MIGRATIONS = {
+    "pulls": [("mode", "TEXT DEFAULT 'filters'")],
+    "contacts": [("email_source", "TEXT"), ("guess_note", "TEXT"), ("guess_done", "INTEGER DEFAULT 0")],
+}
 
 _local = threading.local()
 _path = None
@@ -82,6 +101,11 @@ def connect(path=None):
     os.makedirs(os.path.dirname(os.path.abspath(db_path())), exist_ok=True)
     con = _conn()
     con.executescript(SCHEMA)
+    for table, cols in MIGRATIONS.items():
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        for col, typ in cols:
+            if col not in have:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
     return con
 
 

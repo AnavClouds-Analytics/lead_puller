@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -52,6 +52,39 @@ SETTINGS = [
      "If fewer than this % of that first batch have an email, the pull pauses and asks before spending more (0 = off)"),
     ("EXPECTED_EMAIL_RATE", "80", "int", "Saving credits",
      "% of researched people expected to have an email, until your own history says otherwise"),
+
+    ("EMAIL_GUESSING", "1", "bool", "Email guessing",
+     "Before paying Seamless for a person, guess their email from their company's known format and check it with "
+     "MillionVerifier; only a \"valid\" answer is used, anything else is paid for in Seamless as usual (0 = off)"),
+    ("GUESS_MAX_CHECKS_PER_PERSON", "2", "int", "Email guessing",
+     "Most MillionVerifier checks for one person before paying Seamless (a 2nd only when the company uses two formats)"),
+    ("GUESS_MIN_CHECKS_LEFT", "200", "int", "Email guessing",
+     "Stop guessing (and pay Seamless as usual) when MillionVerifier has fewer checks left than this"),
+    ("GUESS_STOP_BELOW_RATE", "40", "int", "Email guessing",
+     "Stop guessing at a company once fewer than this % of its guesses came back valid (after 3 guesses)"),
+    ("GUESS_INITIAL_FORMATS", "0", "bool", "Email guessing",
+     "1 = also guess initial formats (jsmith@, j.smith@) when nobody else seen at the company would share the address. "
+     "Off by default: another J. Smith there could own it. Formats like john@ are never guessed"),
+    ("GUESS_PER_STEP", "10", "int", "Email guessing",
+     "Guesses checked per step, so Pause and Stop always answer quickly"),
+    ("GUESS_TIMEOUT_SECONDS", "10", "int", "Email guessing",
+     "MillionVerifier answer time limit per check (2–60); a slow answer counts as not valid, never as valid"),
+    ("GUESS_CACHE_DAYS", "30", "int", "Email guessing",
+     "Reuse a MillionVerifier answer for the same address for this many days instead of paying for it again"),
+    ("GUESS_ERRORS_PAUSE", "3", "int", "Email guessing",
+     "After this many MillionVerifier errors in a row, stop guessing for 30 minutes and pay Seamless as usual"),
+    ("MILLIONVERIFIER_API_KEY", "", "secret", "Email guessing",
+     "Optional. The MillionVerifier key is normally added on the Accounts page; a key here is used when none is set there"),
+    ("MILLIONVERIFIER_BASE_URL", "https://api.millionverifier.com/api/v3", "str", "Email guessing",
+     "MillionVerifier API address"),
+
+    ("DEFAULT_PER_COMPANY", "3", "int", "Company lists",
+     "People per company preselected for \"People at my companies\" pulls (most senior first)"),
+    ("COMPANY_LIST_MAX", "2000", "int", "Company lists", "Largest company list one pull accepts"),
+    ("COMPANY_BATCH", "100", "int", "Company lists", "Companies per Seamless search (Seamless allows up to 100)"),
+    ("RESLICE_FULL_SHARE", "50", "int", "Company lists",
+     "When this % of a batch's companies already have enough people, search the rest again without them, so "
+     "search credits aren't spent on people from full companies"),
 
     ("LOCATION_APPLIES_TO", "contact", "str", "Search",
      "Default \"Location applies to\": contact = person's location (recommended), company, bothOR, bothAND"),

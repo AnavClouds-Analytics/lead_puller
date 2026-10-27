@@ -2,6 +2,8 @@
 
     python -m tests.demo_server        # http://localhost:8765  password: demo-pass-1
     A second fake Seamless key to add on the Accounts page: demo-second-key-2222
+    A fake MillionVerifier key for the Accounts page:      mv-key-7d3e
+    A company list to upload on New pull:                  tests/data/demo-hiring-signals.csv
 """
 import os
 import tempfile
@@ -14,14 +16,15 @@ os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="leadpuller2-demo-"))
 import httpx
 import uvicorn
 
-from app import claude, dnscheck, seamless
-from tests.fakes import FakeClaude, FakeSeamless
+from app import claude, dnscheck, seamless, verifier
+from tests.fakes import FakeClaude, FakeMillionVerifier, FakeSeamless
 
 fake = FakeSeamless(balance=9_400)
 fake.chaos_poll = True
 fake.add_key("demo-second-key-2222", 10_000)
 seamless.TRANSPORT = httpx.MockTransport(fake.handler)
 claude.TRANSPORT = httpx.MockTransport(FakeClaude().handler)
+verifier.TRANSPORT = httpx.MockTransport(FakeMillionVerifier(fake, credits=18_420).handler)
 dnscheck.LOOKUP = lambda d: "no" if d in ("acme13.com", "acme26.com") else "yes"
 
 if __name__ == "__main__":

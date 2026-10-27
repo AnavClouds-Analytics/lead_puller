@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import accounts, claude, db, engine, exports, importer, memory, seamless
+from . import accounts, claude, companies, db, engine, exports, guess, importer, memory, seamless, verifier
 from . import filters as F
 from .config import APP_VERSION, cfg, shown_settings
 
@@ -42,7 +42,7 @@ def _err(status):
     return handler
 
 
-for _exc in (engine.PullError, seamless.SeamlessError, claude.ClaudeError, ValueError):
+for _exc in (engine.PullError, seamless.SeamlessError, claude.ClaudeError, verifier.VerifierError, ValueError):
     app.add_exception_handler(_exc, _err(400))
 
 
@@ -114,7 +114,9 @@ def _overview():
     return {"accounts": accs, "spent_this_month": spent, "monthly_budget": budget,
             "budget_left": max(0, budget - spent) if budget else None, "spending_enabled": cfg.SPENDING_ENABLED,
             "shared_pools": _shared_pools(), "low": [a["name"] for a in accs if a["enabled"] and a["low"]],
-            "people_pulled": db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL")["n"],
+            "people_pulled": db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL OR "
+                                   "email_source='guessed'")["n"],
+            "verifier": verifier.status(),
             "seamless_saved": db.q1("SELECT COUNT(*) n FROM saved_contacts")["n"],
             "emails_in_memory": db.q1("SELECT COUNT(*) n FROM memory WHERE key LIKE 'em:%'")["n"]}
 
@@ -126,7 +128,9 @@ def meta():
         "max_per_email": cfg.DEFAULT_MAX_CREDITS_PER_EMAIL, "max_per_company": cfg.MAX_PER_COMPANY,
         "columns": exports.default_columns(), "page_size": cfg.TABLE_PAGE_SIZE,
         "location_default": cfg.LOCATION_APPLIES_TO, "move_on": cfg.MOVE_ON_SEARCH_COST,
-        "wait_minutes": cfg.RESEARCH_WAIT_MINUTES, "late_hours": cfg.LATE_ANSWER_HOURS},
+        "wait_minutes": cfg.RESEARCH_WAIT_MINUTES, "late_hours": cfg.LATE_ANSWER_HOURS,
+        "per_company": cfg.DEFAULT_PER_COMPANY, "company_max": cfg.COMPANY_LIST_MAX,
+        "company_only": sorted(companies.COMPANY_ONLY)},
         "columns": [{"key": k, "label": l} for k, l, _ in exports.COLUMNS], "tech_bundles": F.TECH_BUNDLES,
         "has_claude": bool(cfg.ANTHROPIC_API_KEY), "overview": _overview()}
 
@@ -211,7 +215,21 @@ def _pull_out(pid):
     spent = spend_s + spend_r
     oldest = db.q1("SELECT MIN(created_at) t FROM research_requests WHERE pull_id=? AND resolved_at IS NULL",
                    (pid,))["t"]
-    p.update({"stats": {**st, "no_email": no_email, "search_credits": spend_s, "research_credits": spend_r,
+    g = db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='guessed' AND {engine.DELIVERABLE}",
+              (pid,))["n"]
+    vl = {r["result"]: r["n"] for r in db.q("SELECT result, COUNT(*) n FROM verify_log WHERE pull_id=? AND cached=0 "
+                                            "GROUP BY result", (pid,))}
+    paid_email = db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL AND "
+                       f"{engine.DELIVERABLE}", (pid,))["n"]
+    guessing = {"guessed": g, "paid": st["researched"], "paid_email": paid_email, "saved": g,
+                "checks": sum(vl.values()), "valid": vl.get("ok", 0), "catch_all": vl.get("catch_all", 0),
+                "not_valid": sum(n for k, n in vl.items() if k not in ("ok", "catch_all")),
+                "ready": verifier.ready()[0], "why_not": verifier.ready()[1]}
+    if p.get("mode") == "companies":
+        cs = db.q1("SELECT COUNT(*) n, SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) r FROM pull_companies "
+                   "WHERE pull_id=?", (pid,))
+        p["companies"] = {"total": cs["n"], "ready": cs["r"] or 0}
+    p.update({"guessing": guessing, "stats": {**st, "no_email": no_email, "search_credits": spend_s, "research_credits": spend_r,
                         "credits": spent, "per_email": round(spent / emails, 2) if emails else None,
                         "hit_rate": round(hit * 100), "late": db.q1(
                             "SELECT COUNT(*) n FROM research_requests WHERE pull_id=? AND gave_up=1", (pid,))["n"],
@@ -225,9 +243,54 @@ def _pull_out(pid):
 @app.post("/api/pulls", dependencies=AUTH)
 async def new_pull(request: Request):
     b = await request.json()
+    clist = b.get("companies")
+    if clist is not None:
+        clist = [{"name": c.get("name") or "", "domain_raw": c.get("domain") or "", "signal": c.get("signal") or ""}
+                 for c in clist if isinstance(c, dict)]
     pid = engine.create_pull(b.get("name"), b.get("prompt"), b.get("filters") or {}, b.get("target"),
-                             b.get("max_credits"), str(b.get("account") or "auto"), b.get("max_per_company"))
+                             b.get("max_credits"), str(b.get("account") or "auto"), b.get("max_per_company"),
+                             company_list=clist)
     return _pull_out(pid)
+
+
+# ---------------------------------------------------------------- company lists
+def _companies_out(items, per_company, target):
+    sm = companies.summary(items)
+    return {"items": items, "summary": sm,
+            "estimate": companies.estimate(sm["ready"], max(1, int(per_company or cfg.DEFAULT_PER_COMPANY)),
+                                           target or sm["ready"] * max(1, int(per_company or cfg.DEFAULT_PER_COMPANY)),
+                                           sm["known_format"], sm["catch_all"], verifier.ready()[0]),
+            "guessing_ready": verifier.ready()[0], "guessing_why": verifier.ready()[1]}
+
+
+@app.post("/api/companies/check", dependencies=AUTH)
+async def companies_check(request: Request):
+    """Paste or re-check a list (free): status per company, and the estimate."""
+    b = await request.json()
+    rows = companies.parse(text=b.get("text") or "")
+    rows += [{"name": c.get("name") or "", "domain_raw": c.get("domain") or "", "signal": c.get("signal") or ""}
+             for c in (b.get("items") or []) if isinstance(c, dict)]
+    return _companies_out(companies.check(rows), b.get("per_company"), b.get("target"))
+
+
+@app.post("/api/companies/upload", dependencies=AUTH)
+async def companies_upload(file: UploadFile = File(...), per_company: int = 0, target: int = 0):
+    raw = (await file.read()).decode("utf-8-sig", errors="replace")
+    rows = companies.parse(csv_text=raw)
+    if not rows:
+        raise engine.PullError("Couldn't find any companies in that file. It needs a website or domain column.")
+    out = _companies_out(companies.check(rows), per_company, target)
+    out["file"] = (file.filename or "upload.csv")[:120]
+    return out
+
+
+@app.get("/api/pulls/{pid}/companies", dependencies=AUTH)
+def pull_companies(pid: int, offset: int = 0, limit: int = 0, q: str = "", all: int = 0):
+    if all:
+        return {"rows": db.q("SELECT name, domain, signal, status FROM pull_companies WHERE pull_id=? ORDER BY idx",
+                             (pid,))}
+    offset, limit = _page(offset, limit)
+    return companies.rows_for_pull(pid, offset, limit, q)
 
 
 @app.get("/api/pulls", dependencies=AUTH)
@@ -269,8 +332,12 @@ def pull_action(pid: int, action: str):
         engine.finish_now(pid)
     elif action == "rerun":
         p = db.get_pull(pid)
+        clist = None
+        if p.get("mode") == "companies":
+            clist = [{"name": r["name"], "domain_raw": r["domain"], "signal": r["signal"]} for r in
+                     db.q("SELECT * FROM pull_companies WHERE pull_id=? ORDER BY idx", (pid,)) if r["domain"]]
         new = engine.create_pull(p["name"], p["prompt"], p["filters"], p["target"], p["max_credits"],
-                                 p["account_choice"], p["max_per_company"], rerun_of=pid)
+                                 p["account_choice"], p["max_per_company"], rerun_of=pid, company_list=clist)
         return _pull_out(new)
     else:
         raise HTTPException(404)
@@ -288,6 +355,7 @@ def delete_pull(pid: int):
     # Memory stays: people you paid for are still never pulled again.
     db.x("DELETE FROM contacts WHERE pull_id=? AND state!='banked'", (pid,))
     db.x("DELETE FROM pull_slices WHERE pull_id=?", (pid,))
+    db.x("DELETE FROM pull_companies WHERE pull_id=?", (pid,))
     db.x("DELETE FROM pulls WHERE id=?", (pid,))
     return {"ok": True}
 
@@ -299,7 +367,7 @@ def stop_all():
 
 PEOPLE_COLS = """id, name, first_name, last_name, title, company, domain, li_url, country, city, size, industry, state,
                  skip_reason, skip_kind, email, email_status, phone, research_status, research_message, filled_free,
-                 dup_email"""
+                 dup_email, email_source, guess_note"""
 PEOPLE_VIEWS = {
     "emails": "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0",
     "no_email": "submitted_at IS NOT NULL AND (email IS NULL OR email='') AND state!='queued'",
@@ -433,6 +501,30 @@ def delete_account(aid: int):
         raise engine.PullError("A pull is still using this account. Switch it off instead; delete it later.")
     db.x("DELETE FROM accounts WHERE id=?", (aid,))
     return _overview()
+
+
+# ---------------------------------------------------------------- MillionVerifier (email guessing)
+@app.get("/api/verifier", dependencies=AUTH)
+def verifier_status():
+    return verifier.status()
+
+
+@app.post("/api/verifier", dependencies=AUTH)
+async def verifier_set(request: Request):
+    b = await request.json()
+    if b.get("api_key"):
+        verifier.set_key(b["api_key"])
+    if "enabled" in b:
+        verifier.set_enabled(bool(b["enabled"]))
+    if b.get("check"):
+        verifier.refresh_credits()
+    return verifier.status()
+
+
+@app.delete("/api/verifier", dependencies=AUTH)
+def verifier_delete():
+    verifier.remove_key()
+    return verifier.status()
 
 
 # ---------------------------------------------------------------- do-not-pull

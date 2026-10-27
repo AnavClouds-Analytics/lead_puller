@@ -10,6 +10,8 @@ from . import db
 from .config import cfg
 
 LOOKUP = None          # tests replace this with a fake: domain -> "yes" | "no" | "unknown"
+KNOWN_GOOD = ("gmail.com", "outlook.com")
+_health = {"ok": None, "at": 0.0}
 
 
 def _real_lookup(domain):
@@ -34,6 +36,16 @@ def _real_lookup(domain):
         return "unknown", type(e).__name__
 
 
+def dns_healthy():
+    """A "no" is only believed if this server's DNS can see big mail providers. If DNS on the server is
+    broken (it answers "doesn't exist" for everything), nobody is skipped."""
+    if _health["ok"] is not None and time.time() - _health["at"] < 600:
+        return _health["ok"]
+    ok = any(_real_lookup(d)[0] == "yes" for d in KNOWN_GOOD)
+    _health.update(ok=ok, at=time.time())
+    return ok
+
+
 def has_mail_server(domain):
     domain = db.norm_domain(domain)
     if not domain or "." not in domain:
@@ -46,6 +58,8 @@ def has_mail_server(domain):
         result, detail = (out if isinstance(out, tuple) else (out, ""))
     else:
         result, detail = _real_lookup(domain)
+        if result == "no" and not dns_healthy():
+            result = "unknown"
     if result in ("yes", "no"):          # don't cache "unknown": try again next time
         db.x("INSERT INTO dns(domain,result,at) VALUES(?,?,?) ON CONFLICT(domain) DO UPDATE "
              "SET result=excluded.result, at=excluded.at", (domain, result, time.time()))

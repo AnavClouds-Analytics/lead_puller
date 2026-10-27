@@ -24,9 +24,32 @@ LAST = ["Smith", "Müller", "O'Brien", "Cohen", "Garcia", "Chen", "Patel", "Levi
 TECHS = [["Salesforce", "Slack"], ["HubSpot"], ["Salesforce", "Tableau"], ["Zoho CRM"], [], ["AWS", "Salesforce"]]
 
 
+# Every fake company uses one real-world email format; some accept every address (catch-all), some mix two formats.
+FORMATS = ["first.last", "first", "flast", "firstlast", "first_last", "f.last"]
+
+
+def company_format(co, i):
+    if co % 13 == 4:
+        return "first.last" if i % 2 else "flast"          # two formats in use at one company
+    return FORMATS[co % len(FORMATS)]
+
+
+def is_catch_all(domain):
+    m = re.match(r"acme(\d+)\.com$", domain or "")
+    return bool(m) and int(m.group(1)) % 7 == 3
+
+
+def local_for(fmt, first, last):
+    f, l = slug(first), slug(last)
+    return {"first.last": f"{f}.{l}", "first": f, "flast": f"{f[0]}{l}", "firstlast": f"{f}{l}",
+            "first_last": f"{f}_{l}", "f.last": f"{f[0]}.{l}"}[fmt]
+
+
 def make_people(n=900, seed=7):
     rnd = random.Random(seed)
     people = []
+    names_at = set()
+    taken = set()
     for i in range(n):
         co = rnd.randint(0, 260)
         company = f"Staffing Partners {co}" if co % 17 == 0 else f"Acme Software {co}"
@@ -37,6 +60,13 @@ def make_people(n=900, seed=7):
             domain = ""                                               # no website on record
         size = "" if co % 41 == 3 else SIZES[co % len(SIZES)]          # some companies have no size on record
         first, last = FIRST[i % len(FIRST)], LAST[(i * 7) % len(LAST)]
+        j = 1
+        while (first, last, co) in names_at:                      # no namesakes at one company (a test adds some)
+            last = LAST[(i * 7 + j) % len(LAST)]
+            j += 1
+            if j > len(LAST):
+                first = FIRST[(i + j) % len(FIRST)]
+        names_at.add((first, last, co))
         li = f"https://www.linkedin.com/in/{first.lower()}-{i}/"
         if i % 9 == 0:
             li = ""
@@ -48,7 +78,20 @@ def make_people(n=900, seed=7):
                        "industries": ["Computer Software"] if co % 5 else ["Staffing & Recruiting"], "size": size,
                        "techs": TECHS[co % len(TECHS)],
                        "lastModifiedAt": "2023-01-15 10:00:00" if i % 6 == 0 else "2026-08-01 10:00:00"})
+        people[-1]["email"] = mailbox_for(people[-1], co, i, taken)
     return people
+
+
+def mailbox_for(p, co, i, taken):
+    """The person's real work mailbox, in their company's format (made unique if two people collide)."""
+    if not p["domain"]:
+        return f"{slug(p['first'])}.{slug(p['last'])}.p{p['pid']}@nodomain.example"
+    local = local_for(company_format(co, i), p["first"], p["last"])
+    e, k = f"{local}@{p['domain']}", 2
+    while e in taken:
+        e, k = f"{local}{k}@{p['domain']}", k + 1
+    taken.add(e)
+    return e
 
 
 def slug(s):
@@ -56,14 +99,15 @@ def slug(s):
 
 
 def email_for(p):
-    """Encodes the person id, so a test can prove every email went to the right person."""
-    return f"{slug(p['first'])}.{slug(p['last'])}.p{p['pid']}@{p['domain'] or 'nodomain.example'}"
+    """The person's real mailbox: the fake knows whose it is, so a test can prove every email went to the right person."""
+    return p["email"]
 
 
 class FakeSeamless:
     def __init__(self, people=None, balance=100_000, seed=1):
         self.people = people if people is not None else make_people()
         self.by_pid = {p["pid"]: p for p in self.people}
+        self.mailboxes = {p["email"]: p["pid"] for p in self.people}
         self.rnd = random.Random(seed)
         self.pools = {"key-alpha-1111": balance}
         self.shared_pool = False          # True: every key draws on (and de-duplicates in) one organization
@@ -90,6 +134,8 @@ class FakeSeamless:
         self.slow_pids = set()
         self.row_email_for_researched = True   # search rows show the email of people your org already researched
         self.email_override = {}
+        self.drop_sid = False                  # every poll answer without searchResultId
+        self.leak_domains = False
 
     # ------------------------------------------------------------------ accounts / books
     def add_key(self, key, balance):
@@ -182,6 +228,9 @@ class FakeSeamless:
             return (not inc or value in inc) and value not in exc
         if not incl("contactCountry", p["country"]):
             return False
+        if body.get("companyDomain") and p["domain"] not in body["companyDomain"] and not (
+                self.leak_domains and p["pid"] % 9 == 1):
+            return False                      # leak_domains: Seamless also returns some other companies
         if body.get("companySize") is not None and p["size"] not in body["companySize"]:
             return False
         if body.get("industry") and not set(body["industry"]) & set(p["industries"]):
@@ -300,7 +349,7 @@ class FakeSeamless:
             req["polls"] += 1
             pid = req["pid"]
             row = {"requestId": rid, "searchResultId": req["sid"]}
-            if self.chaos_poll and self.rnd.random() < 0.25:
+            if (self.chaos_poll and self.rnd.random() < 0.25) or self.drop_sid:
                 row.pop("searchResultId")
             if pid is None:
                 row.update(status="error", message="unknown search result")
@@ -319,6 +368,59 @@ class FakeSeamless:
         if self.chaos_poll:
             self.rnd.shuffle(out)
         return self._resp(200, {"success": True, "data": out})
+
+
+class FakeMillionVerifier:
+    """MillionVerifier: 'ok' only for mailboxes that really exist; catch-all companies say 'catch_all' for anything."""
+
+    def __init__(self, seamless_fake, credits=50_000, key="mv-key-7d3e"):
+        self.s = seamless_fake
+        self.credits = credits
+        self.key = key
+        self.checks = []                  # every paid check: email
+        self.credit_calls = 0
+        self.fail_next = []               # list of: "error" | "timeout" | "500" | "no_credits" | "garbage"
+        self.unknown_domains = set()
+
+    def handler(self, request: httpx.Request):
+        path = request.url.path.rstrip("/")
+        params = request.url.params
+        if params.get("api") != self.key:
+            return httpx.Response(200, json={"error": "invalid_api_key", "credits": 0})
+        if path.endswith("/credits"):
+            self.credit_calls += 1
+            return httpx.Response(200, json={"credits": self.credits, "bulk_credits": 0, "renewing_credits": 0, "plan": 4})
+        email = (params.get("email") or "").lower()
+        if self.fail_next:
+            mode = self.fail_next.pop(0)
+            if mode == "timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            if mode == "500":
+                return httpx.Response(500, text="boom")
+            if mode == "garbage":
+                return httpx.Response(200, text="<html>")
+            if mode == "no_credits":
+                return httpx.Response(200, json={"email": email, "result": "error", "error": "Insufficient credits",
+                                                 "credits": 0})
+            return httpx.Response(200, json={"email": email, "result": "error", "resultcode": 4,
+                                             "error": "Internal error"})
+        if self.credits < 1:
+            return httpx.Response(200, json={"email": email, "result": "error", "error": "Insufficient credits",
+                                             "credits": 0})
+        self.credits -= 1
+        self.checks.append(email)
+        domain = email.split("@")[-1]
+        if domain in self.unknown_domains:
+            res, code = "unknown", 3
+        elif is_catch_all(domain):
+            res, code = "catch_all", 2
+        elif email in self.s.mailboxes:
+            res, code = "ok", 1
+        else:
+            res, code = "invalid", 6
+        return httpx.Response(200, json={"email": email, "quality": "good", "result": res, "resultcode": code,
+                                         "subresult": "", "free": False, "role": False, "didyoumean": "",
+                                         "credits": self.credits, "executiontime": 1, "error": "", "livemode": True})
 
 
 class FakeClaude:

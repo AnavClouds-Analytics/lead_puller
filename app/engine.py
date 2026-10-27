@@ -10,6 +10,10 @@ Where credits go, and how each is saved:
             - a slice where new people have become expensive is left for later (MOVE_ON_*);
             - people found but not needed are kept ("banked") and used first next time, without searching.
   research  1 credit per person sent.
+            - email guessing first: where a company's email format is known from a real email, the address is
+              built and checked with MillionVerifier; only a "valid" answer is used (no Seamless credit), anything
+              else is paid for in Seamless as usual. At a new company one person is paid for first to learn the
+              format, the others wait for that answer;
             - nobody already pulled (any account, by email, LinkedIn or name + company), nobody already
               researched in your Seamless accounts, nobody on do-not-pull, no company without a website or
               without an email server, no more than N per company;
@@ -24,7 +28,7 @@ import re
 import threading
 import time
 
-from . import accounts, db, dnscheck, filters as F, memory, seamless
+from . import accounts, companies as CO, db, dnscheck, filters as F, guess, memory, seamless, verifier
 from .config import cfg
 
 NOW = time.time            # tests swap in a fake clock
@@ -35,18 +39,29 @@ class PullError(Exception):
 
 
 DELIVERABLE = "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0"
+NOT_GUESSED = "COALESCE(email_source,'')!='guessed'"
 OPEN_STATES = ("kept", "queued", "done", "unconfirmed", "timed_out", "no_email", "failed")
 
 
 # ================================================================ creating and controlling pulls
 def create_pull(name, prompt, filters, target, max_credits=None, account_choice="auto", max_per_company=None,
-                rerun_of=None):
+                rerun_of=None, company_list=None):
     f = F.clean(filters)
-    if not F.meaningful(f):
+    items = None
+    if company_list is not None:
+        items = CO.check(company_list)
+        if not any(i["status"] == "ready" for i in items):
+            raise PullError("None of those companies has a website Lead Puller can search. Add websites (e.g. acme.com).")
+        f = CO.people_filters(f)
+        if max_per_company in (None, "", 0, "0"):
+            max_per_company = cfg.DEFAULT_PER_COMPANY
+    elif not F.meaningful(f):
         raise PullError("Pick at least one search filter (for example a job title, country or industry).")
     target = int(target or 0)
     if target < 1:
         raise PullError("Enter how many contacts with email you want.")
+    if items is not None:
+        target = min(target, sum(1 for i in items if i["status"] == "ready") * max(1, int(max_per_company)))
     if max_credits in (None, "", 0):
         max_credits = math.ceil(target * cfg.DEFAULT_MAX_CREDITS_PER_EMAIL)
     max_credits = int(max_credits)
@@ -58,10 +73,14 @@ def create_pull(name, prompt, filters, target, max_credits=None, account_choice=
         raise PullError("No Seamless account is switched on. Add your API key on the Accounts page.")
     cap = cfg.MAX_PER_COMPANY if max_per_company in (None, "") else max(0, int(max_per_company))
     now = NOW()
+    default_name = F.summary(f) if items is None else f"{sum(1 for i in items if i['status'] == 'ready')} companies" + (
+        f" · {F.summary(f)}" if F.summary(f) != "No filters" else "")
     pid = db.x("""INSERT INTO pulls(name,prompt,filters_json,target,max_credits,max_per_company,account_choice,status,
-                  created_at,updated_at,rerun_of) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-               ((name or F.summary(f))[:90], prompt or "", json.dumps(f), target, max_credits, cap,
-                str(account_choice or "auto"), "queued", now, now, rerun_of))
+                  created_at,updated_at,rerun_of,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ((name or default_name)[:90], prompt or "", json.dumps(f), target, max_credits, cap,
+                str(account_choice or "auto"), "queued", now, now, rerun_of, "companies" if items is not None else "filters"))
+    if items is not None:
+        CO.save_for_pull(pid, items)
     return pid
 
 
@@ -138,11 +157,11 @@ def counts(pid):
 def hit_rate(pid):
     """Share of people researched who come back with a usable email: this pull, else your history, else .env."""
     r = db.q1(f"""SELECT COUNT(*) n, SUM(CASE WHEN {DELIVERABLE} THEN 1 ELSE 0 END) e FROM contacts
-                  WHERE pull_id=? AND state IN ('done','no_email','failed') AND filled_free=0""", (pid,))
+                  WHERE pull_id=? AND state IN ('done','no_email','failed') AND filled_free=0 AND {NOT_GUESSED}""", (pid,))
     if r["n"] >= 20:
         return min(1.0, max(0.05, (r["e"] or 0) / r["n"]))
     r = db.q1(f"""SELECT COUNT(*) n, SUM(CASE WHEN {DELIVERABLE} THEN 1 ELSE 0 END) e FROM
-                  (SELECT * FROM contacts WHERE state IN ('done','no_email','failed') AND filled_free=0
+                  (SELECT * FROM contacts WHERE state IN ('done','no_email','failed') AND filled_free=0 AND {NOT_GUESSED}
                    ORDER BY id DESC LIMIT 2000)""")
     if r["n"] >= 50:
         return min(1.0, max(0.05, (r["e"] or 0) / r["n"]))
@@ -173,8 +192,32 @@ def _pick_account(p, need):
 
 
 # ================================================================ slices
+def _plan_companies(p):
+    """Company lists: one search per batch of up to COMPANY_BATCH websites (Seamless allows 100)."""
+    doms = CO.ready_domains(p["id"])
+    n = max(1, min(100, cfg.COMPANY_BATCH))
+    base = F.search_body(p["filters"])
+    with db.tx() as c:
+        for i in range(0, len(doms), n):
+            chunk = doms[i:i + n]
+            body = dict(base, companyDomain=chunk)
+            c.execute("INSERT INTO pull_slices(pull_id,idx,label,size_value,skey) VALUES(?,?,?,?,?)",
+                      (p["id"], i // n * 10, f"Companies {i + 1}–{i + len(chunk)}", json.dumps({"domains": chunk}),
+                       _hash(body)))
+
+
+def _slice_domains(sl):
+    try:
+        v = json.loads(sl["size_value"] or "null")
+    except ValueError:
+        return None
+    return v.get("domains") if isinstance(v, dict) else None
+
+
 def _plan(p):
     """Split the search into company-size slices (each remembered separately, per account)."""
+    if p.get("mode") == "companies":
+        return _plan_companies(p)
     f = p["filters"]
     base = F.search_body(f)
     base.pop("companySize", None)
@@ -214,6 +257,10 @@ def _plan(p):
 
 def _slice_body(p, sl):
     body = F.search_body(p["filters"])
+    doms = _slice_domains(sl)
+    if doms is not None:
+        body["companyDomain"] = doms
+        return body
     body.pop("companySize", None)
     if sl["size_value"] is not None:
         sv = sl["size_value"]
@@ -303,7 +350,8 @@ def step(p):
         if st["pending"]:
             return _wait(p, st)
         r = db.q1(f"""SELECT COUNT(*) n, SUM(CASE WHEN {DELIVERABLE} THEN 1 ELSE 0 END) e FROM contacts
-                      WHERE pull_id=? AND state IN ('done','no_email','failed') AND filled_free=0""", (pid,))
+                      WHERE pull_id=? AND state IN ('done','no_email','failed') AND filled_free=0 AND {NOT_GUESSED}""",
+                    (pid,))
         db.update_pull(pid, rate_ack=1)
         if r["n"] >= 10 and 100.0 * (r["e"] or 0) / r["n"] < cfg.PAUSE_BELOW_EMAIL_RATE:
             db.update_pull(pid, status="paused", pause_kind="low_rate", error=(
@@ -318,7 +366,8 @@ def step(p):
         batch = min(batch, cfg.FIRST_BATCH)
     sl = _current_slice(pid)
     if st["kept"] >= batch or (st["kept"] and not sl):
-        return _research(p, min(batch, st["kept"]))
+        if _research(p, min(batch, st["kept"])) or not sl:
+            return
     if sl:
         return _search(p, sl, need_people - st["kept"], hit)
     if st["pending"]:
@@ -330,6 +379,12 @@ def step(p):
 def _start(p):
     pid = p["id"]
     _plan(p)
+    guess.backfill()                                     # free: email formats from everything you already have
+    if verifier.key() and cfg.EMAIL_GUESSING:
+        try:
+            verifier.refresh_credits()                   # free
+        except verifier.VerifierError:
+            pass
     balances = {}
     for a in accounts.ordered_for(p["account_choice"]):
         try:
@@ -512,9 +567,40 @@ def _search(p, sl, want_people, hit):
             state = "expensive"
             note = (f"left for later: the last {len(recent)} pages kept {k} of {sum(r['rows'] for r in recent)} "
                     f"(mostly people you already have)")
+    doms = _slice_domains(sl)
+    new_slice = None
+    if doms is not None and state == "scanning":
+        cap = p["max_per_company"] or 0
+        full = [d for d in doms if cap and _listed_count(pid, d) >= cap]
+        rest = [d for d in doms if d not in full]
+        if full and not rest:
+            state, note = "done", "every company in this batch has enough people"
+        elif full and 100.0 * len(full) / len(doms) >= cfg.RESLICE_FULL_SHARE and _slice_gen(sl) < 3:
+            state = "done"
+            others = "the other one is" if len(rest) == 1 else f"the other {len(rest)} are"
+            note = f"{len(full)} of {len(doms)} companies have enough people; {others} searched again on their own"
+            new_slice = rest
     db.x("""UPDATE pull_slices SET state=?, pages=pages+1, rows=rows+?, kept=kept+?, search_credits=search_credits+?,
             recent_json=?, note=COALESCE(?, note), total=COALESCE(?, total) WHERE id=?""",
          (state, len(rows), kept, credits, json.dumps(recent), note, total, sl["id"]))
+    if new_slice:
+        body2 = dict(F.search_body(p["filters"]), companyDomain=new_slice)
+        db.x("INSERT INTO pull_slices(pull_id,idx,label,size_value,skey,note) VALUES(?,?,?,?,?,?)",
+             (pid, sl["idx"] + 1, f"{sl['label'].split(' · ')[0]} · {len(new_slice)} still to fill",
+              json.dumps({"domains": new_slice, "gen": _slice_gen(sl) + 1}), _hash(body2),
+              "searched again without the companies that already have enough people"))
+
+
+def _slice_gen(sl):
+    try:
+        return int((json.loads(sl["size_value"] or "{}") or {}).get("gen", 0))
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
+def _listed_count(pid, domain):
+    return db.q1("""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('kept','queued','done','unconfirmed',
+                    'timed_out','no_email','failed') AND (domain=? OR domain LIKE ?)""", (pid, domain, "%." + domain))["n"]
 
 
 def _row_email(r):
@@ -609,14 +695,20 @@ def _store_rows(p, acct, sl, rows):
     kept = 0
     now = NOW()
     page_keys = _pull_keys(pid)
-    for r in rows:
-        c = _parse_row(r)
+    listed_mode = p.get("mode") == "companies"
+    parsed = [_parse_row(r) for r in rows]
+    if listed_mode:
+        parsed.sort(key=lambda c: guess.seniority_rank(c["seniority"], c["title"]))
+    for c in parsed:
         if not c["sid"]:
             continue
         keys = db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"])
         reason = kind = None
         if keys and page_keys & set(keys):
             reason, kind = "Same person twice in Seamless's results", "dup"
+        listed_dom = CO.listed(pid, c["domain"]) if listed_mode else None
+        if not reason and listed_mode and not listed_dom:
+            reason, kind = "Not one of your companies", "not_listed"
         if not reason:
             hit = memory.find(keys)
             if hit:
@@ -635,11 +727,17 @@ def _store_rows(p, acct, sl, rows):
         if not reason and cfg.REQUIRE_COMPANY_WEBSITE and not c["domain"]:
             reason, kind = "No company website", "no_site"
         if not reason:
-            reason = _company_cap(p, c["company"], c["domain"])
+            if listed_dom:
+                cap = p["max_per_company"] or 0
+                reason = f"More than {cap} at this company" if cap and _listed_count(pid, listed_dom) >= cap else None
+            else:
+                reason = _company_cap(p, c["company"], c["domain"])
             kind = "cap" if reason else None
         if not reason and cfg.SKIP_NO_EMAIL_SERVER and c["domain"] and dnscheck.has_mail_server(c["domain"]) == "no":
             reason, kind = "Company domain can't receive email", "no_mx"
         page_keys.update(keys)
+        if c["row_email"] and c["domain"]:
+            guess.learn(c["first_name"], c["last_name"], c["row_email"], c["domain"], "search")   # free
         state = "skipped" if reason else "kept"
         kept += 0 if reason else 1
         db.x("""INSERT INTO contacts(pull_id,account_id,slice_id,skey,sid,state,skip_reason,skip_kind,name,first_name,
@@ -662,6 +760,8 @@ def _pull_keys(pid):
 
 # ================================================================ researching
 def _research(p, n):
+    """Get emails for up to n kept people: a verified guess where the company's format is known (free in Seamless),
+    otherwise Seamless research (1 credit). Returns how many people were handled (0 = nothing could move yet)."""
     pid = p["id"]
     by_acct = db.q("SELECT account_id, COUNT(*) n FROM contacts WHERE pull_id=? AND state='kept' GROUP BY account_id",
                    (pid,))
@@ -674,28 +774,98 @@ def _research(p, n):
         if room is None:
             room = n
         if credits_left(p) < 1:
-            return
+            return 0
         if room < 1:
             # This account can't pay: keep these people for later (their search IDs belong to this account).
             db.x("UPDATE contacts SET state='banked', banked_at=? WHERE pull_id=? AND state='kept' AND account_id=?",
                  (NOW(), pid, grp["account_id"]))
             continue
-        k = min(n, room, grp["n"])
+        k = min(n, grp["n"])
         cands = db.q("SELECT * FROM contacts WHERE pull_id=? AND state='kept' AND account_id=? ORDER BY id LIMIT ?",
-                     (pid, acct["id"], k))
+                     (pid, acct["id"], max(k * 3, 60)))
+        cands.sort(key=lambda c: (guess.seniority_rank(c["seniority"], c["title"]), c["id"]))
+        guessing, _why = verifier.ready()
+        inflight = _domains_in_flight(pid) if guessing else set()
         block = memory.Blocklist()
-        fresh = []
+        to_pay, done, checks, learners = [], 0, 0, set()
         for c in cands:
+            if done + len(to_pay) >= k or len(to_pay) >= room:
+                break
             reason = _recheck(c, block)
             if reason:
                 db.x("UPDATE contacts SET state='skipped', skip_reason=?, skip_kind='recheck' WHERE id=?",
                      (reason, c["id"]))
+                continue
+            d = db.norm_domain(c["domain"])
+            if not guessing or c["guess_done"] or not d:
+                to_pay.append(c)
+                continue
+            addrs, why_not = guess.plan(c, _namesakes(pid, c))
+            if addrs:
+                if checks >= max(1, cfg.GUESS_PER_STEP):
+                    continue                              # checked next step, so Pause/Stop answer quickly
+                checks += len(addrs)
+                email, note = guess.try_person(c, addrs, pid)
+                if email and _recheck(c, memory.Blocklist()) is None:
+                    _apply_guess(c, email, note)
+                    done += 1
+                    continue
+                db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (note, c["id"]))
+                to_pay.append(c)
+                guessing, _why = verifier.ready()        # e.g. MillionVerifier just ran out: stop guessing
+            elif why_not == "Company's email format not known yet.":
+                if d in inflight or d in learners:
+                    continue                              # wait for the person already paid for at this company
+                learners.add(d)
+                db.x("UPDATE contacts SET guess_note=? WHERE id=?",
+                     ("Paid for in Seamless to learn this company's email format.", c["id"]))
+                to_pay.append(c)
             else:
-                fresh.append(c)
-        if not fresh:
-            return
-        _send(p, acct, fresh)
-        return
+                db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (why_not, c["id"]))
+                to_pay.append(c)
+        if to_pay:
+            _send(p, acct, to_pay[:max(0, min(k - done, room))])
+        return done + len(to_pay)
+    return 0
+
+
+def _domains_in_flight(pid):
+    """Companies where someone in this pull is paid for and their answer (with the email format) is on its way."""
+    if not db.q1("SELECT 1 x FROM research_requests WHERE pull_id=? AND resolved_at IS NULL LIMIT 1", (pid,)):
+        return set()                     # nothing is on its way, so nobody should wait
+    return {db.norm_domain(r["domain"]) for r in db.q(
+        """SELECT DISTINCT c.domain FROM contacts c WHERE c.pull_id=? AND c.state='queued' AND c.domain IS NOT NULL
+           AND c.domain!='' AND (c.request_id IS NULL OR EXISTS (SELECT 1 FROM research_requests r WHERE
+           r.request_id=c.request_id AND r.resolved_at IS NULL))""", (pid,))}
+
+
+def _namesakes(pid, c):
+    """Is there evidence of a different person with the same name at this company? (Same name, different LinkedIn,
+    anywhere in your results, or a known email of someone with this name there.) Then a guess could reach the wrong
+    person, so it isn't made."""
+    parts = guess.name_parts(c["first_name"], c["last_name"])
+    if not parts:
+        return False
+    d = db.norm_domain(c["domain"])
+    mine = db.norm_li(c["li_url"])
+    for r in db.q("SELECT first_name, last_name, li_url FROM contacts WHERE domain=? AND id!=?", (d, c["id"])):
+        if guess.name_parts(r["first_name"], r["last_name"]) != parts:
+            continue
+        other = db.norm_li(r["li_url"])
+        if mine and other and mine != other:
+            return True
+    return bool(db.q1("SELECT 1 x FROM email_examples WHERE domain=? AND first=? AND last=?", (d, *parts)))
+
+
+def _apply_guess(c, email, note):
+    now = NOW()
+    db.x("""UPDATE contacts SET state='done', email=?, email_status='valid', email_source='guessed', guess_done=1,
+            guess_note=?, research_status='guessed', research_message=?, resolved_at=? WHERE id=?""",
+         (email, note, "Guessed from the company's email format and checked valid by MillionVerifier (no Seamless "
+                       "credit).", now, c["id"]))
+    memory.remember(db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"]) + ["em:" + email], "pull",
+                    c["pull_id"], None, "email")
+    guess.learn(c["first_name"], c["last_name"], email, c["domain"], "guess")
 
 
 def _send(p, acct, people):
@@ -826,7 +996,14 @@ def _same_person(c, rec):
         return li_a == li_b
     na = db.norm(c["name"])
     nb = db.norm(rec.get("fullName") or f"{rec.get('firstName') or ''} {rec.get('lastName') or ''}")
-    return bool(na) and na == nb
+    if not na or na != nb:
+        return False
+    # Same name is not enough (two Anna Duboises at two companies): the company must match too.
+    dom_a, dom_b = db.norm_domain(c["domain"]), db.norm_domain(rec.get("companyDomain") or "")
+    if dom_a and dom_b:
+        return dom_a == dom_b
+    co_a, co_b = db.norm_company(c["company"]), db.norm_company(rec.get("companyName") or rec.get("company") or "")
+    return bool(co_a) and co_a == co_b
 
 
 def _apply_contact(c, rec, status, message, free=False):
@@ -849,7 +1026,8 @@ def _apply_contact(c, rec, status, message, free=False):
               "email_2": others[0] if others else None, "email_3": others[1] if len(others) > 1 else None,
               "phone": rec.get("contactPhone1"), "phone_type": rec.get("contactPhone1DataType"),
               "company_phone": rec.get("companyPhone1"), "technologies": techs or None,
-              "contact_json": json.dumps(rec), "filled_free": 1 if free else 0, "dup_email": dup}
+              "contact_json": json.dumps(rec), "filled_free": 1 if free else 0, "dup_email": dup,
+              "email_source": "seamless" if email else None}
     for col, keys in (("first_name", ("firstName",)), ("last_name", ("lastName",)), ("title", ("jobTitle",)),
                       ("city", ("city",)), ("region", ("state",))):
         for k in keys:
@@ -863,6 +1041,8 @@ def _apply_contact(c, rec, status, message, free=False):
     memory.set_outcome(keys, "email" if email else "no_email")
     if em and not dup:
         memory.remember(["em:" + em], "pull", c["pull_id"], c["account_id"], "email")
+        guess.learn(fields.get("first_name") or c["first_name"], fields.get("last_name") or c["last_name"], em,
+                    fields.get("domain") or c["domain"], "pull")
     for t in [t.strip() for t in (techs or "").split(",") if t.strip()][:40]:
         db.x("INSERT INTO techs(name,seen) VALUES(?,1) ON CONFLICT(name) DO UPDATE SET seen=seen+1", (t[:80],))
 

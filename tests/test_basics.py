@@ -161,3 +161,15 @@ def test_download_never_repeats_an_email_and_never_runs_formulas(env):
     for line in text.splitlines()[1:]:
         assert line.split(",", 1)[1][:1] not in ("=", "+", "-", "@"), line
     assert exports.cell("=1+1") == "'=1+1" and exports.cell("Acme") == "Acme"
+
+
+def test_broken_server_dns_never_skips_anyone(env, monkeypatch):
+    from app import dnscheck
+    monkeypatch.setattr(dnscheck, "LOOKUP", None)
+    monkeypatch.setattr(dnscheck, "_health", {"ok": None, "at": 0.0})
+    monkeypatch.setattr(dnscheck, "_real_lookup", lambda d: ("no", "domain does not exist"))
+    assert dnscheck.has_mail_server("realcompany.com") == "unknown"     # DNS says nothing exists: don't trust it
+    monkeypatch.setattr(dnscheck, "_health", {"ok": None, "at": 0.0})
+    monkeypatch.setattr(dnscheck, "_real_lookup",
+                        lambda d: ("yes", "mx") if d in dnscheck.KNOWN_GOOD else ("no", "no MX"))
+    assert dnscheck.has_mail_server("parked-domain.com") == "no"

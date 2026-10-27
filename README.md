@@ -1,4 +1,4 @@
-# Lead Puller 2.0
+# Lead Puller 2.1
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
@@ -6,14 +6,50 @@ memory of everyone already paid for is copied over automatically (see "Moving fr
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
 
+## New in 2.1
+
+- **People at my companies.** On New pull, switch "Who to pull" to "People at my companies". Then paste
+  websites or upload a CSV (any file with a website/domain column, e.g. a Hiring Signal Finder or Funding
+  Finder download) and choose people per company (default 3, most senior first). Lead Puller searches those
+  companies in batches of 100 and pays only for people at them. Companies that already have enough people
+  are left out of later searches. The file's signal column goes into the download.
+- **Email guessing (saves Seamless research credits).** Lead Puller learns each company's email format from
+  real emails (earlier pulls, Seamless saved contacts, emails shown in search results). For the next person
+  there, it builds the address and checks it with MillionVerifier. Only a "valid" answer is used, with no
+  Seamless credit spent; anything else is paid for in Seamless as before. At a new company, one person is
+  paid for first to learn the format. Only formats with the full first and last name are guessed
+  (`john.smith@`, `johnsmith@`, `john_smith@`…). `john@` and `jsmith@` could belong to someone else, so
+  people at those companies are paid for in Seamless as before (`GUESS_INITIAL_FORMATS=1` turns on a guarded
+  version for initials). It also works on normal pulls wherever a company's format is already known.
+- The **MillionVerifier key goes on the Accounts page** (like the Seamless keys; the AnavMail key works).
+  With no key, guessing is simply off and 2.1 behaves exactly like 2.0.
+- Fix: when Seamless returns an answer without saying who it is for, it is now matched by name **and**
+  company (two people with the same name at two companies could swap emails before).
+
+### Upgrading from 2.0
+
+Replace the code, keep `data/` and `.env`:
+
+```bash
+cd lead-puller-2 && docker compose down
+cp -r data ../lead-puller-2-data-backup            # backup first
+# unzip lead-puller-2.1.0.zip over this folder (it never contains data/ or .env)
+docker compose up -d --build
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.1.0"}
+```
+
+The database gets its new columns automatically on start. No `.env` change is needed: every new setting has a
+safe default (all of them are listed under "Email guessing" and "Company lists" in `.env.example`). Then add the
+MillionVerifier key on the Accounts page.
+
 ## Deploy (fresh install)
 
 ```bash
-unzip lead-puller-2.0.0.zip && cd lead-puller-2
+unzip lead-puller-2.1.0.zip && cd lead-puller-2
 cp .env.example .env          # then edit .env (see below)
 mkdir -p data
 docker compose up -d --build
-curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.0.0"}
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.1.0"}
 ```
 
 The app listens on `127.0.0.1:8090`. Put Nginx/Caddy with HTTPS in front, exactly like 1.x. Run **one**
@@ -76,6 +112,11 @@ that gets the email). Here is how Lead Puller avoids paying:
 - **Skip people unlikely to pay off:** no company website, a domain with no mail server (free DNS check),
   more than `MAX_PER_COMPANY` people at one company, and anyone on do-not-pull (email, domain including
   subdomains, LinkedIn, company).
+- **Email guessing before research** (2.1, needs the MillionVerifier key). See "New in 2.1". Each
+  MillionVerifier answer is reused for `GUESS_CACHE_DAYS`, so the same address is never paid for twice.
+  Catch-all companies cost at most one check and are then never guessed. A company whose guesses keep
+  failing is given up (`GUESS_STOP_BELOW_RATE`). MillionVerifier errors, timeouts or a low balance
+  (`GUESS_MIN_CHECKS_LEFT`) just mean "pay Seamless as usual".
 - **Hard stops:** max credits per pull, monthly budgets (overall and per account) and `ACCOUNT_RESERVE`
   credits left on each account. `SPENDING_ENABLED=0` is the kill switch.
 - **No blind retries.** If Seamless's answer to a research call is lost, the tool checks the balance (free)
@@ -89,8 +130,9 @@ Seamless charged each key.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 49 tests, ~10 s, against a fake Seamless (no real credits)
+python -m pytest -q                       # 87 tests, ~15 s, against a fake Seamless + fake MillionVerifier
 FAKE_SEED=7 python -m pytest -q           # same tests on a differently shuffled fake
+LP_TEST_GUESSING=1 python -m pytest -q    # every test again with email guessing switched on
 ```
 
 Or inside the container: `docker compose exec leadpuller python -m pytest -q`.
@@ -100,6 +142,8 @@ Or inside the container: `docker compose exec leadpuller python -m pytest -q`.
 - `app/engine.py`: the pull runner (search, skip, research, answers, all credit rules).
 - `app/seamless.py`: the Seamless API client (rate limit, safe retries, ledger).
 - `app/memory.py`: memory, do-not-pull, free saved-contacts sync.
+- `app/guess.py`: email formats, the guessing rules. `app/verifier.py`: the MillionVerifier client.
+- `app/companies.py`: company lists (reading files, checking, per-company report).
 - `app/importer.py`: the one-time 1.x import.
 - `app/config.py`: every `.env` setting with its default and help text.
 - `app/static/index.html`: the whole UI.

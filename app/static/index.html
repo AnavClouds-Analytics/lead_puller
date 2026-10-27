@@ -100,6 +100,8 @@ tr:last-child td{border-bottom:none}
 .pills{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
 .pills button{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:8px 0;font-weight:600;cursor:pointer}
 .pills button.on{background:var(--brand);border-color:var(--brand);color:var(--brand-ink)}
+.pills.five{grid-template-columns:repeat(5,minmax(0,1fr))}
+.dropzone{border:1.5px dashed var(--line);border-radius:10px;padding:14px;min-width:0}
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:12px;flex-wrap:wrap}
 .tabs button{border:none;background:none;padding:8px 12px;color:var(--ink2);font-weight:600;border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer}
 .tabs button.on{color:var(--brand);border-color:var(--brand)}
@@ -140,7 +142,7 @@ async function api(path, opts={}) {
   if (!r.ok) throw new Error((d && (d.error || d.detail)) || ("Error " + r.status));
   return d;
 }
-function toast(msg, err) { const t = document.createElement("div"); t.className = "toast"+(err?" err":""); t.textContent = msg;
+function toast(msg, err) { document.querySelectorAll(".toast").forEach(x => x.remove()); const t = document.createElement("div"); t.setAttribute("role", err ? "alert" : "status"); t.className = "toast"+(err?" err":""); t.textContent = msg;
   document.body.appendChild(t); setTimeout(()=>t.remove(), err?7000:3000); }
 async function busy(btn, fn) { const old = btn.innerHTML; btn.disabled = true; btn.innerHTML = '<span class="spin"></span> ' + old;
   try { return await fn(); } catch(e) { toast(e.message, true); } finally { if (btn.isConnected) { btn.disabled = false; btn.innerHTML = old; } } }
@@ -149,12 +151,12 @@ const ss = {get(k,d){ try { const v = sessionStorage.getItem(k); return v ? JSON
 
 // ------------------------------------------------------------ paged table (server sends one page at a time)
 function pagedTable(host, key, o) {
-  const st = Object.assign({offset:0, limit:(META && META.defaults.page_size)||50, q:"", sort:o.sort||"", dir:o.dir||"asc"}, ss.get("lp.t."+key,{}), o.reset?{offset:0}:{});
+  const st = Object.assign({offset:0, limit:o.limit||(META && META.defaults.page_size)||50, q:"", sort:o.sort||"", dir:o.dir||"asc"}, ss.get("lp.t."+key,{}), o.reset?{offset:0}:{});
   const save = () => ss.set("lp.t."+key, st);
   host.innerHTML = `<div class="tbar">${o.search===false?"":`<input type="search" data-q value="${esc(st.q)}" placeholder="${esc(o.placeholder||"Search")}" aria-label="Search">`}${o.toolbar||""}</div>
     <div class="tablewrap"><table><thead><tr>${o.cols.map(c=>`<th class="${c.cls||""}" ${c.sort?`data-sort="${c.sort}"`:""}>${c.label}</th>`).join("")}</tr></thead><tbody data-body><tr><td colspan="${o.cols.length}" class="muted">Loading…</td></tr></tbody></table></div>
     <div class="pager"><span data-info></span><div class="pg"><button class="btn small" data-prev>Previous</button><span data-no></span><button class="btn small" data-next>Next</button>
-    <label class="small" style="display:flex;gap:6px;align-items:center;margin-left:6px">Rows <select data-size>${[25,50,100,250].map(n=>`<option ${n===st.limit?"selected":""}>${n}</option>`).join("")}</select></label></div></div>`;
+    <label class="small" style="display:flex;gap:6px;align-items:center;margin-left:6px">Rows <select data-size>${[...new Set([o.limit||25,25,50,100,250])].sort((x,y)=>x-y).map(n=>`<option ${n===st.limit?"selected":""}>${n}</option>`).join("")}</select></label></div></div>`;
   let seq = 0, last = null;
   async function load() {
     const my = ++seq; let d;
@@ -188,7 +190,9 @@ function pagedTable(host, key, o) {
 const NAV = [["#/new","New pull"],["#/history","History"],["#/accounts","Accounts"],["#/dnp","Do-not-pull"],["#/settings","Settings"]];
 function balHtml(ov) {
   const accs = (ov.accounts||[]).filter(a=>a.enabled);
+  const mv = ov.verifier || {};
   return accs.map(a=>`<span>${esc(a.name)}: <b>${fmt(a.balance)}</b></span>`).join("") +
+    (mv.has_key ? `<span>MillionVerifier: <b>${fmt(mv.credits)}</b> checks</span>` : "") +
     `<span>This month: <b>${fmt(ov.spent_this_month)}</b>${ov.monthly_budget?` of ${fmt(ov.monthly_budget)}`:""}</span>
      <button class="btn small danger" id="stopAll" title="Stops every pull now. People already sent to Seamless still come back.">Emergency stop</button>`;
 }
@@ -248,13 +252,24 @@ function fieldsBy() { const g = {}; META.fields.forEach(f => (g[f.group] = g[f.g
 async function renderNew(fromId) {
   const d = META.defaults;
   NP = {filters: JSON.parse(JSON.stringify(d.filters)), target: d.target, max: null, maxEdited: false, account: "auto",
-        cap: d.max_per_company, name: "", prompt: "", count: null};
+        cap: d.max_per_company, name: "", prompt: "", count: null, who: "filters", list: null, perCo: d.per_company, targetEdited: false};
   if (fromId) { try { const p = await api("/api/pulls/" + fromId);
-    Object.assign(NP, {filters: p.filters, target: p.target, max: p.max_credits, maxEdited: true, account: p.account_choice, cap: p.max_per_company, name: p.name, prompt: p.prompt}); } catch(e) {} }
+    Object.assign(NP, {filters: p.filters, target: p.target, max: p.max_credits, maxEdited: true, account: p.account_choice, cap: p.max_per_company, name: p.name, prompt: p.prompt});
+    if (p.mode === "companies") { const c = await api(`/api/pulls/${fromId}/companies?all=1`);
+      NP.who = "companies"; NP.perCo = p.max_per_company || d.per_company; NP.targetEdited = true;
+      NP.list = await api("/api/companies/check", {body:{items:c.rows.map(r=>({name:r.name, domain:r.domain, signal:r.signal})), per_company:NP.perCo, target:NP.target}}); NP.list.file = `the list from pull #${fromId}`; } } catch(e) {} }
   const accs = META.overview.accounts.filter(a => a.enabled);
   setMain(`<h1>New pull</h1><p class="sub">Pick filters like in Seamless, say how many emails you want, press Start. Nobody you've pulled before, on any account, is pulled or paid for again.</p>
     ${!accs.length ? `<div class="notice warn">No Seamless account yet. <a href="#/accounts">Add your API key</a> first.</div>` : ""}
     ${fromId ? `<div class="notice info">Filters copied from pull #${fromId}. Change anything, then Start.</div>` : ""}
+    <section class="card row between" style="padding:14px 16px"><div><b>Who to pull</b><div class="small muted" id="whoNote"></div></div>
+      <span class="seg" role="group" aria-label="Who to pull"><button type="button" data-who="filters">Anyone matching filters</button><button type="button" data-who="companies">People at my companies</button></span></section>
+    <section class="card hide" id="coCard" aria-label="Your companies"><h2>Your companies</h2>
+      <p class="small muted" style="margin:-6px 0 12px">Paste company websites (one per line, or "Company, website") or upload a CSV. Any file with a website or domain column works, including Hiring Signal Finder and Funding Finder downloads. Checking the list is free.</p>
+      <div class="grid g2"><div><label for="coText" class="sr">Company websites</label><textarea id="coText" rows="5" placeholder="northwind-health.com&#10;BrightPath, brightpath.io&#10;https://www.kestrel-analytics.com/careers"></textarea>
+          <button class="btn" id="coCheck" style="margin-top:8px">Check these companies</button></div>
+        <div class="dropzone"><label for="coFile"><b>Or upload a CSV</b></label><input type="file" id="coFile" accept=".csv,text/csv" style="margin-top:8px"><div class="small muted" style="margin-top:6px" id="coFileNote">A Signal column (job posted, funding round…) is kept and goes into the download.</div></div></div>
+      <div id="coResult" style="margin-top:12px"></div></section>
     ${META.has_claude ? `<div class="card row" style="padding:14px 16px"><label for="desc" style="font-weight:600;white-space:nowrap">Describe it (optional)</label>
       <input id="desc" placeholder="e.g. CTOs at Israeli software companies, 1–500 employees, no interns" style="flex:1 1 360px" value="${esc(NP.prompt)}">
       <button class="btn" id="fill">Fill the filters</button><div id="descNotes" style="flex-basis:100%"></div></div>` : ""}
@@ -271,10 +286,14 @@ async function renderNew(fromId) {
           <div class="small muted" style="margin-top:4px">A hard stop. It never spends more, on any account.</div>
           <label for="acct" class="small" style="display:block;font-weight:600;margin:14px 0 6px">Seamless account</label>
           <select id="acct"><option value="auto">${accs.length>1?"All, in order: "+esc(accs.map(a=>a.name).join(", then ")):"Automatic"}</option>${accs.map(a=>`<option value="${a.id}">${esc(a.name)} only</option>`).join("")}</select>
-          <label for="cap" class="small" style="display:block;font-weight:600;margin:14px 0 6px">Max people per company</label>
-          <input id="cap" type="number" min="0" style="width:110px"> <span class="small muted">0 = no limit</span>
+          <div id="capBox"><label for="cap" class="small" style="display:block;font-weight:600;margin:14px 0 6px">Max people per company</label>
+          <input id="cap" type="number" min="0" style="width:110px"> <span class="small muted">0 = no limit</span></div>
+          <div id="perCoBox" class="hide"><div class="small" style="font-weight:600;margin:14px 0 6px">People per company</div>
+            <div class="pills five" role="group" aria-label="People per company" id="perCo"></div>
+            <div class="small muted" style="margin-top:4px">Most senior first. 3 per company gives email guessing the most to work with.</div></div>
         </section>
         <section class="card" style="margin:0">
+          <div id="coEst" class="hide"></div>
           <button class="btn" id="check" style="width:100%">Check how many match (1 credit)</button>
           <div id="countBox" class="small" style="margin-top:10px"></div>
           <div id="estBox" class="small muted" style="margin-top:12px;padding-top:12px;border-top:1px solid var(--line2)"></div>
@@ -285,8 +304,13 @@ async function renderNew(fromId) {
         </section>
       </aside></div>`);
   $("#acct").value = NP.account; $("#cap").value = NP.cap;
-  drawFilters(); drawTarget();
-  $("#target").oninput = e => { NP.target = Math.max(0, +e.target.value||0); drawTarget(true); };
+  drawWho(); drawFilters(); drawTarget();
+  $$("[data-who]").forEach(b => b.onclick = () => { NP.who = b.dataset.who; drawWho(); drawFilters(); drawTarget(); });
+  $("#coCheck").onclick = e => busy(e.currentTarget, async () => { if (!$("#coText").value.trim()) return toast("Paste at least one website.", true);
+    NP.list = await api("/api/companies/check", {body:{text:$("#coText").value, per_company:NP.perCo, target:NP.targetEdited?NP.target:0}}); NP.list.file = null; onList(); });
+  $("#coFile").onchange = async e => { const f = e.target.files[0]; if (!f) return; const fd = new FormData(); fd.append("file", f);
+    try { NP.list = await api(`/api/companies/upload?${qs({per_company:NP.perCo, target:NP.targetEdited?NP.target:0})}`, {body:fd}); onList(); } catch(err) { toast(err.message, true); } };
+  $("#target").oninput = e => { NP.target = Math.max(0, +e.target.value||0); NP.targetEdited = true; drawTarget(true); };
   $("#maxc").oninput = e => { NP.max = +e.target.value||0; NP.maxEdited = true; drawEstimate(); };
   $("#acct").onchange = e => NP.account = e.target.value;
   $("#cap").oninput = e => NP.cap = Math.max(0, +e.target.value||0);
@@ -296,8 +320,14 @@ async function renderNew(fromId) {
       <div class="muted">People you already have are skipped as they come up, never paid for.</div>`; refreshTop(await api("/api/overview")); });
   $("#startBtn").onclick = e => {
     if (!NP.target) return toast("Enter how many contacts with email you want.", true);
-    if (!confirm(`Start? Up to ${fmt(NP.max)} credits for ${fmt(NP.target)} emails. It stops at whichever comes first.`)) return;
-    busy(e.currentTarget, async () => { const p = await api("/api/pulls", {body:{filters:NP.filters, target:NP.target, max_credits:NP.max, account:NP.account, max_per_company:NP.cap, name:$("#pname").value.trim(), prompt:$("#desc")?.value.trim()||""}});
+    const co = NP.who === "companies";
+    if (co && !(NP.list && NP.list.summary.ready)) return toast("Add your companies first (paste websites or upload a CSV).", true);
+    if (!confirm(co ? `Start? People at ${fmt(NP.list.summary.ready)} companies, up to ${NP.perCo} each: up to ${fmt(NP.target)} emails and ${fmt(NP.max)} credits. It stops at whichever comes first.`
+                    : `Start? Up to ${fmt(NP.max)} credits for ${fmt(NP.target)} emails. It stops at whichever comes first.`)) return;
+    const filters = co ? Object.fromEntries(Object.entries(NP.filters).filter(([k]) => !META.defaults.company_only.includes(k))) : NP.filters;
+    busy(e.currentTarget, async () => { const p = await api("/api/pulls", {body:{filters, target:NP.target, max_credits:NP.max, account:NP.account,
+        max_per_company: co ? NP.perCo : NP.cap, name:$("#pname").value.trim(), prompt:$("#desc")?.value.trim()||"",
+        companies: co ? NP.list.items.filter(i=>i.status==="ready") : undefined}});
       location.hash = "#/pull/" + p.id; }); };
   $("#fill") && ($("#fill").onclick = e => busy(e.currentTarget, async () => {
     const r = await api("/api/describe", {body:{text:$("#desc").value}});
@@ -307,7 +337,46 @@ async function renderNew(fromId) {
     $("#descNotes").innerHTML = `<div class="notice ok small" style="margin:8px 0 0">Filled ${Object.keys(r.filters).length} filters below. Check them; nothing is spent until you press Start.${r.notes.length?`<ul style="margin:4px 0 0;padding-left:18px">${r.notes.map(n=>`<li>${esc(n)}</li>`).join("")}</ul>`:""}</div>`;
     drawFilters(); drawTarget(); }));
 }
+const CO_STATUS = {ready:["Ready","b-ok"], no_website:["No website, skipped","b-warn"], dnp:["On do-not-pull","" ], duplicate:["Duplicate",""], too_many:["Over COMPANY_LIST_MAX",""]};
+function drawWho() {
+  const co = NP.who === "companies";
+  $$("[data-who]").forEach(b => { b.classList.toggle("on", b.dataset.who === NP.who); b.setAttribute("aria-pressed", b.dataset.who === NP.who); });
+  $("#whoNote").textContent = co ? "Decision-makers at companies you choose, such as your hiring and funding signals. Company filters are hidden: your list decides the companies."
+    : "Everyone Seamless has for your filters. Email guessing works in the background wherever a company's email format is known.";
+  $("#coCard").classList.toggle("hide", !co); $("#capBox").classList.toggle("hide", co); $("#perCoBox").classList.toggle("hide", !co);
+  $("#check").classList.toggle("hide", co); $("#countBox").classList.toggle("hide", co); $("#estBox").classList.toggle("hide", co); $("#coEst").classList.toggle("hide", !co);
+  $("#perCo").innerHTML = [1,2,3,5,10].map(n=>`<button type="button" class="${n===NP.perCo?"on":""}" aria-pressed="${n===NP.perCo}" data-pc="${n}">${n}</button>`).join("");
+  $$("#perCo button").forEach(b => b.onclick = () => { NP.perCo = +b.dataset.pc; NP.targetEdited = false; drawWho(); drawTarget(); refreshList(); });
+  if (co) drawList();
+}
+function onList() { NP.targetEdited = false; drawList(); drawTarget(); }
+async function refreshList() { if (!NP.list) return; const file = NP.list.file;
+  NP.list = await api("/api/companies/check", {body:{items:NP.list.items.map(i=>({name:i.name, domain:i.domain, signal:i.signal})), per_company:NP.perCo, target:NP.targetEdited?NP.target:0}});
+  NP.list.file = file; drawList(); }
+function drawList() {
+  const L = NP.list, box = $("#coResult"); if (!box) return;
+  if (!L) { box.innerHTML = ""; $("#coEst").innerHTML = `<div class="small muted">Add your companies to see the estimate.</div>`; return; }
+  const sm = L.summary, show = NP.showAll ? L.items : L.items.slice(0, 6);
+  box.innerHTML = `${L.file ? `<div class="small" style="margin-bottom:8px">From <b>${esc(L.file)}</b> · ${fmt(sm.total)} rows</div>` : ""}
+    <div class="row" style="gap:6px;margin-bottom:10px"><span class="badge b-ok">${fmt(sm.ready)} ready</span>${sm.no_website?`<span class="badge b-warn">${fmt(sm.no_website)} no website, skipped</span>`:""}${sm.dnp?`<span class="badge">${fmt(sm.dnp)} on do-not-pull</span>`:""}${sm.duplicate?`<span class="badge">${fmt(sm.duplicate)} duplicate</span>`:""}${sm.too_many?`<span class="badge">${fmt(sm.too_many)} over the limit</span>`:""}${sm.known_format?`<span class="badge b-brand">${fmt(sm.known_format)} email format already known</span>`:""}</div>
+    <div class="tablewrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>Company</th><th>Website</th><th>Signal (from your file)</th><th>Status</th></tr></thead><tbody>
+      ${show.map(i=>{ const [l,c] = CO_STATUS[i.status]||[i.status,""]; return `<tr><td>${esc(i.name)}</td><td>${i.domain?esc(i.domain):'<span class="muted">none found</span>'}</td><td class="small">${esc(i.signal||"")}</td><td><span class="badge ${c}">${l}</span></td></tr>`; }).join("")}</tbody></table></div>
+    ${L.items.length > 6 ? `<button type="button" class="linkbtn small" id="coAll" style="margin-top:8px">${NP.showAll?"Show fewer":`See all ${fmt(L.items.length)}`}</button>` : ""}`;
+  $("#coAll") && ($("#coAll").onclick = () => { NP.showAll = !NP.showAll; drawList(); });
+  const e = L.estimate;
+  $("#coEst").innerHTML = `<h2 style="margin-bottom:8px">Estimate</h2>
+    <div class="skiprow small"><span>Search</span><b>about ${fmt(e.search_low)}–${fmt(e.search_high)} credits</b></div>
+    <div class="small muted" style="margin-bottom:4px">${fmt(Math.ceil(sm.ready/100))} search${sm.ready>100?"es":""} of up to 100 companies, more pages if a company has many matches.</div>
+    ${e.guessing ? `<div class="skiprow small"><span>Research without guessing</span><b class="muted">up to ${fmt(e.research_without)}</b></div>
+      <div class="skiprow small"><span>Research with guessing</span><b>about ${fmt(e.research_low)}–${fmt(e.research_high)}</b></div>
+      <div class="small muted" style="margin-bottom:4px">1 paid per company to learn its email format, then the rest guessed where the format uses the full name. Catch-all companies are paid for as usual.</div>
+      <div class="skiprow small"><span>MillionVerifier checks</span><b>about ${fmt(e.checks)}</b></div>`
+    : `<div class="skiprow small"><span>Research</span><b>up to ${fmt(e.research_without)}</b></div>
+      <div class="small muted">Email guessing is off: ${esc(L.guessing_why||"")}${(L.guessing_why||"").includes("Accounts")?` <a href="#/accounts">Add the key</a>.`:""}</div>`}
+    <div class="notice info small" style="margin:10px 0 12px">Ranges, not promises: the real number depends on each company's email format and how many people Seamless has there.</div>`;
+}
 function drawTarget(fromInput) {
+  if (NP.who === "companies" && NP.list && !NP.targetEdited) NP.target = NP.list.summary.ready * NP.perCo;
   if (!fromInput) $("#target").value = NP.target;
   $("#pills").innerHTML = [500,1000,2000,5000].map(n=>`<button type="button" class="${n===NP.target?"on":""}" aria-pressed="${n===NP.target}" data-n="${n}">${fmt(n)}</button>`).join("");
   $$("#pills button").forEach(b => b.onclick = () => { NP.target = +b.dataset.n; drawTarget(); });
@@ -317,12 +386,14 @@ function drawTarget(fromInput) {
 }
 let estT;
 function drawEstimate() { clearTimeout(estT); estT = setTimeout(async () => { if (!$("#estBox")) return;
+  if (NP.who === "companies") return;
   const e = await api(`/api/estimate?target=${NP.target||0}`);
   $("#estBox").innerHTML = `Estimate for <b style="color:var(--ink)">${fmt(NP.target)}</b> emails: about <b style="color:var(--ink)">${fmt(e.credits)}</b> credits (${e.per_email} per email, ${e.based_on?`from your last ${fmt(e.based_on)} emails`:"until you have your own history"}).`
     + (NP.max && e.credits > NP.max ? `<div style="color:var(--warn);margin-top:4px">Your max (${fmt(NP.max)}) may stop it before ${fmt(NP.target)}.</div>` : ""); }, 200); }
 
 function drawFilters() {
   const groups = fieldsBy();
+  if (NP.who === "companies") for (const g of Object.keys(groups)) { groups[g] = groups[g].filter(f => !META.defaults.company_only.includes(f.key)); if (!groups[g].length) delete groups[g]; }
   $("#fbody").innerHTML = Object.entries(groups).map(([g, fs]) => {
     const set = fs.filter(f => NP.filters[f.key] !== undefined && !(f.key==="technologiesIsOr")).length;
     const open = GROUPS_OPEN[g] || set;
@@ -410,7 +481,7 @@ function wireFilters() {
 const STATUS = {queued:["Waiting its turn","b-brand"], running:["Running","b-warn"], paused:["Paused","b-bad"], done:["Done","b-ok"], failed:["Failed","b-bad"]};
 const SKIP = {dup:"Same person twice in Seamless's results", mem_email:"Already pulled · email Seamless showed is in memory", mem_other:"Already pulled · same LinkedIn or name + company",
   seamless:"Already researched in your Seamless account", dnp:"On your do-not-pull list", exclude:"Excluded by your filters", no_li:"No LinkedIn profile",
-  no_site:"No company website", cap:"More than your limit per company", no_mx:"Company can't receive email", recheck:"Taken just before paying (already pulled)", expired:"Search result expired at Seamless", other:"Other"};
+  no_site:"No company website", cap:"More than your limit per company", not_listed:"Not one of your companies", no_mx:"Company can't receive email", recheck:"Taken just before paying (already pulled)", expired:"Search result expired at Seamless", other:"Other"};
 const SLICE = {todo:["Next",""], scanning:["Scanning now","b-warn"], done:["Done: scanned to the end","b-ok"], expensive:["Left for later","b-bad"], left:["Not needed","" ]};
 let PV = null;
 async function renderPull(id) {
@@ -424,7 +495,9 @@ async function renderPull(id) {
         <h1>${esc(p.name)}</h1><div class="small muted">${esc(p.summary)}</div></div>
         <div class="row" id="actions"></div></div>
       <div id="live"></div>
+      ${p.mode === "companies" ? `<section class="card" aria-label="Companies"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Companies</h2><span class="small muted">${fmt(p.companies.ready)} companies · up to ${p.max_per_company} people each, most senior first</span></div><div id="coTable"></div></section>` : ""}
       <div id="results"></div>`);
+    CO_TBL = null;
     drawResults(p);
   }
   drawLive(p);
@@ -469,12 +542,44 @@ function drawLive(p) {
       ${(s.skips||[]).length ? `<div style="margin-top:14px"><div class="small" style="font-weight:600;margin-bottom:4px">Why they were skipped (checked as each page arrived) · click to see who</div>
         ${s.skips.map(r=>`<div class="skiprow small"><button type="button" class="linkbtn" data-skip="${esc(r.kind)}">${esc(SKIP[r.kind]||r.example||r.kind)}</button><b>${fmt(r.n)}</b></div>`).join("")}</div>` : ""}
       <div class="small muted" style="margin-top:10px">Memory holds ${fmt(p.overview.people_pulled)} people pulled with this tool and ${fmt(p.overview.seamless_saved)} contacts already in your Seamless accounts (${fmt(p.overview.emails_in_memory)} emails), on every account.</div></section>
-    ${p.slices.length ? `<section class="card" aria-label="Smart scanning"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Smart scanning</h2><span class="small muted">Search split by company size, freshest first. A slice is left for later when new people get too expensive to find.</span></div>
+    ${guessCard(p)}
+
+    ${p.slices.length ? `<section class="card" aria-label="Smart scanning"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Smart scanning</h2><span class="small muted">${p.mode==="companies"?"One search per 100 companies. Companies that already have enough people are left out of later searches.":"Search split by company size, freshest first. A slice is left for later when new people get too expensive to find."}</span></div>
       <div class="tablewrap"><table><thead><tr><th>Slice</th><th class="right">Pages</th><th class="right">New people</th><th class="right">Per new email</th><th>Status</th></tr></thead><tbody>
       ${p.slices.map(x=>{ const [l,c] = SLICE[x.state]||[x.state,""]; return `<tr><td>${esc(x.label)}${x.note?`<div class="small muted">${esc(x.note)}</div>`:""}</td><td class="right">${fmt(x.pages)}</td><td class="right">${x.new_pct==null?"—":x.new_pct+"%"}</td><td class="right">${x.per_new_email ?? "—"}</td><td><span class="badge ${c}">${l}</span></td></tr>`; }).join("")}</tbody></table></div>
       <div class="small muted" style="margin-top:10px">Old people never stop a pull: they're skipped and never researched. It ends at ${fmt(p.target)} emails or ${fmt(p.max_credits)} credits; a slice where finding a new email costs more than ${META.defaults.move_on} extra search credits is left for later.</div></section>` : ""}`;
   $$("#live [data-skip]").forEach(b => b.onclick = () => { PV.view = "skipped"; PV.kind = b.dataset.skip; drawResults(p, true); $("#results").scrollIntoView({behavior:"smooth"}); });
+  if (p.mode === "companies" && $("#coTable")) drawCompanies(p);
 }
+function guessCard(p) {
+  const g = p.guessing || {}, mv = (p.overview||{}).verifier || {};
+  if (!g.checks && !g.guessed && !mv.has_key) return `<section class="card" aria-label="How the emails were found"><h2>How the emails were found</h2>
+    <div class="small muted">Every email came from Seamless research. Add a MillionVerifier key on the <a href="#/accounts">Accounts</a> page to guess and verify emails where a company's format is known, so fewer people need a Seamless credit.</div></section>`;
+  return `<section class="card" aria-label="How the emails were found"><h2>How the emails were found</h2>
+    <div class="grid g4"><div class="stat"><div class="k">Paid in Seamless</div><div class="v">${fmt(g.paid)}</div><div class="h">${fmt(g.paid_email)} got an email · 1 credit each</div></div>
+      <div class="stat"><div class="k">Guessed, verified valid</div><div class="v" style="color:var(--ok)">${fmt(g.guessed)}</div><div class="h">0 Seamless credits</div></div>
+      <div class="stat"><div class="k">Seamless credits saved</div><div class="v" style="color:var(--ok)">${fmt(g.saved)}</div><div class="h">in this pull</div></div>
+      <div class="stat"><div class="k">MillionVerifier checks</div><div class="v">${fmt(g.checks)}</div><div class="h">${fmt(g.valid)} valid · ${fmt(g.catch_all)} catch-all · ${fmt(g.not_valid)} not valid</div></div></div>
+    <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else.
+      ${!g.ready && g.why_not ? `<div style="color:var(--warn);margin-top:4px">Guessing is paused right now: ${esc(g.why_not)}</div>` : ""}</div></section>`;
+}
+const FORMAT_HTML = f => f === "catch_all" ? `<span class="badge b-warn">Catch-all</span><div class="small muted">accepts any address, can't guess</div>`
+  : f ? `<code>${esc(f)}</code>` : `<span class="muted">—</span>`;
+function drawCompanies(p) {
+  CO_P = p;
+  if (CO_TBL && $("#coTable").dataset.ready) { if (!$("#coTable").contains(document.activeElement)) CO_TBL.reload(); return; }
+  $("#coTable").dataset.ready = "1";
+  CO_TBL = pagedTable($("#coTable"), `companies.${p.id}`, {limit:10, placeholder:"Search company, website or signal", url: st => `/api/pulls/${p.id}/companies?${qs({offset:st.offset, limit:st.limit, q:st.q})}`,
+    cols: [{label:"Company", html:r=>`${esc(r.name)}<div class="small muted">${esc(r.domain||"no website")}</div>`},
+      {label:"Signal", html:r=>`<span class="small">${esc(r.signal||"")}</span>`},
+      {label:"Email format", html:r=>r.status==="ready"?FORMAT_HTML(r.format):""},
+      {label:"Found", cls:"right", html:r=>r.status==="ready"?fmt(r.found):""}, {label:"Emails", cls:"right", html:r=>r.status==="ready"?fmt(r.emails):""},
+      {label:"How", html:r=>r.status==="ready"&&r.found?`<span class="small">${fmt(r.paid)} Seamless · ${fmt(r.guessed)} guessed</span>`:""},
+      {label:"Status", html:r=>{ if (r.status!=="ready") { const [l,c] = CO_STATUS[r.status]||[r.status,""]; return `<span class="badge ${c}">${l}</span>`; }
+        if (r.full) return `<span class="badge b-ok">Done</span>`; if (r.waiting) return `<span class="badge b-brand">Working</span>`;
+        if (CO_P.status==="done") return r.found?`<span class="badge b-ok">Done</span>`:`<span class="badge">No match</span>`; return r.found?`<span class="badge b-brand">Working</span>`:`<span class="badge">Not reached yet</span>`; }}]});
+}
+let CO_TBL = null, CO_P = null;
 async function pullAction(p, btn) {
   const a = btn.dataset.act;
   if (a === "stop" && !confirm("Stop? Nothing more is searched or researched. Everything found so far is kept; people already sent to Seamless still come back.")) return;
@@ -492,7 +597,7 @@ function drawResults(p, keep) {
       <div class="row"><a class="btn primary" id="dlMain" href="/api/pulls/${p.id}/download?kind=anavmail">Download for AnavMail (CSV, ${fmt(s.downloadable)})</a>
         <a class="btn" href="/api/pulls/${p.id}/download?kind=all&format=xlsx">Everything, all columns (Excel)</a>
         <a class="btn" id="dlNo" href="/api/pulls/${p.id}/download?kind=no_email" ${s.no_email?"":'aria-disabled="true"'}>${fmt(s.no_email)} without email (LinkedIn, phone)</a></div>
-      <div class="small muted" style="margin-top:10px">AnavMail columns: <b style="color:var(--ink)">${esc(cols.join(", "))}</b> (DEFAULT_COLUMNS in .env)</div></section>
+      <div class="small muted" style="margin-top:10px">AnavMail columns: <b style="color:var(--ink)">${esc(cols.join(", "))}</b> (DEFAULT_COLUMNS in .env). The Excel file also has <b style="color:var(--ink)">How we got the email</b>${p.mode==="companies"?` and <b style="color:var(--ink)">Signal</b>`:""}.</div></section>
     <section class="card"><div class="tabs" role="tablist">${[["emails","With email"],["no_email","No email"],["skipped","Skipped"]].map(([v,l])=>`<button type="button" role="tab" class="${v===view?"on":""}" data-v="${v}">${l}</button>`).join("")}</div>
       ${view==="skipped"&&PV.kind?`<div class="small" style="margin-bottom:8px">Showing: <b>${esc(SKIP[PV.kind]||PV.kind)}</b> · <button type="button" class="linkbtn" id="allSkips">all reasons</button></div>`:""}<div id="peopleTable"></div></section>`;
   $$("#results .tabs [data-v]").forEach(b => b.onclick = () => { PV.view = b.dataset.v; PV.kind = null; drawResults(p, true); });
@@ -501,7 +606,8 @@ function drawResults(p, keep) {
     {label:"Title", sort:"title", html:r=>esc(r.title)}, {label:"Company", sort:"company", html:r=>`${esc(r.company)}<div class="small muted">${esc(r.domain||"no website")}${r.size?` · ${esc(r.size)}`:""}</div>`},
     {label:"Country", sort:"country", html:r=>esc(r.country)}];
   const extra = view === "skipped" ? [{label:"Why skipped", html:r=>`<span class="small">${esc(r.skip_reason)}</span>`}]
-    : view === "emails" ? [{label:"Email", sort:"email", html:r=>`${esc(r.email)} ${r.email_status&&r.email_status.toLowerCase()!=="valid"?`<span class="badge b-warn">${esc(r.email_status)}</span>`:""}${r.filled_free?' <span class="badge b-ok">free</span>':""}`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}]
+    : view === "emails" ? [{label:"Email", sort:"email", html:r=>`${esc(r.email)} ${r.email_status&&r.email_status.toLowerCase()!=="valid"?`<span class="badge b-warn">${esc(r.email_status)}</span>`:""}${r.filled_free?' <span class="badge b-ok">free</span>':""}`},
+        {label:"How we got it", html:r=>r.email_source==="guessed"?`<span class="badge b-ok" title="${esc(r.guess_note||"")}">Guessed · verified valid</span>`:`<span class="badge b-brand">Seamless</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}]
     : [{label:"Seamless said", html:r=>`<span class="small">${esc(r.research_status||"")}${r.research_message?`<div class="muted">${esc(r.research_message)}</div>`:""}</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}];
   pagedTable($("#peopleTable"), `people.${p.id}.${view}.${PV.kind||""}`, {placeholder:"Search name, company, title, email or country", sort:"id",
     url: st => `/api/pulls/${p.id}/people?${qs({view, kind:PV.kind||"", offset:st.offset, limit:st.limit, q:st.q, sort:st.sort, dir:st.dir})}`,
@@ -531,7 +637,7 @@ async function renderHistory() {
 async function renderAccounts() {
   const ov = await api("/api/accounts"); refreshTop(ov);
   const accs = ov.accounts;
-  setMain(`<h1>Seamless accounts</h1><p class="sub">Pulls use the accounts in this order: when one runs low, the pull carries on with the next. All accounts share one memory of everyone pulled, so nobody found with one key is pulled or paid for again with another.</p>
+  setMain(`<h1>Accounts</h1><h2 style="margin-top:16px">Seamless</h2><p class="sub">Pulls use the accounts in this order: when one runs low, the pull carries on with the next. All accounts share one memory of everyone pulled, so nobody found with one key is pulled or paid for again with another.</p>
     ${(ov.shared_pools||[]).map(g=>`<div class="notice warn"><b>${esc(g.names.join(" and "))} show exactly the same balance (${fmt(g.balance)}).</b> Probably one shared credit pool. Ask Seamless whether your users have separate credits.</div>`).join("")}
     <div class="grid g2">${accs.map((a,i)=>`<section class="card" style="margin:0" data-aid="${a.id}"><div class="row between" style="margin-bottom:10px">
         <h2 style="margin:0">${esc(a.name)} <span class="small muted" style="font-weight:500">· ${i===0?"used first":"used when the one above is low"}</span></h2>
@@ -549,7 +655,9 @@ async function renderAccounts() {
         <label for="naKey" class="small"><b>API key</b></label><input id="naKey" type="password" autocomplete="off" placeholder="Seamless → Settings → Public API" style="margin:4px 0 10px">
         <label for="naBud" class="small"><b>Monthly budget (optional)</b></label><input id="naBud" type="number" min="0" placeholder="No own limit" style="margin:4px 0 12px">
         <button class="btn primary" id="naAdd">Check key and add</button><div class="small muted" style="margin-top:6px">Checked with a free call first; a key Seamless doesn't accept is never saved. Only the last 4 characters are ever shown.</div></section></div>
+    <section class="card" style="margin-top:16px" id="mvCard"></section>
     <section class="card" style="margin-top:16px"><h2>Spending history</h2><div id="ledger"></div></section>`);
+  drawVerifier(ov.verifier);
   const aid = el => +el.closest("[data-aid]").dataset.aid;
   const patch = async (el, body, msg) => { try { await api(`/api/accounts/${aid(el)}`, {method:"PATCH", body}); toast(msg); renderAccounts(); } catch(e) { toast(e.message, true); } };
   $("#main").onchange = e => { if (e.target.matches("[data-budget]")) patch(e.target, {monthly_budget:+e.target.value||0}, "Budget saved.");
@@ -564,6 +672,32 @@ async function renderAccounts() {
   pagedTable($("#ledger"), "ledger", {search:false, empty:"Nothing spent yet.", url: st => `/api/ledger?${qs({offset:st.offset, limit:st.limit})}`,
     cols: [{label:"When", html:r=>`<span class="nowrap">${when(r.at)}</span>`}, {label:"Pull", html:r=>r.pull_id?`<a href="#/pull/${r.pull_id}">${esc(r.pull_name||"#"+r.pull_id)}</a>`:'<span class="muted">—</span>'},
       {label:"Account", html:r=>esc(r.account_name||"")}, {label:"What", html:r=>esc(r.note)}, {label:"Credits", cls:"right", html:r=>fmt(r.credits)}, {label:"Balance after", cls:"right", html:r=>fmt(r.balance_after)}]});
+}
+
+function drawVerifier(mv) {
+  const box = $("#mvCard"); if (!box) return;
+  const paused = mv.paused_until && mv.paused_until*1000 > Date.now();
+  const badge = !mv.has_key ? '<span class="badge">Not set up</span>' : !mv.guessing_on ? '<span class="badge">Off in .env</span>' : !mv.enabled ? '<span class="badge">Switched off</span>'
+    : mv.last_error ? '<span class="badge b-bad">Problem</span>' : paused ? '<span class="badge b-warn">Paused</span>' : '<span class="badge b-ok">Working</span>';
+  box.innerHTML = `<div class="row between" style="margin-bottom:10px"><h2 style="margin:0">MillionVerifier <span class="small muted" style="font-weight:500">· for email guessing</span></h2>${badge}</div>
+    <p class="small muted" style="margin:0 0 12px">Where a company's email format is known, Lead Puller builds the address (only full-name formats like john.smith@) and checks it here first. Only a "valid" answer is used; anything else is paid for in Seamless as usual. The same key AnavMail uses works here.</p>
+    ${mv.last_error ? `<div class="notice bad small">${esc(mv.last_error)}</div>` : ""}
+    ${!mv.guessing_on ? `<div class="notice warn small">EMAIL_GUESSING=0 in .env: guessing is off for every pull.</div>` : ""}
+    ${mv.has_key ? `<div class="kv"><span>API key</span><span><code>${esc(mv.key)}</code>${mv.from_env?' <span class="small muted">from .env</span>':""}</span>
+        <span>Checks left</span><span><b>${fmt(mv.credits)}</b> ${mv.credits_at?`<span class="small muted">· checked ${when(mv.credits_at)}</span>`:""}</span>
+        <span>Used this month</span><span>${fmt(mv.used_this_month)} checks by Lead Puller</span></div>
+      <div class="row" style="margin-top:14px"><button class="btn small" id="mvCheck">Check balance (free)</button>${mv.from_env?"":`<button class="btn small" id="mvRekey">Replace key</button>`}
+        <button class="btn small" id="mvToggle">${mv.enabled?"Turn guessing off":"Turn guessing on"}</button>${mv.from_env?"":`<button class="btn small danger" id="mvDel">Remove key</button>`}</div>
+      <div class="small muted" style="margin-top:8px">With no key, a switched-off key or no checks left, every person is simply paid for in Seamless, exactly as before.</div>`
+    : `<div class="row" style="align-items:flex-end"><div style="flex:1 1 280px"><label for="mvKey" class="small"><b>API key</b></label><input id="mvKey" type="password" autocomplete="off" placeholder="MillionVerifier → API" style="margin-top:4px"></div>
+        <button class="btn primary" id="mvAdd">Check key and add</button></div>
+      <div class="small muted" style="margin-top:6px">Checked with a free call first; a key MillionVerifier doesn't accept is never saved. Only the last 4 characters are ever shown.</div>`}`;
+  const go = (btn, body, msg, method) => busy(btn, async () => { const r = await api("/api/verifier", method ? {method} : {body}); toast(msg); drawVerifier(r); META = await api("/api/meta"); refreshTop(META.overview); });
+  $("#mvAdd") && ($("#mvAdd").onclick = e => go(e.currentTarget, {api_key:$("#mvKey").value}, "MillionVerifier key added."));
+  $("#mvCheck") && ($("#mvCheck").onclick = e => go(e.currentTarget, {check:1}, "Balance checked."));
+  $("#mvToggle") && ($("#mvToggle").onclick = e => go(e.currentTarget, {enabled:!mv.enabled}, mv.enabled?"Guessing off: everyone is paid for in Seamless.":"Guessing on."));
+  $("#mvRekey") && ($("#mvRekey").onclick = e => { const k = prompt("Paste the new MillionVerifier API key:"); if (k) go(e.currentTarget, {api_key:k}, "Key replaced."); });
+  $("#mvDel") && ($("#mvDel").onclick = e => { if (confirm("Remove the MillionVerifier key? Guessing stops; everyone is paid for in Seamless.")) go(e.currentTarget, null, "Key removed.", "DELETE"); });
 }
 
 // ------------------------------------------------------------ do-not-pull
