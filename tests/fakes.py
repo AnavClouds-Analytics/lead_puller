@@ -381,6 +381,7 @@ class FakeMillionVerifier:
         self.credit_calls = 0
         self.fail_next = []               # list of: "error" | "timeout" | "500" | "no_credits" | "garbage"
         self.unknown_domains = set()
+        self.accept_all_domains = set()   # 2.2: servers that say "ok" to any address (some mail filters do)
 
     def handler(self, request: httpx.Request):
         path = request.url.path.rstrip("/")
@@ -412,6 +413,8 @@ class FakeMillionVerifier:
         domain = email.split("@")[-1]
         if domain in self.unknown_domains:
             res, code = "unknown", 3
+        elif domain in self.accept_all_domains:
+            res, code = "ok", 1
         elif is_catch_all(domain):
             res, code = "catch_all", 2
         elif email in self.s.mailboxes:

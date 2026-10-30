@@ -204,6 +204,7 @@ def test_a_first_batch_without_emails_pauses_before_spending_more(env):
     il = [p for p in fake.people if p["country"] == "Israel"]
     for p in il:
         fake.email_override[p["pid"]] = ""            # nobody in Israel has an email
+        fake.mailboxes.pop(p["email"], None)          # (2.2: not even one a guess could find)
     pid = start(client, {"contactCountry": {"in": ["Israel"]}}, target=60, max_credits=500)
     p = run(client, pid, until=("paused", "done"))
     assert p["status"] == "paused" and p["pause_kind"] == "low_rate"

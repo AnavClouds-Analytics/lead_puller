@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -56,6 +56,13 @@ SETTINGS = [
     ("EMAIL_GUESSING", "1", "bool", "Email guessing",
      "Before paying Seamless for a person, guess their email from their company's known format and check it with "
      "MillionVerifier; only a \"valid\" answer is used, anything else is paid for in Seamless as usual (0 = off)"),
+    ("GUESS_PROBE", "1", "bool", "Email guessing",
+     "2.2: at a company whose email format isn't known yet, try the common full-name formats (first.last@, "
+     "firstlast@, first_last@) with MillionVerifier before paying Seamless to learn it (0 = always pay for the first "
+     "person, as in 2.1)"),
+    ("GUESS_PROBE_FORMATS", "3", "int", "Email guessing", "How many of those formats to try for that first person (1-3)"),
+    ("GUESS_MAX_COMPANY_SIZE", "5000", "int", "Email guessing",
+     "2.2: never guess at companies bigger than this many employees (more people share a name there); 0 = no limit"),
     ("GUESS_MAX_CHECKS_PER_PERSON", "2", "int", "Email guessing",
      "Most MillionVerifier checks for one person before paying Seamless (a 2nd only when the company uses two formats)"),
     ("GUESS_MIN_CHECKS_LEFT", "200", "int", "Email guessing",
@@ -78,13 +85,20 @@ SETTINGS = [
     ("MILLIONVERIFIER_BASE_URL", "https://api.millionverifier.com/api/v3", "str", "Email guessing",
      "MillionVerifier API address"),
 
-    ("DEFAULT_PER_COMPANY", "3", "int", "Company lists",
+    ("DEFAULT_PER_COMPANY", "2", "int", "Company lists",
      "People per company preselected for \"People at my companies\" pulls (most senior first)"),
     ("COMPANY_LIST_MAX", "2000", "int", "Company lists", "Largest company list one pull accepts"),
     ("COMPANY_BATCH", "100", "int", "Company lists", "Companies per Seamless search (Seamless allows up to 100)"),
     ("RESLICE_FULL_SHARE", "50", "int", "Company lists",
-     "When this % of a batch's companies already have enough people, search the rest again without them, so "
-     "search credits aren't spent on people from full companies"),
+     "Only used when Seamless doesn't say how many people match: when this % of a batch's companies already have "
+     "enough people, search the rest again without them"),
+    ("RESLICE_SMART", "1", "bool", "Company lists",
+     "2.2: leave companies that already have enough people out of the next search as soon as that costs less than it "
+     "saves (searching again shows some people a second time, and Seamless charges for those rows again)"),
+    ("RESLICE_MAX_TIMES", "8", "int", "Company lists", "Most times one batch of companies is searched again"),
+    ("EXTRA_TRIES_PER_COMPANY", "1", "int", "Company lists",
+     "2.2: when someone at a company comes back with no email, Lead Puller may pay for up to this many more people "
+     "there (so the company still gets its people); 0 = never"),
 
     ("LOCATION_APPLIES_TO", "contact", "str", "Search",
      "Default \"Location applies to\": contact = person's location (recommended), company, bothOR, bothAND"),

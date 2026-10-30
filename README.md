@@ -1,10 +1,53 @@
-# Lead Puller 2.1
+# Lead Puller 2.2
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## New in 2.2 (fewer Seamless credits per email on company lists)
+
+- **No more paying for the first person at every new company.** In 2.1, the first person at a company was
+  always paid for in Seamless to learn its email format. Now Lead Puller first tries the common full-name
+  formats (`john.smith@`, `johnsmith@`, `john_smith@`) with MillionVerifier. If one is "valid", that person
+  costs no Seamless credit and the format is learned for everyone else there. If none is valid, the person is
+  paid for as before. Each company is tried at most twice (`GUESS_PROBE`, `GUESS_PROBE_FORMATS`).
+- **Made-up address check.** Before trying formats at a company, one made-up address (like
+  `zq3f9a1c2bx@company.com`) is checked, once per company ever. If even that comes back "valid", the
+  company's server says yes to anything, so nothing there is guessed. An "unknown" answer also means no guess.
+- **Big companies are never guessed** (more people share a name there): over 5,000 employees by default
+  (`GUESS_MAX_COMPANY_SIZE`, 0 = no limit).
+- **Full companies leave the search sooner.** As soon as leaving them out costs fewer search credits than it
+  saves, the other companies are searched again on their own (`RESLICE_SMART`, `RESLICE_MAX_TIMES`). This
+  matters most when a few big companies fill the first pages: 2.1 gave up there, 2.2 reaches the others.
+- **Only people with a usable email count towards "full".** If someone at a company comes back with no email,
+  one more person there may be paid for (`EXTRA_TRIES_PER_COMPANY=1`; 0 = never, as in 2.1). Companies left out
+  of the search come back once, all together, after every answer is in.
+- **Free vs paid report.** The pull page shows how many emails were guessed (no Seamless credit) and how many
+  of those came from trying the common formats. The download's "How we got the email" column says
+  "seamless", "guessed" or "guessed: common format tried".
+- **People per company now defaults to 2** (`DEFAULT_PER_COMPANY`), and a "People at my companies" pull with
+  no job titles or seniority asks before starting.
+- The first-batch email-rate pause now waits for at least 10 people paid for (guessing can make the first
+  batch tiny).
+
+### Upgrading from 2.1
+
+Same as every upgrade: replace the code, keep `data/` and `.env`:
+
+```bash
+cd lead-puller-2 && docker compose down
+cp -r data ../lead-puller-2-data-backup            # backup first
+# unzip lead-puller-2.2.0.zip over this folder (it never contains data/ or .env)
+docker compose up -d --build
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.2.0"}
+```
+
+The database gets its new columns on start. No `.env` change is needed: every new setting has a default, and
+all of them are in `.env.example` (marked "2.2"). To get 2.1's behaviour back for any part, set it to 0:
+`GUESS_PROBE=0`, `RESLICE_SMART=0`, `EXTRA_TRIES_PER_COMPANY=0`, `GUESS_MAX_COMPANY_SIZE=0`.
+Rollback: unzip 2.1.0 over the folder and `docker compose up -d --build` (the new columns are simply ignored).
 
 ## New in 2.1
 
@@ -130,7 +173,7 @@ Seamless charged each key.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 87 tests, ~15 s, against a fake Seamless + fake MillionVerifier
+python -m pytest -q                       # 107 tests, ~15 s, against a fake Seamless + fake MillionVerifier
 FAKE_SEED=7 python -m pytest -q           # same tests on a differently shuffled fake
 LP_TEST_GUESSING=1 python -m pytest -q    # every test again with email guessing switched on
 ```

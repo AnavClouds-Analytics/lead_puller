@@ -322,6 +322,8 @@ async function renderNew(fromId) {
     if (!NP.target) return toast("Enter how many contacts with email you want.", true);
     const co = NP.who === "companies";
     if (co && !(NP.list && NP.list.summary.ready)) return toast("Add your companies first (paste websites or upload a CSV).", true);
+    const noTitles = co && !((NP.filters.jobTitle||{}).in||[]).length && !((NP.filters.seniority||{}).in||[]).length;   // 2.2
+    if (noTitles && !confirm("No job titles or seniority are set, so anyone at these companies can be picked (interns, support staff…). Most people add 5-10 titles first. Start anyway?")) return;
     if (!confirm(co ? `Start? People at ${fmt(NP.list.summary.ready)} companies, up to ${NP.perCo} each: up to ${fmt(NP.target)} emails and ${fmt(NP.max)} credits. It stops at whichever comes first.`
                     : `Start? Up to ${fmt(NP.max)} credits for ${fmt(NP.target)} emails. It stops at whichever comes first.`)) return;
     const filters = co ? Object.fromEntries(Object.entries(NP.filters).filter(([k]) => !META.defaults.company_only.includes(k))) : NP.filters;
@@ -557,10 +559,10 @@ function guessCard(p) {
     <div class="small muted">Every email came from Seamless research. Add a MillionVerifier key on the <a href="#/accounts">Accounts</a> page to guess and verify emails where a company's format is known, so fewer people need a Seamless credit.</div></section>`;
   return `<section class="card" aria-label="How the emails were found"><h2>How the emails were found</h2>
     <div class="grid g4"><div class="stat"><div class="k">Paid in Seamless</div><div class="v">${fmt(g.paid)}</div><div class="h">${fmt(g.paid_email)} got an email · 1 credit each</div></div>
-      <div class="stat"><div class="k">Guessed, verified valid</div><div class="v" style="color:var(--ok)">${fmt(g.guessed)}</div><div class="h">0 Seamless credits</div></div>
+      <div class="stat"><div class="k">Guessed, verified valid</div><div class="v" style="color:var(--ok)">${fmt(g.guessed)}</div><div class="h">0 Seamless credits${g.probed ? ` · ${fmt(g.probed)} by trying the common formats at a new company` : ""}</div></div>
       <div class="stat"><div class="k">Seamless credits saved</div><div class="v" style="color:var(--ok)">${fmt(g.saved)}</div><div class="h">in this pull</div></div>
       <div class="stat"><div class="k">MillionVerifier checks</div><div class="v">${fmt(g.checks)}</div><div class="h">${fmt(g.valid)} valid · ${fmt(g.catch_all)} catch-all · ${fmt(g.not_valid)} not valid</div></div></div>
-    <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else.
+    <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else. At a new company the common formats are tried first, after checking that the company doesn't accept every address.
       ${!g.ready && g.why_not ? `<div style="color:var(--warn);margin-top:4px">Guessing is paused right now: ${esc(g.why_not)}</div>` : ""}</div></section>`;
 }
 const FORMAT_HTML = f => f === "catch_all" ? `<span class="badge b-warn">Catch-all</span><div class="small muted">accepts any address, can't guess</div>`

@@ -29,8 +29,10 @@ COLUMNS = [
     ("email_2", "Other email 1", lambda c: c["email_2"]),
     ("email_3", "Other email 2", lambda c: c["email_3"]),
     ("technologies", "Technologies", lambda c: c["technologies"]),
-    ("email_source", "How we got the email", lambda c: {"guessed": "guessed (MillionVerifier: valid)",
-                                                        "seamless": "seamless"}.get(c.get("email_source") or "", "")),
+    ("email_source", "How we got the email", lambda c: (
+        "guessed: common format tried (MillionVerifier: valid)" if c.get("email_source") == "guessed"
+        and c.get("guess_how") == "probe" else
+        {"guessed": "guessed (MillionVerifier: valid)", "seamless": "seamless"}.get(c.get("email_source") or "", ""))),
     ("signal", "Signal", lambda c: c.get("signal") or ""),
     ("result", "Seamless result", lambda c: c["research_status"]),
     ("note", "Note", lambda c: c["research_message"]),

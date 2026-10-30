@@ -82,7 +82,10 @@ CREATE INDEX IF NOT EXISTS vl_email ON verify_log(email, at);
 # Columns added after 2.0 (old databases get them on start).
 MIGRATIONS = {
     "pulls": [("mode", "TEXT DEFAULT 'filters'")],
-    "contacts": [("email_source", "TEXT"), ("guess_note", "TEXT"), ("guess_done", "INTEGER DEFAULT 0")],
+    "contacts": [("email_source", "TEXT"), ("guess_note", "TEXT"), ("guess_done", "INTEGER DEFAULT 0"),
+                 ("guess_how", "TEXT")],                          # 2.2: 'format' (known format) | 'probe'
+    # 2.2: accept_all_checked = a made-up address was checked at this company (accept_all = it came back valid too)
+    "domain_guess": [("accept_all_checked", "INTEGER DEFAULT 0"), ("probe_tries", "INTEGER DEFAULT 0")],
 }
 
 _local = threading.local()

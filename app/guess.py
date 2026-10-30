@@ -5,6 +5,7 @@ failed check, or a company whose guesses keep failing all mean "pay Seamless as 
 """
 import json
 import re
+import secrets
 import time
 import unicodedata
 
@@ -149,11 +150,24 @@ def blocked(domain):
     return None
 
 
+def size_low(size):
+    """Smallest employee count in a Seamless size text ('5,001 - 10,000' -> 5001, '10,001+' -> 10001), or None."""
+    m = re.search(r"\d[\d,]*", str(size or ""))
+    return int(m.group(0).replace(",", "")) if m else None
+
+
+def too_big(c):
+    low = size_low(c.get("size"))
+    return bool(cfg.GUESS_MAX_COMPANY_SIZE) and low is not None and low > cfg.GUESS_MAX_COMPANY_SIZE
+
+
 def plan(c, others_same_name):
     """The addresses to check for this person, best first ([] = don't guess), and why not if empty."""
     d = db.norm_domain(c.get("domain"))
     if not d:
         return [], "No company website."
+    if too_big(c):
+        return [], f"Company has more than {cfg.GUESS_MAX_COMPANY_SIZE:,} employees: many share a name there, so it isn't guessed."
     parts = name_parts(c.get("first_name"), c.get("last_name"))
     if not parts:
         return [], "Name not clear enough to guess."
@@ -219,3 +233,84 @@ def try_person(c, addresses, pull_id):
             continue
         return None, "; ".join(tried)          # unknown / error: stop, pay Seamless as usual
     return None, "; ".join(tried)
+
+
+# ---------------------------------------------------------------- 2.2: probing a company whose format isn't known
+PROBE_ORDER = ("first.last", "firstlast", "first_last")
+
+
+def probe_plan(c, others_same_name):
+    """For the first person at a company whose format isn't known: the common full-name addresses to try, best first.
+    ([] = don't probe: pay Seamless as in 2.1), and why not."""
+    if not cfg.GUESS_PROBE:
+        return [], "Trying common formats is off (GUESS_PROBE=0)."
+    d = db.norm_domain(c.get("domain"))
+    if not d:
+        return [], "No company website."
+    if too_big(c):
+        return [], f"Company has more than {cfg.GUESS_MAX_COMPANY_SIZE:,} employees, so it isn't guessed."
+    parts = name_parts(c.get("first_name"), c.get("last_name"))
+    if not parts:
+        return [], "Name not clear enough to guess."
+    why = blocked(d)
+    if why:
+        return [], why
+    if others_same_name:
+        return [], "Someone else with the same name at this company: a guess could reach the wrong person."
+    if int(domain_state(d).get("probe_tries") or 0) >= 2:
+        return [], "The common formats were already tried twice at this company without luck."
+    n = max(1, min(len(PROBE_ORDER), cfg.GUESS_PROBE_FORMATS))
+    out = []
+    for pat in PROBE_ORDER[:n]:
+        e = f"{PATTERNS[pat](*parts)}@{d}"
+        if db.q1("SELECT 1 x FROM memory WHERE key=?", ("em:" + e,)) or \
+                db.q1("SELECT 1 x FROM email_examples WHERE email=?", (e,)):
+            return [], "That address already belongs to someone you have."
+        out.append(e)
+    return out, None
+
+
+def accepts_everything(domain, pull_id, contact_id):
+    """Check a made-up address at the company once. If it comes back valid too, the company's server accepts every
+    address (some mail filters do this even when MillionVerifier can't tell), so nothing there can be guessed.
+    Returns True (accepts everything / not sure: don't guess) or False (safe to probe)."""
+    d = db.norm_domain(domain)
+    st = domain_state(d)
+    if st["catch_all"]:
+        return True
+    if st.get("accept_all_checked"):
+        return False
+    fake = f"zq{secrets.token_hex(5)}x@{d}"
+    res = verifier.check(fake, pull_id, contact_id)
+    db.x("INSERT OR IGNORE INTO domain_guess(domain, updated_at) VALUES(?,?)", (d, NOW()))
+    if res in ("invalid", "disposable"):
+        db.x("UPDATE domain_guess SET accept_all_checked=1, updated_at=? WHERE domain=?", (NOW(), d))
+        return False
+    if res in ("ok", "catch_all"):
+        db.x("UPDATE domain_guess SET accept_all_checked=1, catch_all=1, updated_at=? WHERE domain=?", (NOW(), d))
+        return True
+    return True                                   # unknown / error: not sure, so don't guess this time
+
+
+def probe(c, addresses, pull_id):
+    """Try the planned addresses for the first person at a new company. Returns (email or None, note).
+    A valid answer also teaches the company's format, so the next people there are guessed directly."""
+    d = db.norm_domain(c["domain"])
+    if accepts_everything(d, pull_id, c["id"]):
+        return None, "Company's server accepts every address, so a guess can't be checked."
+    db.x("UPDATE domain_guess SET probe_tries=probe_tries+1, updated_at=? WHERE domain=?", (NOW(), d))
+    tried = []
+    for e in addresses:
+        res = verifier.check(e, pull_id, c["id"])
+        tried.append(f"{e}: {res}")
+        if res == "ok":
+            _bump(d, valid=True)
+            learn(c["first_name"], c["last_name"], e, d, "probe")
+            return e, "Tried the common formats: " + "; ".join(tried)
+        if res == "catch_all":
+            _bump(d, catch_all=True)
+            return None, "; ".join(tried)
+        if res in ("invalid", "disposable"):
+            continue
+        return None, "; ".join(tried)          # unknown / error: stop, pay Seamless as usual
+    return None, "None of the common formats exists: " + "; ".join(tried)

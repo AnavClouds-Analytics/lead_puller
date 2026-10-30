@@ -9,6 +9,7 @@ import os
 import pytest
 
 from app import db, engine, guess, verifier
+from app.config import cfg
 from tests.conftest import US, add_account, add_verifier, check_books, check_people, run, start
 from tests.fakes import FakeSeamless, is_catch_all, make_people
 
@@ -103,8 +104,12 @@ def test_only_a_valid_answer_is_used_everything_else_is_paid_in_seamless(env):
     assert log
     for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND email_source='guessed'", (pid,)):
         assert any(r["email"] == c["email"] and r["result"] == "ok" for r in log)
-    # Guesses that weren't valid: that person was then researched in Seamless (never dropped, never given the guess).
-    failed = {r["contact_id"] for r in log if r["result"] != "ok"}
+    # People none of whose checks came back valid: researched in Seamless (never dropped, never given a guess).
+    # (2.2: a person can have a few invalid formats before the one that exists; a made-up address is never used.)
+    ok_people = {r["contact_id"] for r in log if r["result"] == "ok" and not r["email"].startswith("zq")}
+    failed = {r["contact_id"] for r in log if r["result"] != "ok"} - ok_people
+    for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND email_source='guessed'", (pid,)):
+        assert not c["email"].startswith("zq")
     for cid in failed:
         c = db.q1("SELECT * FROM contacts WHERE id=?", (cid,))
         assert c["email_source"] != "guessed"
@@ -121,7 +126,7 @@ def test_only_full_name_formats_are_guessed(env):
     run(client, pid)
     assert fake.mv.checks
     for r in db.q("SELECT v.email, c.first_name, c.last_name FROM verify_log v JOIN contacts c ON c.id=v.contact_id "
-                  "WHERE v.cached=0"):
+                  "WHERE v.cached=0 AND v.email NOT LIKE 'zq%'"):          # 2.2: the made-up address check
         parts = guess.name_parts(r["first_name"], r["last_name"])
         pats = guess.patterns_of(r["email"].split("@")[0], *parts)
         assert pats and set(pats) <= guess.FULL_NAME, (r["email"], pats)
@@ -276,7 +281,8 @@ def test_a_company_whose_guesses_keep_failing_is_given_up(env):
     by = collections.Counter(e.split("@")[1] for e in fake.mv.checks)
     assert by, "the test needs some guesses"
     for d, n in by.items():
-        assert n <= 3, (d, n)
+        # 2.2: at most 1 made-up address + the common formats once (first person) + 3 failed guesses, then given up
+        assert n <= 1 + cfg.GUESS_PROBE_FORMATS + 3, (d, n)
     assert not db.q1("SELECT 1 x FROM contacts WHERE email_source='guessed'")
     check_books(fake)
 
@@ -481,7 +487,15 @@ def test_company_list_pull_only_pays_for_listed_companies_and_respects_per_compa
                   (pid,)):
         assert c["domain"] in doms
         cnt[c["domain"]] += 1
-    assert cnt and max(cnt.values()) <= 2
+    # 2.2: someone without an email doesn't count, so a company can get one more try (EXTRA_TRIES_PER_COMPANY)...
+    assert cnt and max(cnt.values()) <= 2 + cfg.EXTRA_TRIES_PER_COMPANY
+    emails = collections.Counter(c["domain"] for c in db.q(f"SELECT * FROM contacts WHERE pull_id=? AND {engine.DELIVERABLE}",
+                                                            (pid,)))
+    assert max(emails.values()) <= 2                    # ...but never ends with more emails than you asked for
+    for d, n in cnt.items():                            # and an extra try only after someone came back without one
+        if n > 2:
+            assert db.q1("SELECT 1 x FROM contacts WHERE pull_id=? AND domain=? AND (state IN ('no_email','failed') "
+                         "OR LOWER(COALESCE(email_status,''))='invalid')", (pid, d))
     for who, body in fake.searches:
         assert len(body.get("companyDomain") or []) <= 100
         assert set(body["companyDomain"]) <= set(doms)
@@ -571,8 +585,11 @@ def test_same_name_at_two_companies_never_swap_emails(env):
     fake.shuffle_request_ids = True
     pid = start_list(client, doms, per_company=3, filters={"contactCountry": {"in": ["United States"]}})
     run(client, pid)
-    annas = db.q("SELECT * FROM contacts WHERE pull_id=? AND name='Anna Dubois' AND submitted_at IS NOT NULL", (pid,))
+    annas = db.q("SELECT * FROM contacts WHERE pull_id=? AND name='Anna Dubois' AND (submitted_at IS NOT NULL OR "
+                 "email_source='guessed')", (pid,))
     assert len(annas) == 2
+    for a in annas:                                   # each Anna has her own company's address (or none), never the other's
+        assert not a["email"] or a["email"].endswith("@" + a["domain"])
     check_books(fake)
     check_people(fake)
 

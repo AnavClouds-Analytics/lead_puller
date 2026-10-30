@@ -221,7 +221,9 @@ def _pull_out(pid):
                                             "GROUP BY result", (pid,))}
     paid_email = db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL AND "
                        f"{engine.DELIVERABLE}", (pid,))["n"]
-    guessing = {"guessed": g, "paid": st["researched"], "paid_email": paid_email, "saved": g,
+    probed = db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='guessed' AND guess_how='probe' "
+                   f"AND {engine.DELIVERABLE}", (pid,))["n"]                                  # 2.2
+    guessing = {"guessed": g, "probed": probed, "paid": st["researched"], "paid_email": paid_email, "saved": g,
                 "checks": sum(vl.values()), "valid": vl.get("ok", 0), "catch_all": vl.get("catch_all", 0),
                 "not_valid": sum(n for k, n in vl.items() if k not in ("ok", "catch_all")),
                 "ready": verifier.ready()[0], "why_not": verifier.ready()[1]}
