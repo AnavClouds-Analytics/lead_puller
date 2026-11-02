@@ -116,6 +116,7 @@ def check_books(fake):
     if pr is not None:                # 2.3: Prospeo's books too, to the credit
         logged = db.q1("SELECT COALESCE(SUM(cost),0) s FROM prospeo_log")["s"]
         assert logged == pr.charged, ("prospeo", logged, pr.charged)
+        assert pr.mobile_asked == 0, "asked Prospeo for mobile numbers (10 credits each)"
 
 
 def check_people(fake):

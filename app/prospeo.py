@@ -250,7 +250,9 @@ def enrich(people, pull_id=None):
         for c, _ in batch:
             out[c["id"]] = ("error", None, why)
         return out                                      # nothing was asked: not logged
-    body = {"only_verified_email": bool(cfg.PROSPEO_ONLY_VERIFIED), "data": [d for _, d in batch]}
+    # Emails only: mobile numbers cost 10 credits each, so they are never asked for (switched off explicitly).
+    body = {"only_verified_email": bool(cfg.PROSPEO_ONLY_VERIFIED), "enrich_mobile": False,
+            "only_verified_mobile": False, "data": [d for _, d in batch]}
     try:
         with _client() as cl:
             r = cl.post(_url("/bulk-enrich-person"), headers={"X-KEY": key(), "Content-Type": "application/json"},

@@ -504,6 +504,7 @@ class FakeProspeo:
         self.fail_next = []                 # "500" | "timeout" | "garbage" | "no_credits" | "429"
         self.clock = lambda: 0.0
         self.unknown_pids = set()
+        self.mobile_asked = 0               # calls that asked for mobile numbers (10 credits each): must stay 0
 
     def covers(self, pid):
         return pid % 3 != 0 and pid not in self.unknown_pids
@@ -558,6 +559,7 @@ class FakeProspeo:
         data = body.get("data") or []
         assert len(data) <= 50, "Prospeo takes at most 50 people per call"
         only_verified = body.get("only_verified_email", False)
+        self.mobile_asked += 1 if (body.get("enrich_mobile") or body.get("only_verified_mobile")) else 0
         matched, not_matched, invalid = [], [], []
         cost = 0
         for d in data:
