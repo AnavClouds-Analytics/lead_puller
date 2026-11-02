@@ -98,6 +98,8 @@ MIGRATIONS["contacts"] += [("prospeo_state", "TEXT"), ("prospeo_note", "TEXT"), 
                            ("enrich_input", "TEXT")]
 MIGRATIONS["pulls"] += [("enrich_header", "TEXT")]
 MIGRATIONS["contacts"] += [("prospeo_pid", "TEXT")]          # 2.4: a person found by Prospeo's own search
+# 2.4.1: Prospeo's own request limits (per plan), read from its answers, and why it is paused
+MIGRATIONS["prospeo"] = [("pause_reason", "TEXT"), ("limits_json", "TEXT"), ("last_call_at", "REAL DEFAULT 0")]
 
 _local = threading.local()
 _path = None

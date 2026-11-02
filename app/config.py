@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -109,6 +109,12 @@ SETTINGS = [
      "People sent to Prospeo per step (one call, Prospeo's max is 50), so Pause and Stop always answer quickly"),
     ("PROSPEO_TIMEOUT_SECONDS", "40", "int", "Prospeo (second source)",
      "Prospeo answer time limit per call; a slow answer is never counted as found (the person is tried again)"),
+    ("PROSPEO_SECONDS_BETWEEN_CALLS", "2", "float", "Prospeo (second source)",
+     "2.4.1: wait at least this long between two Prospeo calls (Prospeo limits requests per second, minute and day "
+     "by plan; when it says a limit is reached, Lead Puller waits exactly as long as Prospeo says)"),
+    ("PROSPEO_LATE_DAYS", "3", "int", "Prospeo (second source)",
+     "2.4.1: people still waiting for Prospeo when a pull finishes (e.g. Prospeo's daily limit was reached) are asked "
+     "later by themselves, for this many days (0 = never)"),
     ("PROSPEO_ERRORS_PAUSE", "3", "int", "Prospeo (second source)",
      "After this many Prospeo errors in a row, stop asking Prospeo for 30 minutes"),
     ("PROSPEO_API_KEY", "", "secret", "Prospeo (second source)",

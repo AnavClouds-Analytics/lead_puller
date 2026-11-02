@@ -730,14 +730,16 @@ function drawProspeo(pr) {
   const box = $("#prCard"); if (!box) return;
   const paused = pr.paused_until && pr.paused_until*1000 > Date.now();
   const badge = !pr.has_key ? '<span class="badge">Not set up</span>' : !pr.on ? '<span class="badge">Off in .env</span>' : !pr.enabled ? '<span class="badge">Switched off</span>'
-    : pr.last_error ? '<span class="badge b-bad">Problem</span>' : paused ? '<span class="badge b-warn">Paused</span>' : '<span class="badge b-ok">Working</span>';
+    : pr.last_error ? '<span class="badge b-bad">Problem</span>' : pr.pause_reason ? '<span class="badge b-warn">Waiting for its limit</span>' : paused ? '<span class="badge b-warn">Paused</span>' : '<span class="badge b-ok">Working</span>';
   box.innerHTML = `<div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Prospeo <span class="small muted" style="font-weight:500">· ${pr.order==="prospeo_first"?"asked before Seamless":"second source, after Seamless"}</span></h2>${badge}</div>
     <p class="small muted" style="margin:0 0 12px">${pr.order==="prospeo_first"?"Each person is looked up in Prospeo first; Seamless is paid only for people Prospeo has no verified email for.":"When Seamless has no usable email for a person, Lead Puller asks Prospeo."} Only emails Prospeo has verified are used, and only for the same person (name and company website, or LinkedIn). Prospeo charges 1 credit per email it finds, nothing when it has none, and nothing for the same person again within 90 days. The order is SOURCE_ORDER in .env.</p>
     ${pr.last_error ? `<div class="notice bad small">${esc(pr.last_error)}</div>` : ""}
     ${!pr.on ? `<div class="notice warn small">PROSPEO_ENABLED=0 in .env: Prospeo is never asked.</div>` : ""}
     ${pr.has_key ? `<div class="kv"><span>API key</span><span><code>${esc(pr.key)}</code>${pr.from_env?' <span class="small muted">from .env</span>':""}</span>
         <span>Credits left</span><span><b>${fmt(pr.credits)}</b> ${pr.plan?`<span class="small muted">· ${esc(pr.plan)} plan</span>`:""} ${pr.credits_at?`<span class="small muted">· checked ${when(pr.credits_at)}</span>`:""}</span>
-        <span>Used this month</span><span>${fmt(pr.used_this_month)} credits by Lead Puller</span></div>
+        <span>Used this month</span><span>${fmt(pr.used_this_month)} credits by Lead Puller</span>
+        ${["enrich","search"].filter(k=>(pr.limits||{})[k]&&(pr.limits[k].day_limit!=null)).map(k=>{ const l = pr.limits[k]; return `<span>${k==="enrich"?"Email lookups today":"Searches today"}</span><span>${fmt(l.day_left)} of ${fmt(l.day_limit)} left <span class="small muted">· ${fmt(l.minute_limit)} a minute on your plan</span></span>`; }).join("")}</div>
+      ${pr.pause_reason ? `<div class="notice warn small" style="margin-top:10px">${esc(pr.pause_reason)}</div>` : ""}
       <div class="row" style="margin-top:14px"><button class="btn small" id="prCheck">Check balance (free)</button>${pr.from_env?"":`<button class="btn small" id="prRekey">Replace key</button>`}
         <button class="btn small" id="prToggle">${pr.enabled?"Switch Prospeo off":"Switch Prospeo on"}</button>${pr.from_env?"":`<button class="btn small danger" id="prDel">Remove key</button>`}</div>`
     : `<div class="row" style="align-items:flex-end"><div style="flex:1 1 280px"><label for="prKey" class="small"><b>API key</b></label><input id="prKey" type="password" autocomplete="off" placeholder="Prospeo → API" style="margin-top:4px"></div>

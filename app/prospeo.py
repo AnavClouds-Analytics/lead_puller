@@ -48,6 +48,103 @@ def _url(path):
     return cfg.PROSPEO_BASE_URL.rstrip("/") + path
 
 
+# ---------------------------------------------------------------- 2.4.1: Prospeo's request limits
+def _limits():
+    r = _row() or {}
+    try:
+        return json.loads(r.get("limits_json") or "{}") or {}
+    except ValueError:
+        return {}
+
+
+def _int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _note_limits(resp, kind):
+    """Read Prospeo's x-*-request-left / x-*-reset-seconds headers (enrich and search are counted apart)."""
+    h = {k.lower(): v for k, v in resp.headers.items()}
+    if not any(k.startswith("x-") and ("request-left" in k or "rate-limit" in k) for k in h):
+        return
+    lim = _limits()
+    now = NOW()
+    cur = lim.get(kind) or {}
+    for name, key_ in (("x-daily-request-left", "day_left"), ("x-minute-request-left", "minute_left"),
+                       ("x-daily-rate-limit", "day_limit"), ("x-minute-rate-limit", "minute_limit"),
+                       ("x-second-rate-limit", "second_limit")):
+        v = _int(h.get(name))
+        if v is not None:
+            cur[key_] = v
+    for name, key_ in (("x-daily-reset-seconds", "day_reset_at"), ("x-minute-reset-seconds", "minute_reset_at")):
+        v = _int(h.get(name))
+        if v is not None:
+            cur[key_] = now + max(0, v)
+    cur["at"] = now
+    lim[kind] = cur
+    _ensure()
+    db.x("UPDATE prospeo SET limits_json=? WHERE id=1", (json.dumps(lim),))
+
+
+def _limit_wait(kind):
+    """Seconds to wait before Prospeo may be called again for this kind of call (0 = now), and why."""
+    now = NOW()
+    r = _row() or {}
+    gap = max(0.0, float(cfg.PROSPEO_SECONDS_BETWEEN_CALLS or 0))
+    last = r.get("last_call_at") or 0
+    if gap and now - last < gap:
+        return gap - (now - last), "pacing"
+    cur = _limits().get(kind) or {}
+    if cur.get("day_left") == 0 and (cur.get("day_reset_at") or 0) > now:
+        return cur["day_reset_at"] - now, "day"
+    if cur.get("minute_left") == 0 and (cur.get("minute_reset_at") or 0) > now:
+        return cur["minute_reset_at"] - now, "minute"
+    return 0, None
+
+
+def batch_size():
+    """2.4.1: how many people to send in one bulk call. Prospeo counts one request PER PERSON in a bulk call, so a
+    batch never exceeds what's left of the plan's minute and day limits (free plan: 20 a minute, 50 a day), and is
+    halved after a batch that hit a limit."""
+    n = max(1, min(50, cfg.PROSPEO_PER_STEP))
+    cur = _limits().get("enrich") or {}
+    for k in ("minute_left", "day_left", "max_batch"):
+        if cur.get(k) is not None:
+            n = min(n, max(1, int(cur[k])))
+    return n
+
+
+def _mark_call():
+    _ensure()
+    db.x("UPDATE prospeo SET last_call_at=? WHERE id=1", (NOW(),))
+
+
+def _rate_limited(resp, kind, sent=1):
+    """A 429: wait exactly as long as Prospeo says (never counted as an error; nobody is given up on)."""
+    _note_limits(resp, kind)
+    if kind == "enrich" and sent > 1:              # one request per person: send fewer at a time from now on
+        lim = _limits()
+        lim.setdefault("enrich", {})["max_batch"] = max(1, sent // 2)
+        db.x("UPDATE prospeo SET limits_json=? WHERE id=1", (json.dumps(lim),))
+    cur = _limits().get(kind) or {}
+    now = NOW()
+    if cur.get("day_left") == 0 and (cur.get("day_reset_at") or 0) > now:
+        until = cur["day_reset_at"]
+        lim = cur.get("day_limit")
+        why = (f"Prospeo's daily limit for your plan is used up{f' ({lim} requests a day)' if lim else ''}; "
+               f"Lead Puller carries on by itself when it resets (in about {max(1, round((until - now) / 3600))} h).")
+    else:
+        until = max(cur.get("minute_reset_at") or 0, now + 60)
+        lim = cur.get("minute_limit")
+        why = (f"Prospeo's per-minute limit for your plan was reached{f' ({lim} a minute)' if lim else ''}; "
+               f"waiting a minute.")
+    _ensure()
+    db.x("UPDATE prospeo SET paused_until=?, pause_reason=?, last_error=NULL WHERE id=1", (until, why))
+    return why
+
+
 def _clean_key(raw):
     k = "".join(ch for ch in (raw or "") if ch.isprintable() and not ch.isspace())
     return k.strip("'\"`")
@@ -117,7 +214,9 @@ def status():
     return {"has_key": bool(k), "key": ("•••• " + k[-4:]) if k else "", "from_env": bool(k) and not r.get("api_key"),
             "enabled": bool(r.get("enabled", 1)), "credits": r.get("credits"), "credits_at": r.get("credits_at"),
             "plan": r.get("plan"), "last_error": r.get("last_error"), "paused_until": r.get("paused_until") or 0,
-            "on": cfg.PROSPEO_ENABLED, "order": order(), "used_this_month": used_this_month()}
+            "on": cfg.PROSPEO_ENABLED, "order": order(), "used_this_month": used_this_month(),
+            "pause_reason": r.get("pause_reason") if (r.get("paused_until") or 0) > NOW() else None,
+            "limits": _limits()}
 
 
 def order():
@@ -136,7 +235,11 @@ def ready():
     if not r.get("enabled", 1):
         return False, "Prospeo is switched off on the Accounts page."
     if (r.get("paused_until") or 0) > NOW():
-        return False, "Prospeo had errors; it's asked again by itself shortly."
+        return False, r.get("pause_reason") or "Prospeo had errors; it's asked again by itself shortly."
+    wait, kind = _limit_wait("enrich")
+    if kind in ("day", "minute"):
+        return False, ("Prospeo's daily limit for your plan is used up; it carries on by itself when it resets."
+                       if kind == "day" else "Waiting for Prospeo's per-minute limit to reset.")
     if r.get("credits") is not None and r["credits"] < max(1, cfg.PROSPEO_MIN_CREDITS_LEFT):
         return False, f"Prospeo has fewer than {cfg.PROSPEO_MIN_CREDITS_LEFT} credits left (PROSPEO_MIN_CREDITS_LEFT)."
     return True, None
@@ -159,12 +262,13 @@ def _error(msg):
     r = _row()
     n = (r["errors_in_row"] or 0) + 1
     pause = NOW() + 1800 if n >= max(1, cfg.PROSPEO_ERRORS_PAUSE) else (r["paused_until"] or 0)
-    db.x("UPDATE prospeo SET errors_in_row=?, last_error=?, paused_until=? WHERE id=1", (n, msg[:300], pause))
+    db.x("UPDATE prospeo SET errors_in_row=?, last_error=?, paused_until=?, pause_reason=? WHERE id=1",
+         (n, msg[:300], pause, "Prospeo had errors; it's asked again by itself shortly." if pause > NOW() else None))
 
 
 def _ok():
     _ensure()
-    db.x("UPDATE prospeo SET errors_in_row=0, last_error=NULL WHERE id=1")
+    db.x("UPDATE prospeo SET errors_in_row=0, last_error=NULL, pause_reason=NULL WHERE id=1")
 
 
 def repair_no_match():
@@ -273,13 +377,25 @@ def enrich(people, pull_id=None):
         for c, _ in batch:
             out[c["id"]] = ("error", None, why)
         return out                                      # nothing was asked: not logged
+    wait, why_wait = _limit_wait("enrich")
+    if wait > 0:
+        for c, _ in batch:
+            out[c["id"]] = ("later", None, "Waiting for Prospeo's request limit.")
+        return out
     # Emails only: mobile numbers cost 10 credits each, so they are never asked for (switched off explicitly).
     body = {"only_verified_email": bool(cfg.PROSPEO_ONLY_VERIFIED), "enrich_mobile": False,
             "only_verified_mobile": False, "data": [d for _, d in batch]}
+    _mark_call()
     try:
         with _client() as cl:
             r = cl.post(_url("/bulk-enrich-person"), headers={"X-KEY": key(), "Content-Type": "application/json"},
                         content=json.dumps(body))
+        _note_limits(r, "enrich")
+        if r.status_code == 429:
+            why = _rate_limited(r, "enrich", len(batch))
+            for c, _ in batch:
+                out[c["id"]] = ("later", None, why)
+            return out
     except httpx.HTTPError as e:
         _error(f"Prospeo didn't answer ({type(e).__name__})")
         return _fail_all(batch, out, pull_id, f"Prospeo didn't answer ({type(e).__name__}); tried again later.")
@@ -308,8 +424,6 @@ def enrich(people, pull_id=None):
             msg = "Prospeo has no credits left."
         elif "KEY" in code.upper():
             msg = "Prospeo didn't accept the API key (Accounts page)."
-        elif r.status_code == 429:
-            msg = "Prospeo says too many requests; tried again shortly."
         else:
             msg = f"Prospeo error: {code}"
         _error(msg)
@@ -391,10 +505,18 @@ def search_people(websites, titles, seniorities, page, pull_id=None):
     if not ok:
         return [], 0, 0, why
     body = {"page": int(page), "filters": search_filters(websites, titles, seniorities)}
+    wait, _w = _limit_wait("search")
+    if wait > 0:
+        return [], 0, 0, "later"
+    _mark_call()
     try:
         with _client() as cl:
             r = cl.post(_url("/search-person"), headers={"X-KEY": key(), "Content-Type": "application/json"},
                         content=json.dumps(body))
+        _note_limits(r, "search")
+        if r.status_code == 429:
+            _rate_limited(r, "search")
+            return [], 0, 0, "later"
     except httpx.HTTPError as e:
         _error(f"Prospeo search didn't answer ({type(e).__name__})")
         return [], 0, 0, None

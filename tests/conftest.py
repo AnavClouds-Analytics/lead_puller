@@ -13,7 +13,8 @@ from tests.fakes import FakeClaude, FakeMillionVerifier, FakeProspeo, FakeSeamle
 ENV = {"APP_PASSWORD": "test-pass-123", "COOKIE_SECURE": "0", "POLL_SECONDS": "0", "RATE_LIMIT_PER_MIN": "100000",
        "MONTHLY_CREDIT_BUDGET": "0", "ACCOUNT_RESERVE": "0", "LOW_BALANCE_WARNING": "0", "UPDATED_WITHIN_MONTHS": "0",
        "ANTHROPIC_API_KEY": "claude-key", "SEAMLESS_API_KEY": "", "LATE_POLL_MINUTES": "0",
-       "EXPECTED_EMAIL_RATE": "80", "MAX_PER_COMPANY": "0", "SYNC_SEAMLESS_SAVED": "1"}
+       "EXPECTED_EMAIL_RATE": "80", "MAX_PER_COMPANY": "0", "SYNC_SEAMLESS_SAVED": "1",
+       "PROSPEO_SECONDS_BETWEEN_CALLS": "0"}
 
 
 class Clock:

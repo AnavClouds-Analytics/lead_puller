@@ -137,7 +137,7 @@ def test_prospeo_switched_off_on_accounts_page(env):
     check_books(fake)
 
 
-@pytest.mark.parametrize("modes", [["500", "500", "500"], ["timeout", "garbage"], ["429"], ["no_credits"]])
+@pytest.mark.parametrize("modes", [["500", "500", "500"], ["timeout", "garbage"], ["no_credits"]])
 def test_prospeo_errors_never_become_emails_and_pause_it(env, modes):
     client, fake, clock = env
     prospeo_on(client)
@@ -661,3 +661,27 @@ def test_2_3_0_no_match_errors_are_repaired_on_start(env):
     assert not st["last_error"] and not st["paused_until"]
     assert db.q1("SELECT prospeo_state s FROM contacts WHERE id=?", (c["id"],))["s"] is None
     assert prospeo.ready()[0]
+
+
+
+def test_too_many_requests_is_a_wait_not_an_error(env):
+    """2.4.1: a 429 from Prospeo means 'wait', never an error, and nobody is given up on."""
+    client, fake, clock = env
+    prospeo_on(client)
+    for p in fake.people:
+        fake.email_override[p["pid"]] = ""
+    fake.pr.fail_next = ["429", "429"]
+    pid = start(client, US, target=60, max_credits=300)
+    p = run(client, pid, until=("done", "paused"), ticks=20000, clock=clock)
+    if p["status"] == "paused":
+        client.post(f"/api/pulls/{pid}/resume")
+        run(client, pid, ticks=20000, clock=clock)
+    for _ in range(400):                       # waits a minute, then (even after the pull ended) asks by itself
+        engine.tick()
+        clock.t += 1
+    assert db.q1("SELECT COUNT(*) n FROM prospeo_log WHERE result='error'")["n"] == 0
+    assert db.q1("SELECT COUNT(*) n FROM contacts WHERE prospeo_state='error'")["n"] == 0
+    p = client.get(f"/api/pulls/{pid}").json()
+    assert fake.pr.charged > 0 or p["stats"]["emails"] >= p["target"]     # (guessing may already reach the target)
+    check_books(fake)
+    check_people(fake)

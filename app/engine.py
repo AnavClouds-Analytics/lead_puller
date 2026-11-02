@@ -297,6 +297,10 @@ def tick():
             except seamless.SeamlessError:
                 pass
     poll_late()
+    try:
+        prospeo_late()
+    except Exception:                                    # never let a late Prospeo lookup stop the pulls
+        pass
     running = db.q1("SELECT id FROM pulls WHERE status='running' ORDER BY id LIMIT 1")
     if not running:
         nxt = db.q1("SELECT id FROM pulls WHERE status='queued' ORDER BY id LIMIT 1")
@@ -443,8 +447,10 @@ def _finish(p, reason):
     pid = p["id"]
     now = NOW()
     _settle_unmatched(pid)
-    db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='pkept'",
-         ("Found by Prospeo's search; the pull ended before its email was looked up (nothing charged).", now, pid))
+    if p.get("stopping") or (reason or "").startswith("Stopped by you"):
+        db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='pkept'",
+             ("Found by Prospeo's search; the pull was stopped before its email was looked up (nothing charged).",
+              now, pid))
     if p.get("mode") == "enrich":                       # 2.3: rows from your file are never banked for other pulls
         db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='kept'",
              ("Not looked up: the enrichment was stopped before its turn.", now, pid))
@@ -1175,7 +1181,7 @@ def _prospeo_misses(p, need):
              (f"Prospeo not asked: this pull reached PROSPEO_MAX_CREDITS_PER_PULL ({cfg.PROSPEO_MAX_CREDITS_PER_PULL}).",
               pid))
         return False
-    n = max(1, min(50, cfg.PROSPEO_PER_STEP, need if p.get("mode") != "enrich" else 50,
+    n = max(1, min(prospeo.batch_size(), need if p.get("mode") != "enrich" else 50,
                    room if room is not None else 50))
     batch = _prospeo_screen(pid, rows, n)
     if not batch:
@@ -1216,6 +1222,8 @@ def _prospeo_screen(pid, rows, n):
 def _prospeo_apply(batch, res):
     for c in batch:
         result, email, note = res.get(c["id"], ("error", None, "No answer from Prospeo."))
+        if result == "later":
+            continue                                  # 2.4.1: Prospeo's request limit: asked again later, unchanged
         if result == "found" and email:
             _apply_prospeo(c, email, note)
         elif result == "error":
@@ -1264,11 +1272,13 @@ def _prospeo_search_step(p, need):
         return False
     # 1) emails for people the search found
     waiting = db.q("SELECT * FROM contacts WHERE pull_id=? AND state='pkept' ORDER BY id LIMIT ?",
-                   (pid, max(1, min(50, cfg.PROSPEO_PER_STEP, need, room if room is not None else 50))))
+                   (pid, max(1, min(prospeo.batch_size(), need, room if room is not None else 50))))
     if waiting:
         res = prospeo.enrich(waiting, pid)
         for c in waiting:
             result, email, note = res.get(c["id"], ("error", None, "No answer from Prospeo."))
+            if result == "later":
+                continue                              # 2.4.1: Prospeo's request limit: asked again later
             if result == "found" and email:
                 _apply_prospeo(c, email, "Found by Prospeo's search; email verified by Prospeo.")
                 c2 = db.q1("SELECT state FROM contacts WHERE id=?", (c["id"],))
@@ -1305,6 +1315,9 @@ def _prospeo_search_step(p, need):
     titles = list(((f.get("jobTitle") or {}).get("in")) or [])
     sens = list(((f.get("seniority") or {}).get("in")) or [])
     results, total_pages, cost, stop = prospeo.search_people(batch, titles, sens, st["page"], pid)
+    if stop == "later":
+        db.set_meta(key, st)
+        return True                                   # 2.4.1: Prospeo's request limit: the same page next time
     if stop:
         st["done"] = True
         st["stopped"] = stop
@@ -1380,7 +1393,8 @@ def _prospeo_first(p, people):
     room = prospeo.room(p["id"])
     if not ok or (room is not None and room < 1):
         return 0, people
-    ask = [c for c in people if not (c.get("prospeo_state") or "") and prospeo.lookup_input(c)][:min(50, room or 50)]
+    ask = [c for c in people if not (c.get("prospeo_state") or "") and prospeo.lookup_input(c)][:min(prospeo.batch_size(),
+                                                                                                    room or 50)]
     if not ask:
         return 0, people
     screened = _prospeo_screen(p["id"], ask, len(ask))
@@ -1781,6 +1795,27 @@ def _give_up(pid, message):
         db.x("UPDATE research_requests SET resolved_at=?, gave_up=1, late_polled_at=? WHERE request_id=?",
              (now, now, req["request_id"]))
     db.x("UPDATE contacts SET state='timed_out', research_message=? WHERE pull_id=? AND state='queued'", (message, pid))
+
+
+def prospeo_late():
+    """2.4.1: people still waiting for Prospeo when their pull finished (Prospeo's daily limit, a pause) are asked
+    later by themselves, one small call per tick, for PROSPEO_LATE_DAYS. Never for pulls you stopped."""
+    if not cfg.PROSPEO_LATE_DAYS or not prospeo.ready()[0]:
+        return False
+    since = NOW() - cfg.PROSPEO_LATE_DAYS * 86400
+    for r in db.q(f"""SELECT DISTINCT p.id FROM pulls p JOIN contacts c ON c.pull_id=p.id WHERE p.status='done' AND
+                      p.finished_at>=? AND COALESCE(p.stop_reason,'') NOT LIKE 'Stopped by you%' AND
+                      ((c.state='pkept') OR ({PROSPEO_ELIGIBLE.replace("state", "c.state").replace("email_status", "c.email_status").replace("dup_email", "c.dup_email").replace("(email IS NULL OR email='')", "(c.email IS NULL OR c.email='')")}
+                      AND COALESCE(c.prospeo_state,'') IN ('','retry'))) ORDER BY p.finished_at LIMIT 5""", (since,)):
+        p = db.get_pull(r["id"])
+        need = p["target"] - counts(p["id"])["emails"]
+        if p.get("mode") == "enrich":
+            need = max(need, 1)
+        if need < 1:
+            continue
+        if _prospeo_misses(p, need) or _prospeo_search_step(p, need):
+            return True
+    return False
 
 
 def poll_late():

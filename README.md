@@ -1,10 +1,22 @@
-# Lead Puller 2.4
+# Lead Puller 2.4.1
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## 2.4.1: Prospeo's plan limits
+
+Prospeo limits requests per plan (free plan: 1 a second, 20 a minute, 50 a day for email lookups, the same again for
+searches), and a bulk lookup counts **one request per person**. 2.4.0 sent 50 people at once, so the free plan
+answered "too many requests". Now:
+- Lead Puller reads Prospeo's limits from every answer and never sends more people than the minute and the day
+  still allow; it waits `PROSPEO_SECONDS_BETWEEN_CALLS` (2) between calls.
+- "Too many requests" is a wait (exactly as long as Prospeo says), never an error: nobody is given up on.
+- When the daily limit is used up, the pull finishes normally and the people still waiting are asked by themselves
+  when the limit resets, for `PROSPEO_LATE_DAYS` (3) days. Never for a pull you stopped.
+- The Accounts page shows "Email lookups today: X of 50 left" and why Prospeo is waiting.
 
 ## New in 2.4: Prospeo also finds people Seamless doesn't have
 
@@ -242,7 +254,7 @@ Seamless charged each key.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 155 tests, ~15 s, against a fake Seamless + fake MillionVerifier
+python -m pytest -q                       # 158 tests, ~15 s, against a fake Seamless + fake MillionVerifier
 FAKE_SEED=7 python -m pytest -q           # same tests on a differently shuffled fake
 LP_TEST_GUESSING=1 python -m pytest -q    # every test again with email guessing switched on
 LP_TEST_PROSPEO=1 python -m pytest -q     # every test again with Prospeo switched on

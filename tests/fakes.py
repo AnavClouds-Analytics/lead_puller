@@ -510,6 +510,11 @@ class FakeProspeo:
         self.search_pages = 0
         self.search_calls = []
         self.search_plan_required = False
+        # 2.4.1: Prospeo's plan limits (None = unlimited). FREE plan: {"second": 1, "minute": 20, "day": 50}.
+        # A bulk enrich call counts one request PER PERSON sent.
+        self.limits = None
+        self.used = {}                      # (kind, "minute"|"day"|"second", window) -> requests
+        self.rate_limited = 0
         doms = sorted({p["domain"] for p in seamless_fake.people if p["domain"]})
         n = 50000
         firsts = ["Kara", "Leo", "Mina", "Ravi", "Tess", "Ugo"]
@@ -600,7 +605,39 @@ class FakeProspeo:
                 p["domain"] and p["domain"] == site]
         return hits[0] if len(hits) == 1 else None
 
+    def _limit(self, kind, n):
+        """Count n requests; None if allowed, else the 429 response. Headers like the real Prospeo."""
+        if not self.limits:
+            return None
+        t = self.clock()
+        wins = {"second": int(t), "minute": int(t // 60), "day": int(t // 86400)}
+        used = {w: self.used.get((kind, w, wins[w]), 0) for w in wins}
+        over = (used["second"] + 1 > self.limits["second"] or used["minute"] + n > self.limits["minute"] or
+                used["day"] + n > self.limits["day"])
+        if not over:
+            self.used[(kind, "second", wins["second"])] = used["second"] + 1
+            for w in ("minute", "day"):
+                self.used[(kind, w, wins[w])] = used[w] + n
+        u = {w: self.used.get((kind, w, wins[w]), 0) for w in wins}
+        self._hdr = {"x-daily-request-left": str(max(0, self.limits["day"] - u["day"])),
+                     "x-minute-request-left": str(max(0, self.limits["minute"] - u["minute"])),
+                     "x-daily-reset-seconds": str(int(86400 - t % 86400)),
+                     "x-minute-reset-seconds": str(int(60 - t % 60)),
+                     "x-daily-rate-limit": str(self.limits["day"]), "x-minute-rate-limit": str(self.limits["minute"]),
+                     "x-second-rate-limit": str(self.limits["second"])}
+        if over:
+            self.rate_limited += 1
+            return httpx.Response(429, json={"error": True, "message": "Rate limit exceeded"}, headers=self._hdr)
+        return None
+
     def handler(self, request: httpx.Request):
+        self._hdr = {}
+        resp = self._handle(request)
+        for k, v in (self._hdr or {}).items():
+            resp.headers[k] = v
+        return resp
+
+    def _handle(self, request: httpx.Request):
         self.calls += 1
         if request.headers.get("X-KEY") != self.key:
             return httpx.Response(400, json={"error": True, "error_code": "INVALID_API_KEY"})
@@ -621,12 +658,18 @@ class FakeProspeo:
             if mode == "no_credits":
                 return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
         if path.endswith("/search-person"):
+            lim = self._limit("search", 1)
+            if lim is not None:
+                return lim
             return self.search(json.loads(request.content))
         if not path.endswith("/bulk-enrich-person"):
             return httpx.Response(404, json={"error": True, "error_code": "INVALID_REQUEST"})
         body = json.loads(request.content)
         data = body.get("data") or []
         assert len(data) <= 50, "Prospeo takes at most 50 people per call"
+        lim = self._limit("enrich", len(data))
+        if lim is not None:
+            return lim
         only_verified = body.get("only_verified_email", False)
         self.mobile_asked += 1 if (body.get("enrich_mobile") or body.get("only_verified_mobile")) else 0
         matched, not_matched, invalid = [], [], []
