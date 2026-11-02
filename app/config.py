@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -91,6 +91,14 @@ SETTINGS = [
     ("SOURCE_ORDER", "seamless,prospeo", "str", "Prospeo (second source)",
      "Which paid source is asked first: seamless,prospeo (Prospeo only fills what Seamless misses) or "
      "prospeo,seamless (Prospeo first; Seamless only for the people Prospeo has no verified email for)"),
+    ("PROSPEO_SEARCH", "1", "bool", "Prospeo (second source)",
+     "2.4: on \"People at my companies\" pulls, when Seamless has no more people, search Prospeo's own database for "
+     "the companies that are still short (same job titles), then get their verified emails. Search costs 1 Prospeo credit "
+     "per page of up to 25 people; each verified email 1 more (0 = off)"),
+    ("PROSPEO_SEARCH_BATCH", "100", "int", "Prospeo (second source)",
+     "Companies per Prospeo search (Prospeo takes up to 500)"),
+    ("PROSPEO_SEARCH_MAX_PAGES", "20", "int", "Prospeo (second source)",
+     "Most pages of 25 people read per batch of companies (each page 1 Prospeo credit)"),
     ("PROSPEO_ONLY_VERIFIED", "1", "bool", "Prospeo (second source)",
      "Only take emails Prospeo has verified (recommended); Prospeo charges nothing when it has none"),
     ("PROSPEO_MAX_CREDITS_PER_PULL", "500", "int", "Prospeo (second source)",

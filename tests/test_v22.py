@@ -248,7 +248,7 @@ def test_extra_tries_only_after_no_email_and_never_beyond_the_limit(env, monkeyp
     run(client, pid)
     by = collections.defaultdict(list)
     for c in db.q("SELECT * FROM contacts WHERE pull_id=? AND state IN ('kept','queued','done','unconfirmed',"
-                  "'timed_out','no_email','failed') ORDER BY id", (pid,)):
+                  "'timed_out','no_email','failed') AND prospeo_pid IS NULL ORDER BY id", (pid,)):
         by[c["domain"]].append(c)
     for d, rows in by.items():
         assert len(rows) <= 3, (d, len(rows))                     # 2 + EXTRA_TRIES_PER_COMPANY
@@ -267,7 +267,7 @@ def test_extra_tries_zero_means_at_most_cap(env, monkeypatch):
     pid = start_list(client, company_domains(fake, 80, min_people=1), per_company=2)
     run(client, pid)
     for r in db.q("""SELECT domain, COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('kept','queued','done',
-                     'unconfirmed','timed_out','no_email','failed') GROUP BY domain""", (pid,)):
+                     'unconfirmed','timed_out','no_email','failed') AND prospeo_pid IS NULL GROUP BY domain""", (pid,)):
         assert r["n"] <= 2, dict(r)
     check_books(fake)
     check_people(fake)

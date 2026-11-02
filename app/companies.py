@@ -168,7 +168,7 @@ def rows_for_pull(pid, offset=0, limit=50, q=""):
                           LOWER(COALESCE(email_status,''))!='invalid' THEN 1 ELSE 0 END) emails,
                       SUM(CASE WHEN submitted_at IS NOT NULL THEN 1 ELSE 0 END) paid,
                       SUM(CASE WHEN email_source='guessed' AND state='done' THEN 1 ELSE 0 END) guessed,
-                      SUM(CASE WHEN state IN ('kept','queued') THEN 1 ELSE 0 END) waiting
+                      SUM(CASE WHEN state IN ('kept','queued','pkept') THEN 1 ELSE 0 END) waiting
                       FROM contacts WHERE pull_id=? AND state NOT IN ('skipped','banked','banked_in') AND
                       (domain=? OR domain LIKE ?)""", (pid, r["domain"], "%." + r["domain"]))
         r.update({k: st[k] or 0 for k in ("found", "emails", "paid", "guessed", "waiting")})

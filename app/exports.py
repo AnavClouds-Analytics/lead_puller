@@ -32,6 +32,7 @@ COLUMNS = [
     ("email_source", "How we got the email", lambda c: (
         "guessed: common format tried (MillionVerifier: valid)" if c.get("email_source") == "guessed"
         and c.get("guess_how") == "probe" else
+        "prospeo search (verified)" if c.get("email_source") == "prospeo" and c.get("prospeo_pid") else
         {"guessed": "guessed (MillionVerifier: valid)", "seamless": "seamless", "prospeo": "prospeo (verified)",
          "already": "already had"}.get(c.get("email_source") or "", ""))),
     ("signal", "Signal", lambda c: c.get("signal") or ""),

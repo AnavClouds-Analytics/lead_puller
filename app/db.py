@@ -97,6 +97,7 @@ MIGRATIONS = {
 MIGRATIONS["contacts"] += [("prospeo_state", "TEXT"), ("prospeo_note", "TEXT"), ("enrich_idx", "INTEGER"),
                            ("enrich_input", "TEXT")]
 MIGRATIONS["pulls"] += [("enrich_header", "TEXT")]
+MIGRATIONS["contacts"] += [("prospeo_pid", "TEXT")]          # 2.4: a person found by Prospeo's own search
 
 _local = threading.local()
 _path = None

@@ -25,6 +25,7 @@ async def lifespan(app):
     db.connect()
     importer.auto_import()
     accounts.sync_env_key()
+    prospeo.repair_no_match()                      # 2.3.1: NO_MATCH was wrongly counted as an error in 2.3.0
     if not os.environ.get("DISABLE_WORKER"):
         _worker = engine.Worker()
         _worker.start()
@@ -232,7 +233,12 @@ def _pull_out(pid):
                                                      "prospeo_log WHERE pull_id=? GROUP BY result", (pid,))}
     p["prospeo"] = {"found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='prospeo' AND "
                                    f"{engine.DELIVERABLE}", (pid,))["n"],
-                    "asked": sum(v[0] for k, v in pl.items() if k != "charge"),
+                    "asked": sum(v[0] for k, v in pl.items() if k not in ("charge", "search")),
+                    "search_pages": pl.get("search", (0, 0))[0], "search_credits": pl.get("search", (0, 0))[1],
+                    "search_found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND prospeo_pid IS NOT NULL "
+                                          f"AND {engine.DELIVERABLE}", (pid,))["n"],
+                    "search_on": cfg.PROSPEO_SEARCH and p.get("mode") == "companies",
+                    "search_stopped": (db.get_meta(f"prospeo_search:{pid}") or {}).get("stopped"),
                     "credits": prospeo.spent(pid), "none": pl.get("none", (0, 0))[0],
                     "mismatch": pl.get("mismatch", (0, 0))[0], "errors": pl.get("error", (0, 0))[0],
                     "waiting": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND {engine.PROSPEO_ELIGIBLE} "
@@ -389,14 +395,14 @@ def stop_all():
 
 PEOPLE_COLS = """id, name, first_name, last_name, title, company, domain, li_url, country, city, size, industry, state,
                  skip_reason, skip_kind, email, email_status, phone, research_status, research_message, filled_free,
-                 dup_email, email_source, guess_note, prospeo_state, prospeo_note"""
+                 dup_email, email_source, guess_note, prospeo_state, prospeo_note, prospeo_pid"""
 PEOPLE_VIEWS = {
     "emails": "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0",
     "no_email": "(email IS NULL OR email='') AND (state IN ('no_email','failed','timed_out','unconfirmed') OR "
                 "(submitted_at IS NOT NULL AND state!='queued'))",
     "researched": "submitted_at IS NOT NULL",
     "skipped": "state='skipped'",
-    "waiting": "state IN ('kept','queued')",
+    "waiting": "state IN ('kept','queued','pkept')",
 }
 
 

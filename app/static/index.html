@@ -578,11 +578,12 @@ function prospeoCard(p) {
       <div class="stat"><div class="k">Asked</div><div class="v">${fmt(r.asked)}</div><div class="h">${fmt(r.none)} had no verified email (free)</div></div>
       <div class="stat"><div class="k">Prospeo credits</div><div class="v">${fmt(r.credits)}</div><div class="h">${r.cap?`of ${fmt(r.cap)} max for this ${p.mode==="enrich"?"file":"pull"}`:"no limit per pull"}</div></div>
       <div class="stat"><div class="k">Waiting for Prospeo</div><div class="v">${fmt(r.waiting)}</div><div class="h">${fmt(r.mismatch)} answers about a different person were thrown away</div></div></div>
-    <div class="small muted" style="margin-top:10px">${first?"People Prospeo has a verified email for aren't paid for in Seamless. ":"Only people Seamless had no usable email for are sent to Prospeo. "}Prospeo charges 1 credit per email it finds and nothing when it has none. Every answer is checked to be the same person (name and company website, or LinkedIn).
+    ${r.search_on ? `<div class="small" style="margin-top:12px"><b>Prospeo search</b> (when Seamless has no more people at your companies): <b>${fmt(r.search_found)}</b> emails for people Seamless didn't have · ${fmt(r.search_pages)} search pages, ${fmt(r.search_credits)} credits${r.search_stopped?`<div style="color:var(--warn)">${esc(r.search_stopped)}</div>`:""}</div>` : ""}
+    <div class="small muted" style="margin-top:10px">${first?"People Prospeo has a verified email for aren't paid for in Seamless. ":"People Seamless had no usable email for are sent to Prospeo. "}${r.search_on?"On company lists, companies that are still short when Seamless runs out are searched in Prospeo's own database (1 credit per page of 25 people). ":""}Prospeo charges 1 credit per email it finds and nothing when it has none. Every answer is checked to be the same person (name and company website, or LinkedIn).
       ${!r.ready && r.why_not ? `<div style="color:var(--warn);margin-top:4px">${esc(r.why_not)}</div>` : ""}</div></section>`;
 }
 const SRC_BADGE = r => r.email_source==="guessed" ? `<span class="badge b-ok" title="${esc(r.guess_note||"")}">Guessed · verified valid</span>`
-  : r.email_source==="prospeo" ? `<span class="badge b-ok" title="${esc(r.prospeo_note||"")}">Prospeo · verified</span>`
+  : r.email_source==="prospeo" ? `<span class="badge b-ok" title="${esc(r.prospeo_note||"")}">${r.prospeo_pid?"Prospeo search · verified":"Prospeo · verified"}</span>`
   : r.email_source==="already" ? `<span class="badge">Already had</span>` : `<span class="badge b-brand">Seamless</span>`;
 const FORMAT_HTML = f => f === "catch_all" ? `<span class="badge b-warn">Catch-all</span><div class="small muted">accepts any address, can't guess</div>`
   : f ? `<code>${esc(f)}</code>` : `<span class="muted">—</span>`;

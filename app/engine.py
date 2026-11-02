@@ -402,7 +402,11 @@ def step(p):
         return _search(p, sl, need_people - st["kept"], hit)
     if st["pending"]:
         return _wait(p, st)
-    return _finish(p, f"Seamless has no more new people for these filters: you have {st['emails']:,} of "
+    # 2.4: Seamless has no more people: search Prospeo's own database for the companies that are still short
+    if _prospeo_search_step(p, p["target"] - st["emails"]):
+        return
+    used = " or Prospeo" if db.q1("SELECT 1 x FROM prospeo_log WHERE pull_id=? AND result='search' LIMIT 1", (pid,)) else ""
+    return _finish(p, f"Seamless{used} has no more new people for these filters: you have {st['emails']:,} of "
                       f"{p['target']:,}. Widen the filters (more titles, countries or sizes) to get more.")
 
 
@@ -439,6 +443,8 @@ def _finish(p, reason):
     pid = p["id"]
     now = NOW()
     _settle_unmatched(pid)
+    db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='pkept'",
+         ("Found by Prospeo's search; the pull ended before its email was looked up (nothing charged).", now, pid))
     if p.get("mode") == "enrich":                       # 2.3: rows from your file are never banked for other pulls
         db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='kept'",
              ("Not looked up: the enrichment was stopped before its turn.", now, pid))
@@ -662,13 +668,13 @@ def _slice_gen(sl):
 
 
 def _listed_count(pid, domain):
-    return db.q1("""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('kept','queued','done','unconfirmed',
+    return db.q1("""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('kept','queued','pkept','done','unconfirmed',
                     'timed_out','no_email','failed') AND (domain=? OR domain LIKE ?)""", (pid, domain, "%." + domain))["n"]
 
 
 def _good_at(pid, domain):
     """People at a listed company who have an email or are still being looked up."""
-    r = db.q1(f"""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND (state IN ('kept','queued','unconfirmed','timed_out')
+    r = db.q1(f"""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND (state IN ('kept','queued','pkept','unconfirmed','timed_out')
                   OR ({DELIVERABLE})) AND (domain=? OR domain LIKE ?)""", (pid, domain, "%." + domain))
     return int(r["n"] or 0)
 
@@ -679,9 +685,9 @@ def _company_full(pid, domain, cap):
     cap + EXTRA_TRIES_PER_COMPANY people paid for in total."""
     if not cap:
         return False
-    r = db.q1(f"""SELECT SUM(CASE WHEN state IN ('kept','queued','unconfirmed','timed_out') OR ({DELIVERABLE}) THEN 1
+    r = db.q1(f"""SELECT SUM(CASE WHEN state IN ('kept','queued','pkept','unconfirmed','timed_out') OR ({DELIVERABLE}) THEN 1
                   ELSE 0 END) good, COUNT(*) tried FROM contacts WHERE pull_id=? AND state IN
-                  ('kept','queued','done','unconfirmed','timed_out','no_email','failed') AND (domain=? OR domain LIKE ?)""",
+                  ('kept','queued','pkept','done','unconfirmed','timed_out','no_email','failed') AND (domain=? OR domain LIKE ?)""",
               (pid, domain, "%." + domain))
     return int(r["good"] or 0) >= cap or int(r["tried"] or 0) >= cap + max(0, cfg.EXTRA_TRIES_PER_COMPANY)
 
@@ -781,7 +787,7 @@ def _company_cap(p, company, domain):
     if not ck:
         return None
     if ck.startswith("d:"):
-        n = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('kept','queued','done','unconfirmed',"
+        n = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state IN ('kept','queued','pkept','done','unconfirmed',"
                   "'timed_out','no_email','failed') AND domain=?", (p["id"], ck[2:]))["n"]
     else:
         n = sum(1 for r in db.q("SELECT company FROM contacts WHERE pull_id=? AND state IN ('kept','queued','done',"
@@ -1238,6 +1244,134 @@ def _apply_prospeo(c, email, note):
     memory.remember(keys + ["em:" + em], "pull", c["pull_id"], None, "email")
     memory.set_outcome(keys, "email")
     guess.learn(c["first_name"], c["last_name"], em, c["domain"], "prospeo")
+
+
+def _prospeo_search_step(p, need):
+    """2.4, "People at my companies": Seamless has run out. One small step: either get emails for people Prospeo's
+    search found (one call, up to 50), or read the next search page (25 people, 1 Prospeo credit) for the companies
+    that still have fewer people than you asked for. Returns True if it did something."""
+    pid = p["id"]
+    if p.get("mode") != "companies" or not cfg.PROSPEO_SEARCH or p["stopping"] or need < 1:
+        return False
+    ok, _why = prospeo.ready()
+    if not ok:
+        return False
+    room = prospeo.room(pid)
+    if room is not None and room < 1:
+        db.x("UPDATE contacts SET state='no_email', prospeo_state='skipped', prospeo_note=?, resolved_at=? WHERE "
+             "pull_id=? AND state='pkept'", (f"Not asked: this pull reached PROSPEO_MAX_CREDITS_PER_PULL "
+                                              f"({cfg.PROSPEO_MAX_CREDITS_PER_PULL}).", NOW(), pid))
+        return False
+    # 1) emails for people the search found
+    waiting = db.q("SELECT * FROM contacts WHERE pull_id=? AND state='pkept' ORDER BY id LIMIT ?",
+                   (pid, max(1, min(50, cfg.PROSPEO_PER_STEP, need, room if room is not None else 50))))
+    if waiting:
+        res = prospeo.enrich(waiting, pid)
+        for c in waiting:
+            result, email, note = res.get(c["id"], ("error", None, "No answer from Prospeo."))
+            if result == "found" and email:
+                _apply_prospeo(c, email, "Found by Prospeo's search; email verified by Prospeo.")
+                c2 = db.q1("SELECT state FROM contacts WHERE id=?", (c["id"],))
+                if c2 and c2["state"] == "pkept":            # email already someone else's
+                    db.x("UPDATE contacts SET state='no_email', resolved_at=? WHERE id=?", (NOW(), c["id"]))
+            elif result == "error" and (c.get("prospeo_state") or "") != "retry":
+                db.x("UPDATE contacts SET prospeo_state='retry', prospeo_note=? WHERE id=?", (note, c["id"]))
+            else:
+                db.x("UPDATE contacts SET state='no_email', prospeo_state=?, prospeo_note=?, resolved_at=?, "
+                     "research_message=? WHERE id=?", (result, note, NOW(), "Found by Prospeo's search: " + note,
+                                                       c["id"]))
+                memory.remember(db.person_keys(c["name"], c["company"], c["li_url"]), "pull", pid, None, "no_email")
+        return True
+    # 2) the next search page
+    key = f"prospeo_search:{pid}"
+    st = db.get_meta(key) or {}
+    if st.get("done"):
+        return False
+    cap = p["max_per_company"] or 0
+    if "queue" not in st:
+        short = [d for d in CO.ready_domains(pid) if not cap or _good_at(pid, d) < cap]
+        n = max(1, min(500, cfg.PROSPEO_SEARCH_BATCH))
+        st = {"queue": [short[i:i + n] for i in range(0, len(short), n)], "i": 0, "page": 1, "pages": 0}
+    if st["i"] >= len(st["queue"]):
+        st["done"] = True
+        db.set_meta(key, st)
+        return False
+    batch = [d for d in st["queue"][st["i"]] if not cap or _good_at(pid, d) < cap]
+    if not batch:
+        st.update(i=st["i"] + 1, page=1)
+        db.set_meta(key, st)
+        return True
+    f = p["filters"]
+    titles = list(((f.get("jobTitle") or {}).get("in")) or [])
+    sens = list(((f.get("seniority") or {}).get("in")) or [])
+    results, total_pages, cost, stop = prospeo.search_people(batch, titles, sens, st["page"], pid)
+    if stop:
+        st["done"] = True
+        st["stopped"] = stop
+        db.set_meta(key, st)
+        db.update_pull(pid, error=f"Prospeo search stopped: {stop}")
+        return False
+    added = _prospeo_take(p, results, cap)
+    st["pages"] = st.get("pages", 0) + 1
+    if not results or st["page"] >= total_pages or st["page"] >= max(1, cfg.PROSPEO_SEARCH_MAX_PAGES):
+        st.update(i=st["i"] + 1, page=1)
+    else:
+        st["page"] += 1
+    db.set_meta(key, st)
+    return True
+
+
+def _prospeo_take(p, results, cap):
+    """People from a Prospeo search page who are worth an email lookup: at one of your companies that is still short,
+    with your countries, not excluded by your filters, not already pulled anywhere, not on do-not-pull. Most senior
+    first, never more per company than you asked for. Returns how many were kept."""
+    pid = p["id"]
+    f = p["filters"]
+    rules = F.tool_excludes(f)
+    countries = {x.lower() for x in ((f.get("contactCountry") or {}).get("in") or [])}
+    no_countries = {x.lower() for x in ((f.get("contactCountry") or {}).get("out") or [])}
+    block = memory.Blocklist()
+    page_keys = _pull_keys(pid)
+    cands = []
+    for r in results:
+        person, company = (r or {}).get("person") or {}, (r or {}).get("company") or {}
+        dom = CO.listed(pid, company.get("domain") or company.get("website") or "")
+        first, last = (person.get("first_name") or "").strip(), (person.get("last_name") or "").strip()
+        name = (person.get("full_name") or f"{first} {last}").strip()
+        if not dom or not person.get("person_id") or not name:
+            continue
+        loc = person.get("location") or {}
+        country = (loc.get("country") or "").strip()
+        if countries and country.lower() not in countries:
+            continue
+        if country.lower() in no_countries:
+            continue
+        c = {"name": name, "first_name": first, "last_name": last, "title": person.get("current_job_title") or "",
+             "company": company.get("name") or "", "domain": db.norm_domain(company.get("domain") or dom),
+             "li_url": person.get("linkedin_url") or "", "country": country, "city": loc.get("city") or "",
+             "region": loc.get("state") or "", "row_email": "", "seniority": "", "department": "",
+             "industry": company.get("industry") or "", "size": company.get("employee_range") or "",
+             "prospeo_pid": str(person["person_id"]), "listed": dom}
+        keys = db.person_keys(c["name"], c["company"], c["li_url"])
+        if not keys or page_keys & set(keys) or memory.find(keys):
+            continue
+        if block.reason(c["name"], c["company"], c["domain"], c["li_url"], None) or _tool_exclude(c, rules):
+            continue
+        page_keys.update(keys)
+        cands.append(c)
+    cands.sort(key=lambda c: guess.seniority_rank(c["seniority"], c["title"]))
+    kept = 0
+    now = NOW()
+    for c in cands:
+        if cap and _good_at(pid, c["listed"]) >= cap:
+            continue
+        db.x("""INSERT INTO contacts(pull_id,state,name,first_name,last_name,title,company,domain,li_url,country,region,
+                city,industry,size,prospeo_pid,research_message,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+             (pid, "pkept", c["name"], c["first_name"], c["last_name"], c["title"], c["company"], c["domain"],
+              c["li_url"], c["country"], c["region"], c["city"], c["industry"], c["size"], c["prospeo_pid"],
+              "Seamless didn't have this person; found by Prospeo's search.", now))
+        kept += 1
+    return kept
 
 
 def _prospeo_first(p, people):

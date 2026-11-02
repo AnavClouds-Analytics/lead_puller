@@ -1,10 +1,38 @@
-# Lead Puller 2.3
+# Lead Puller 2.4
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## New in 2.4: Prospeo also finds people Seamless doesn't have
+
+On **People at my companies** pulls, when Seamless has no more people, the companies that are still short (fewer
+people with an email than you asked for) are searched in **Prospeo's own database** with the same job titles (or,
+with no titles, the same seniority). People you already have (any pull, any account), people on do-not-pull, people
+your title excludes leave out and people outside your countries are skipped for free; the rest, most senior first and
+never more per company than you asked for, get a Prospeo-verified email.
+
+- Cost: 1 Prospeo credit per search page of up to 25 people (pages with nobody are free) + 1 per verified email
+  (nothing when there's none). Both count towards `PROSPEO_MAX_CREDITS_PER_PULL`.
+- Settings: `PROSPEO_SEARCH=1` (0 = off), `PROSPEO_SEARCH_BATCH=100` companies per search,
+  `PROSPEO_SEARCH_MAX_PAGES=20` pages per batch.
+- If your Prospeo plan doesn't include the search, the pull says so and finishes normally.
+- The pull page's Prospeo card shows emails from the search, pages and credits; the download's "How we got the
+  email" says `prospeo search (verified)`.
+- Together with 2.3: a person Seamless has but without a usable email gets a Prospeo email lookup; a person Seamless
+  doesn't have at all can now be found by Prospeo's search. "Anyone matching filters" pulls are unchanged (Prospeo
+  only fills Seamless's misses there).
+
+Upgrade: same as 2.3 (unzip over the folder, keep `data/` and `.env`, `docker compose up -d --build`); healthz says
+`2.4.0`. No `.env` change needed.
+
+## 2.3.1 fix
+
+Prospeo answers `NO_MATCH` when nobody in a batch has a verified email. 2.3.0 counted that as an error and paused
+Prospeo for 30 minutes; it is now "no Prospeo email" (no charge) and Prospeo carries on. People already marked that
+way are put right on the first start.
 
 ## New in 2.3 (Prospeo as a second source, and Enrich contacts)
 
@@ -39,7 +67,7 @@ cd lead-puller-2 && docker compose down
 cp -r data ../lead-puller-2-data-backup            # backup first
 # unzip lead-puller-2.3.0.zip over this folder (it never contains data/ or .env)
 docker compose up -d --build
-curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.3.0"}
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.3.1"}
 ```
 
 The database gets its new columns and tables on start (tested on a 2.2 database: every pull, person, credit and
@@ -214,7 +242,7 @@ Seamless charged each key.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 143 tests, ~15 s, against a fake Seamless + fake MillionVerifier
+python -m pytest -q                       # 155 tests, ~15 s, against a fake Seamless + fake MillionVerifier
 FAKE_SEED=7 python -m pytest -q           # same tests on a differently shuffled fake
 LP_TEST_GUESSING=1 python -m pytest -q    # every test again with email guessing switched on
 LP_TEST_PROSPEO=1 python -m pytest -q     # every test again with Prospeo switched on

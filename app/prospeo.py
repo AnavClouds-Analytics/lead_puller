@@ -167,8 +167,29 @@ def _ok():
     db.x("UPDATE prospeo SET errors_in_row=0, last_error=NULL WHERE id=1")
 
 
+def repair_no_match():
+    """2.3.1: 2.3.0 counted Prospeo's NO_MATCH answer as an error (and paused Prospeo for 30 minutes). Those people
+    had no Prospeo email (nothing was charged): record them as such, and clear the false error. Safe to run every start."""
+    _ensure()
+    r = _row()
+    if r and (r["last_error"] or "").strip() == "Prospeo error: NO_MATCH":
+        db.x("UPDATE prospeo SET last_error=NULL, errors_in_row=0, paused_until=0 WHERE id=1")
+    ids = [x["contact_id"] for x in db.q("SELECT DISTINCT contact_id FROM prospeo_log WHERE result='error' AND "
+                                          "note='Prospeo error: NO_MATCH' AND contact_id IS NOT NULL")]
+    if ids:
+        db.x("UPDATE prospeo_log SET result='none', note=? WHERE result='error' AND note='Prospeo error: NO_MATCH'",
+             ("Prospeo has no verified email for this person (no charge).",))
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            db.x(f"UPDATE contacts SET prospeo_state=NULL, prospeo_note=NULL WHERE id IN ({','.join('?' * len(chunk))}) "
+                 f"AND prospeo_state IN ('retry','error')", chunk)
+    return len(ids)
+
+
 def lookup_input(c):
     """What Prospeo needs to find this person: LinkedIn, or full name + company website. None = not enough."""
+    if c.get("prospeo_pid"):
+        return {"person_id": c["prospeo_pid"]}         # 2.4: found by Prospeo's own search
     out = {}
     li = (c.get("li_url") or "").strip()
     if db.norm_li(li):
@@ -201,6 +222,8 @@ def recently_asked(keys):
 
 def _same_person(c, person, company):
     """The answer must be this person: same LinkedIn, or same name and same company website."""
+    if c.get("prospeo_pid") and str((person or {}).get("person_id") or "") == str(c["prospeo_pid"]):
+        return True                                     # 2.4: the very person Prospeo's search returned
     li_a = db.norm_li(c.get("li_url"))
     li_b = db.norm_li((person or {}).get("linkedin_url") or "")
     if li_a and li_b:
@@ -269,6 +292,16 @@ def enrich(people, pull_id=None):
         return _fail_all(batch, out, pull_id, "Prospeo sent an unreadable answer; tried again later.")
     if r.status_code != 200 or resp.get("error"):
         code = str(resp.get("error_code") or resp.get("message") or f"HTTP {r.status_code}")
+        if code.upper() in ("NO_MATCH", "INVALID_DATAPOINTS"):
+            # 2.3.1: not an error. Prospeo answers NO_MATCH when it has nobody (or no verified email) in the whole
+            # batch: nothing was charged, and these people simply have no Prospeo email.
+            _ok()
+            for c, _ in batch:
+                why = ("Prospeo has no verified email for this person (no charge)." if code.upper() == "NO_MATCH"
+                       else "Not enough details for Prospeo to look this person up (no charge).")
+                out[c["id"]] = ("none" if code.upper() == "NO_MATCH" else "invalid", None, why)
+                _log(pull_id, c, out[c["id"]][0], 0, None, why)
+            return out
         if "CREDIT" in code.upper():
             _ensure()
             db.x("UPDATE prospeo SET credits=0, credits_at=? WHERE id=1", (NOW(),))
@@ -331,3 +364,76 @@ def enrich(people, pull_id=None):
     if r0 and r0["credits"] is not None and used:
         db.x("UPDATE prospeo SET credits=MAX(0, credits-?), credits_at=? WHERE id=1", (used, NOW()))
     return out
+
+
+# ---------------------------------------------------------------- 2.4: Prospeo's own people search
+SENIORITY_MAP = {"C-Level": ["C-Suite", "Founder/Owner"], "VP": ["Vice President"], "Director": ["Director", "Head"],
+                 "Manager": ["Manager"], "Senior": ["Senior"], "Entry Level": ["Entry"]}
+
+
+def search_filters(websites, titles, seniorities):
+    """Prospeo search filters for these companies and the pull's job titles (or, with no titles, seniorities)."""
+    f = {"company": {"websites": {"include": list(websites)[:500]}}}
+    if titles:
+        f["person_job_title"] = {"include": list(titles)[:100], "match_mode": "CONTAINS"}
+    elif seniorities:
+        sen = sorted({v for x in seniorities for v in SENIORITY_MAP.get(x, [])})
+        if sen:
+            f["person_seniority"] = {"include": sen}
+    return f
+
+
+def search_people(websites, titles, seniorities, page, pull_id=None):
+    """One page (up to 25 people) of Prospeo's people search at these companies. Free when nothing matches; 1 credit
+    otherwise (0 if Prospeo says the page is a free repeat). Returns (results, total_pages, cost, stop_reason)
+    where stop_reason is None, or a reason to stop searching for this pull (plan, filters)."""
+    ok, why = ready()
+    if not ok:
+        return [], 0, 0, why
+    body = {"page": int(page), "filters": search_filters(websites, titles, seniorities)}
+    try:
+        with _client() as cl:
+            r = cl.post(_url("/search-person"), headers={"X-KEY": key(), "Content-Type": "application/json"},
+                        content=json.dumps(body))
+    except httpx.HTTPError as e:
+        _error(f"Prospeo search didn't answer ({type(e).__name__})")
+        return [], 0, 0, None
+    try:
+        resp = r.json()
+    except ValueError:
+        resp = None
+    if not isinstance(resp, dict):
+        _error(f"Prospeo search sent an unreadable answer (HTTP {r.status_code})")
+        return [], 0, 0, None
+    if r.status_code != 200 or resp.get("error"):
+        code = str(resp.get("error_code") or resp.get("message") or f"HTTP {r.status_code}").upper()
+        if code == "NO_RESULTS":
+            _ok()
+            return [], 0, 0, None                     # nobody there: free
+        if code == "PLAN_REQUIRED":
+            return [], 0, 0, "Your Prospeo plan doesn't include this search (PLAN_REQUIRED)."
+        if code == "INVALID_FILTERS":
+            return [], 0, 0, "Prospeo didn't accept the search: " + str(resp.get("filter_error") or "invalid filters")
+        if "CREDIT" in code:
+            _ensure()
+            db.x("UPDATE prospeo SET credits=0, credits_at=? WHERE id=1", (NOW(),))
+            _error("Prospeo has no credits left.")
+            return [], 0, 0, "Prospeo has no credits left."
+        _error(f"Prospeo search error: {code}")
+        return [], 0, 0, None
+    _ok()
+    results = resp.get("results") or []
+    pag = resp.get("pagination") or {}
+    cost = 0 if (resp.get("free") or not results) else 1
+    db.x("INSERT INTO prospeo_log(at,pull_id,contact_id,person_key,result,cost,email,note) VALUES(?,?,?,?,?,?,?,?)",
+         (NOW(), pull_id, None, None, "search", cost, None,
+          f"search page {page}: {len(results)} people at {len(websites)} companies"))
+    if cost:
+        r0 = _row()
+        if r0 and r0["credits"] is not None:
+            db.x("UPDATE prospeo SET credits=MAX(0, credits-?), credits_at=? WHERE id=1", (cost, NOW()))
+    try:
+        total_pages = int(pag.get("total_page") or 0)
+    except (TypeError, ValueError):
+        total_pages = 0
+    return results, total_pages, cost, None

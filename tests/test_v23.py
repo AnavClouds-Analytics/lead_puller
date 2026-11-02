@@ -622,3 +622,42 @@ def test_2_3_gets_more_emails_than_2_2_for_the_same_seamless_credits(env, monkey
     assert s1 / e1 < s0 / e0                                  # fewer Seamless credits per email
     check_books(fake2)
     check_people(fake2)
+
+
+def test_no_match_for_a_whole_batch_is_not_an_error(env, monkeypatch):
+    """2.3.1: Prospeo answers 400 NO_MATCH when nobody in the batch has a verified email. That's 'nothing found'
+    (free), not an error: Prospeo must not pause, and the people are recorded as having no Prospeo email."""
+    client, fake, clock = env
+    monkeypatch.setenv("PROSPEO_PER_STEP", "3")
+    prospeo_on(client)
+    for p in fake.people:
+        fake.email_override[p["pid"]] = ""
+    fake.pr.covers = lambda pid: False                      # Prospeo knows nobody
+    pid = start(client, US, target=30, max_credits=200)
+    p = run(client, pid, until=("done", "paused"))
+    if p["status"] == "paused":
+        client.post(f"/api/pulls/{pid}/resume")
+        p = run(client, pid)
+    st = client.get("/api/prospeo").json()
+    assert not st["last_error"] and not st["paused_until"]
+    assert db.q1("SELECT COUNT(*) n FROM prospeo_log WHERE result='error'")["n"] == 0
+    assert p["prospeo"]["none"] > 3 and p["prospeo"]["waiting"] == 0
+    assert fake.pr.charged == 0
+    check_books(fake)
+
+
+def test_2_3_0_no_match_errors_are_repaired_on_start(env):
+    client, fake, clock = env
+    prospeo_on(client)
+    pid = start(client, US, target=10, max_credits=60)
+    run(client, pid)
+    c = db.q1("SELECT * FROM contacts WHERE pull_id=? LIMIT 1", (pid,))
+    db.x("UPDATE contacts SET prospeo_state='error', prospeo_note='Prospeo error: NO_MATCH' WHERE id=?", (c["id"],))
+    db.x("INSERT INTO prospeo_log(at,pull_id,contact_id,result,cost,note) VALUES(1,?,?,'error',0,'Prospeo error: NO_MATCH')",
+         (pid, c["id"]))
+    db.x("UPDATE prospeo SET last_error='Prospeo error: NO_MATCH', errors_in_row=3, paused_until=9999999999 WHERE id=1")
+    assert prospeo.repair_no_match() == 1
+    st = client.get("/api/prospeo").json()
+    assert not st["last_error"] and not st["paused_until"]
+    assert db.q1("SELECT prospeo_state s FROM contacts WHERE id=?", (c["id"],))["s"] is None
+    assert prospeo.ready()[0]

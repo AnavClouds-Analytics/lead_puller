@@ -505,9 +505,73 @@ class FakeProspeo:
         self.clock = lambda: 0.0
         self.unknown_pids = set()
         self.mobile_asked = 0               # calls that asked for mobile numbers (10 credits each): must stay 0
+        # 2.4: people only Prospeo has (Seamless never shows them), at every 3rd company
+        self.extra = []
+        self.search_pages = 0
+        self.search_calls = []
+        self.search_plan_required = False
+        doms = sorted({p["domain"] for p in seamless_fake.people if p["domain"]})
+        n = 50000
+        firsts = ["Kara", "Leo", "Mina", "Ravi", "Tess", "Ugo"]
+        lasts = ["Novak", "Ortiz", "Pryce", "Quinn", "Reyes", "Sato"]
+        titles = ["CTO", "VP Engineering", "Head of IT", "Engineering Intern", "Director of Engineering", "Recruiter"]
+        for i, d in enumerate(doms):
+            if i % 3:
+                continue
+            co = next(p["company"] for p in seamless_fake.people if p["domain"] == d)
+            for k in range(3):
+                n += 1
+                f, l = firsts[(i + k) % 6], lasts[(i * 2 + k) % 6]
+                p = {"pid": n, "first": f, "last": l, "name": f"{f} {l}", "company": co, "domain": d,
+                     "title": titles[(i + k) % 6], "seniority": "C-Level" if k == 0 else "VP", "department": "Engineering",
+                     "country": "United States" if (i + k) % 5 else "Canada", "liUrl": f"https://www.linkedin.com/in/{f.lower()}-{n}/",
+                     "industries": [], "size": "", "techs": [], "lastModifiedAt": "2026-08-01 10:00:00",
+                     "email": f"{f.lower()}.{l.lower()}{n}@{d}"}
+                self.extra.append(p)
+                seamless_fake.by_pid[n] = p
+                seamless_fake.mailboxes[p["email"]] = n
 
     def covers(self, pid):
-        return pid % 3 != 0 and pid not in self.unknown_pids
+        return (pid >= 50000 or pid % 3 != 0) and pid not in self.unknown_pids
+
+    SEN = {"C-Suite": "C-Level", "Founder/Owner": "C-Level", "Vice President": "VP", "Director": "Director",
+           "Head": "Director"}
+
+    def search(self, body):
+        """2.4: Prospeo's people search: companies by website, job title CONTAINS or seniority; 25 per page."""
+        self.search_calls.append(body)
+        if self.search_plan_required:
+            return httpx.Response(400, json={"error": True, "error_code": "PLAN_REQUIRED"})
+        f = body.get("filters") or {}
+        sites = {x.lower() for x in (((f.get("company") or {}).get("websites") or {}).get("include") or [])}
+        assert len(sites) <= 500
+        titles = [t.lower() for t in ((f.get("person_job_title") or {}).get("include") or [])]
+        sens = {self.SEN.get(x) for x in ((f.get("person_seniority") or {}).get("include") or [])}
+        pool = [p for p in self.s.people + self.extra if p["domain"] in sites and
+                (p["pid"] >= 50000 or self.covers(p["pid"]))]
+        if titles:
+            pool = [p for p in pool if any(t in p["title"].lower() for t in titles)]
+        elif sens:
+            pool = [p for p in pool if p["seniority"] in sens]
+        pool.sort(key=lambda p: p["pid"])
+        if not pool:
+            return httpx.Response(400, json={"error": True, "error_code": "NO_RESULTS"})
+        page = int(body.get("page") or 1)
+        chunk = pool[(page - 1) * 25: page * 25]
+        if chunk:
+            if self.credits < 1:
+                return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
+            self.credits -= 1
+            self.charged += 1
+            self.search_pages += 1
+        res = [{"person": {"person_id": f"p{p['pid']}", "first_name": p["first"], "last_name": p["last"],
+                           "full_name": p["name"], "linkedin_url": p["liUrl"] or None, "current_job_title": p["title"],
+                           "location": {"country": p["country"], "city": "Springfield"},
+                           "email": {"revealed": False}},
+                "company": {"name": p["company"], "domain": p["domain"], "website": "https://" + p["domain"]}}
+               for p in chunk]
+        return httpx.Response(200, json={"error": False, "free": False, "results": res, "pagination": {
+            "current_page": page, "per_page": 25, "total_page": -(-len(pool) // 25), "total_count": len(pool)}})
 
     def verified(self, pid):
         return pid % 10 != 7
@@ -516,6 +580,9 @@ class FakeProspeo:
         return pid % 37 == 5
 
     def _find(self, d):
+        if d.get("person_id"):
+            pid = int(str(d["person_id"]).lstrip("p"))
+            return self.s.by_pid.get(pid)
         li = (d.get("linkedin_url") or "").lower()
         m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", li)
         if m:
@@ -553,6 +620,8 @@ class FakeProspeo:
                 return httpx.Response(429, json={"error": True, "error_code": "RATE_LIMITED"})
             if mode == "no_credits":
                 return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
+        if path.endswith("/search-person"):
+            return self.search(json.loads(request.content))
         if not path.endswith("/bulk-enrich-person"):
             return httpx.Response(404, json={"error": True, "error_code": "INVALID_REQUEST"})
         body = json.loads(request.content)
@@ -565,7 +634,7 @@ class FakeProspeo:
         for d in data:
             ident = d.get("identifier")
             self.asked.append(ident)
-            ok_input = d.get("linkedin_url") or ((d.get("first_name") and d.get("last_name") or d.get("full_name"))
+            ok_input = d.get("person_id") or d.get("linkedin_url") or ((d.get("first_name") and d.get("last_name") or d.get("full_name"))
                                                  and (d.get("company_website") or d.get("company_name")))
             if not ok_input:
                 invalid.append(ident)
@@ -596,10 +665,13 @@ class FakeProspeo:
                 cost += 1
                 self.revealed_to[who["pid"]] = now
             matched.append({"identifier": ident, "person": {
-                "first_name": who["first"], "last_name": who["last"], "full_name": who["name"],
+                "person_id": f"p{who['pid']}", "first_name": who["first"], "last_name": who["last"], "full_name": who["name"],
                 "linkedin_url": who["liUrl"] or None,
                 "email": {"status": "VERIFIED" if self.verified(p["pid"]) else "UNVERIFIED", "revealed": True,
                           "email": email, "verification_method": "SMTP", "email_mx_provider": "Google"}},
                 "company": {"name": who["company"], "website": "https://" + who["domain"], "domain": who["domain"]}})
+        if not matched:                     # the real Prospeo: nobody in the batch matched -> 400 NO_MATCH
+            return httpx.Response(400, json={"error": True, "error_code": "INVALID_DATAPOINTS" if invalid and
+                                             not not_matched else "NO_MATCH"})
         return httpx.Response(200, json={"error": False, "total_cost": cost, "matched": matched,
                                          "not_matched": not_matched, "invalid_datapoints": invalid})
