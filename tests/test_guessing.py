@@ -83,6 +83,14 @@ def test_guessing_saves_seamless_credits_on_a_company_list(env, tmp_path, monkey
     assert client.post("/api/auth/login", json={"password": "test-pass-123"}).status_code == 200
     assert client.post("/api/accounts", json={"name": "Account A", "api_key": "key-alpha-1111"}).status_code == 200
     add_verifier(client)
+    if os.environ.get("LP_TEST_PROSPEO") == "1":           # 2.3: same sources as the first run
+        from app import prospeo
+        from tests.conftest import add_prospeo
+        from tests.fakes import FakeProspeo
+        fake2.pr = FakeProspeo(fake2)
+        fake2.pr.clock = clock
+        monkeypatch.setattr(prospeo, "TRANSPORT", httpx.MockTransport(fake2.pr.handler))
+        add_prospeo(client)
     pid1 = start_list(client, doms)
     p = run(client, pid1)
     with_g = research_credits(pid1)

@@ -214,3 +214,30 @@ def saved_contacts(start_iso, end_iso, page, account, limit=500):
     resp = _request("GET", "/contacts", "org_contacts",
                     params={"startDate": start_iso, "endDate": end_iso, "page": page, "limit": limit}, account=account)
     return _json(resp).get("data") or []
+
+
+# ---------------------------------------------------------------- 2.3: look up people from your own file
+def clue_for(c):
+    """What Seamless needs to find one person without a search: LinkedIn, else full name + company (+ job title)."""
+    li = (c.get("li_url") or "").strip()
+    if db.norm_li(li):
+        return {"liProfileUrl": li if li.lower().startswith("http") else "https://" + li.lstrip("/")}
+    company = (c.get("company") or "").strip()
+    if not company and c.get("domain"):
+        label = db.norm_domain(c["domain"]).split(".")[0]
+        company = " ".join(w.capitalize() for w in label.replace("_", "-").split("-") if w)
+    out = {"contactName": (c.get("name") or "").strip(), "companyName": company}
+    if c.get("title"):
+        out["title"] = c["title"]
+    return out
+
+
+def research_clues(clues, account, pull_id=None):
+    """Research people by LinkedIn / name + company (1 credit each). Returns requestIds (same order as sent)."""
+    body = {"contacts": list(clues), "isJobChange": False}
+    resp = _request("POST", "/contacts/research", "research_contacts", json=body, safe_to_retry=False, account=account)
+    ids = _json(resp).get("requestIds") or []
+    if ids:
+        db.log_credits(pull_id, account.get("id"), "research", len(ids), balance_of(resp),
+                       f"look up {len(ids)} people from your file")
+    return ids

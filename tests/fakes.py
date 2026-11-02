@@ -136,6 +136,7 @@ class FakeSeamless:
         self.email_override = {}
         self.drop_sid = False                  # every poll answer without searchResultId
         self.leak_domains = False
+        self.clue_lookups = 0
 
     # ------------------------------------------------------------------ accounts / books
     def add_key(self, key, balance):
@@ -284,8 +285,49 @@ class FakeSeamless:
         return self._resp(200, {"data": rows, "supplementalData": {"isMore": more, "total": len(pool),
                                                                    "nextToken": tok}})
 
+    def _find_clue(self, clue):
+        """2.3: who a LinkedIn / name + company lookup is about (None = Seamless doesn't know them)."""
+        li = (clue.get("liProfileUrl") or "").lower()
+        m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", li)
+        if m:
+            slug_ = m.group(1).rstrip("/")
+            for p in self.people:
+                pm = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", (p["liUrl"] or "").lower())
+                if pm and pm.group(1).rstrip("/") == slug_:
+                    return p["pid"]
+            return None
+        name = " ".join((clue.get("contactName") or "").lower().split())
+        co = " ".join((clue.get("companyName") or "").lower().split())
+        hits = [p for p in self.people if p["name"].lower() == name and
+                (p["company"].lower() == co or (p["domain"] and p["domain"].split(".")[0] == co.replace(" ", "")))]
+        return hits[0]["pid"] if len(hits) == 1 else None
+
+    def research_clues(self, body):
+        clues = body.get("contacts") or []
+        self.clue_lookups += len(clues)
+        done = self.researched_in(self.org())
+        found = [self._find_clue(c) for c in clues]
+        cost = sum(1 for pid in found if pid is None or pid not in done)
+        if self.balance_of(self.cur) < cost:
+            return self._resp(422, {"code": "insufficientCredits", "msg": "no credits"})
+        ids = []
+        for pid in found:
+            rid = f"r{len(self.requests)}c{self.rnd.randint(100, 999)}"
+            dup = pid is not None and pid in done
+            if not dup:
+                self.charge("research", 1)          # a lookup from your file costs 1 credit, found or not
+                if pid is not None:
+                    done[pid] = done.get(pid, 0) + 1
+            self.requests[rid] = {"sid": None, "pid": pid, "dup": dup, "polls": 0, "clue": True,
+                                  "need": self.rnd.randint(1, 4) if self.chaos_poll else 1}
+            self.rid_key[rid] = self.cur
+            ids.append(rid)
+        return self._resp(202, {"success": True, "requestIds": ids})
+
     def research(self, request):
         body = json.loads(request.content)
+        if body.get("contacts") is not None:
+            return self.research_clues(body)
         sids = body.get("searchResultIds") or []
         if len(sids) > 500:
             return self._resp(400, {"message": "max 500"})
@@ -349,9 +391,11 @@ class FakeSeamless:
             req["polls"] += 1
             pid = req["pid"]
             row = {"requestId": rid, "searchResultId": req["sid"]}
-            if (self.chaos_poll and self.rnd.random() < 0.25) or self.drop_sid:
+            if (self.chaos_poll and self.rnd.random() < 0.25) or self.drop_sid or req.get("clue"):
                 row.pop("searchResultId")
-            if pid is None:
+            if pid is None and req.get("clue"):
+                row.update(status="not found", message="")
+            elif pid is None:
                 row.update(status="error", message="unknown search result")
             elif req["polls"] < req["need"] or pid in self.slow_pids:
                 row.update(status=self.rnd.choice(["queued", "researching"]))
@@ -441,3 +485,119 @@ class FakeClaude:
                             "industry": {"in": ["Not A Real Industry", "Computer Software"]}}}
         return httpx.Response(200, json={"content": [{"type": "tool_use", "id": "t1", "name": "set_search",
                                                       "input": data}]})
+
+
+
+class FakeProspeo:
+    """Prospeo (2.3): knows about two thirds of the people, sometimes better than Seamless. Charges 1 credit per
+    email it reveals, nothing when it has none, and nothing for the same person again within 90 days. Some answers
+    are unverified, and a few are about the wrong person (a trap: they must never be used)."""
+
+    def __init__(self, seamless_fake, credits=5000, key="prospeo-key-9f1c"):
+        self.s = seamless_fake
+        self.credits = credits
+        self.key = key
+        self.charged = 0
+        self.calls = 0
+        self.asked = []                     # identifiers of every person asked about
+        self.revealed_to = {}               # pid -> first reveal time
+        self.fail_next = []                 # "500" | "timeout" | "garbage" | "no_credits" | "429"
+        self.clock = lambda: 0.0
+        self.unknown_pids = set()
+
+    def covers(self, pid):
+        return pid % 3 != 0 and pid not in self.unknown_pids
+
+    def verified(self, pid):
+        return pid % 10 != 7
+
+    def wrong_person(self, pid):
+        return pid % 37 == 5
+
+    def _find(self, d):
+        li = (d.get("linkedin_url") or "").lower()
+        m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", li)
+        if m:
+            for p in self.s.people:
+                pm = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", (p["liUrl"] or "").lower())
+                if pm and pm.group(1).rstrip("/") == m.group(1).rstrip("/"):
+                    return p
+            return None
+        first, last = (d.get("first_name") or "").lower(), (d.get("last_name") or "").lower()
+        if d.get("full_name") and not first:
+            parts = d["full_name"].lower().split()
+            first, last = parts[0], parts[-1]
+        site = (d.get("company_website") or "").lower()
+        hits = [p for p in self.s.people if p["first"].lower() == first and p["last"].lower() == last and
+                p["domain"] and p["domain"] == site]
+        return hits[0] if len(hits) == 1 else None
+
+    def handler(self, request: httpx.Request):
+        self.calls += 1
+        if request.headers.get("X-KEY") != self.key:
+            return httpx.Response(400, json={"error": True, "error_code": "INVALID_API_KEY"})
+        path = request.url.path
+        if path.endswith("/account-information"):
+            return httpx.Response(200, json={"error": False, "response": {
+                "current_plan": "STARTER", "remaining_credits": self.credits, "used_credits": self.charged}})
+        if self.fail_next:
+            mode = self.fail_next.pop(0)
+            if mode == "timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
+            if mode == "500":
+                return httpx.Response(500, text="boom")
+            if mode == "garbage":
+                return httpx.Response(200, text="<html>")
+            if mode == "429":
+                return httpx.Response(429, json={"error": True, "error_code": "RATE_LIMITED"})
+            if mode == "no_credits":
+                return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
+        if not path.endswith("/bulk-enrich-person"):
+            return httpx.Response(404, json={"error": True, "error_code": "INVALID_REQUEST"})
+        body = json.loads(request.content)
+        data = body.get("data") or []
+        assert len(data) <= 50, "Prospeo takes at most 50 people per call"
+        only_verified = body.get("only_verified_email", False)
+        matched, not_matched, invalid = [], [], []
+        cost = 0
+        for d in data:
+            ident = d.get("identifier")
+            self.asked.append(ident)
+            ok_input = d.get("linkedin_url") or ((d.get("first_name") and d.get("last_name") or d.get("full_name"))
+                                                 and (d.get("company_website") or d.get("company_name")))
+            if not ok_input:
+                invalid.append(ident)
+                continue
+            p = self._find(d)
+            if p and p["email"] not in self.s.mailboxes and not self.wrong_person(p["pid"]):
+                p = None                         # that mailbox doesn't exist: Prospeo can't verify an email
+            if not p or not self.covers(p["pid"]) or (only_verified and not self.verified(p["pid"])):
+                not_matched.append(ident)
+                continue
+            who = p
+            if self.wrong_person(p["pid"]):
+                who = next(q for q in self.s.people if q["pid"] != p["pid"] and q["domain"] and
+                           q["name"] != p["name"])
+            email = who["email"] if (not who["email"].endswith("@nodomain.example") and
+                                     who["email"] in self.s.mailboxes) else None
+            if not email:
+                not_matched.append(ident)
+                continue
+            now = self.clock()
+            first = self.revealed_to.get(who["pid"])
+            free = first is not None and now - first < 90 * 86400
+            if not free:
+                if self.credits < 1:
+                    return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
+                self.credits -= 1
+                self.charged += 1
+                cost += 1
+                self.revealed_to[who["pid"]] = now
+            matched.append({"identifier": ident, "person": {
+                "first_name": who["first"], "last_name": who["last"], "full_name": who["name"],
+                "linkedin_url": who["liUrl"] or None,
+                "email": {"status": "VERIFIED" if self.verified(p["pid"]) else "UNVERIFIED", "revealed": True,
+                          "email": email, "verification_method": "SMTP", "email_mx_provider": "Google"}},
+                "company": {"name": who["company"], "website": "https://" + who["domain"], "domain": who["domain"]}})
+        return httpx.Response(200, json={"error": False, "total_cost": cost, "matched": matched,
+                                         "not_matched": not_matched, "invalid_datapoints": invalid})

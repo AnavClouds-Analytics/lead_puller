@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -84,6 +84,35 @@ SETTINGS = [
      "Optional. The MillionVerifier key is normally added on the Accounts page; a key here is used when none is set there"),
     ("MILLIONVERIFIER_BASE_URL", "https://api.millionverifier.com/api/v3", "str", "Email guessing",
      "MillionVerifier API address"),
+
+    ("PROSPEO_ENABLED", "1", "bool", "Prospeo (second source)",
+     "2.3: when Seamless has no usable email for a person, ask Prospeo (needs the Prospeo key on the Accounts page; "
+     "0 = off, everything works as in 2.2)"),
+    ("SOURCE_ORDER", "seamless,prospeo", "str", "Prospeo (second source)",
+     "Which paid source is asked first: seamless,prospeo (Prospeo only fills what Seamless misses) or "
+     "prospeo,seamless (Prospeo first; Seamless only for the people Prospeo has no verified email for)"),
+    ("PROSPEO_ONLY_VERIFIED", "1", "bool", "Prospeo (second source)",
+     "Only take emails Prospeo has verified (recommended); Prospeo charges nothing when it has none"),
+    ("PROSPEO_MAX_CREDITS_PER_PULL", "500", "int", "Prospeo (second source)",
+     "Most Prospeo credits one pull or enrichment may use (0 = no limit). Prospeo charges 1 credit per email found"),
+    ("PROSPEO_MIN_CREDITS_LEFT", "20", "int", "Prospeo (second source)",
+     "Stop asking Prospeo when it has fewer credits left than this"),
+    ("PROSPEO_PER_STEP", "50", "int", "Prospeo (second source)",
+     "People sent to Prospeo per step (one call, Prospeo's max is 50), so Pause and Stop always answer quickly"),
+    ("PROSPEO_TIMEOUT_SECONDS", "40", "int", "Prospeo (second source)",
+     "Prospeo answer time limit per call; a slow answer is never counted as found (the person is tried again)"),
+    ("PROSPEO_ERRORS_PAUSE", "3", "int", "Prospeo (second source)",
+     "After this many Prospeo errors in a row, stop asking Prospeo for 30 minutes"),
+    ("PROSPEO_API_KEY", "", "secret", "Prospeo (second source)",
+     "Optional. The Prospeo key is normally added on the Accounts page; a key here is used when none is set there"),
+    ("PROSPEO_BASE_URL", "https://api.prospeo.io", "str", "Prospeo (second source)", "Prospeo API address"),
+
+    ("ENRICH_MAX_ROWS", "5000", "int", "Enrich contacts",
+     "2.3: largest file the Enrich contacts page accepts"),
+    ("ENRICH_USE_SEAMLESS", "1", "bool", "Enrich contacts",
+     "Look people up in Seamless on the Enrich contacts page (1 credit each); 0 = only free checks, guessing and Prospeo"),
+    ("ENRICH_DEFAULT_MAX_CREDITS", "1.2", "float", "Enrich contacts",
+     "Max Seamless credits pre-filled for an enrichment = rows that need a lookup × this"),
 
     ("DEFAULT_PER_COMPANY", "2", "int", "Company lists",
      "People per company preselected for \"People at my companies\" pulls (most senior first)"),

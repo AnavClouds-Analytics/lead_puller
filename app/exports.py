@@ -32,7 +32,8 @@ COLUMNS = [
     ("email_source", "How we got the email", lambda c: (
         "guessed: common format tried (MillionVerifier: valid)" if c.get("email_source") == "guessed"
         and c.get("guess_how") == "probe" else
-        {"guessed": "guessed (MillionVerifier: valid)", "seamless": "seamless"}.get(c.get("email_source") or "", ""))),
+        {"guessed": "guessed (MillionVerifier: valid)", "seamless": "seamless", "prospeo": "prospeo (verified)",
+         "already": "already had"}.get(c.get("email_source") or "", ""))),
     ("signal", "Signal", lambda c: c.get("signal") or ""),
     ("result", "Seamless result", lambda c: c["research_status"]),
     ("note", "Note", lambda c: c["research_message"]),
@@ -94,12 +95,13 @@ def _signals(pid, rows):
 
 def all_rows(pid):
     return _signals(pid, db.q("SELECT * FROM contacts WHERE pull_id=? AND (submitted_at IS NOT NULL OR "
-                              "email_source='guessed') ORDER BY id", (pid,)))
+                              "email_source IN ('guessed','prospeo','already')) ORDER BY id", (pid,)))
 
 
 def no_email_rows(pid):
-    return _signals(pid, db.q("""SELECT * FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL AND
-                   (email IS NULL OR email='') AND state NOT IN ('queued') ORDER BY id""", (pid,)))
+    return _signals(pid, db.q("""SELECT * FROM contacts WHERE pull_id=? AND (email IS NULL OR email='') AND
+                   (state IN ('no_email','failed','timed_out','unconfirmed') OR (submitted_at IS NOT NULL AND
+                   state NOT IN ('queued'))) ORDER BY id""", (pid,)))
 
 
 def to_csv(rows, cols):
@@ -128,3 +130,36 @@ def safe_name(name, fallback):
     import re
     s = re.sub(r"[^A-Za-z0-9]+", "-", name or "").strip("-")[:60]
     return s or fallback
+
+
+ENRICH_ADDED = [("email", "Email"), ("email_status", "Email status"), ("source", "How we got the email"),
+                ("title", "Job title (found)"), ("linkedin", "LinkedIn (found)"), ("website", "Company website"),
+                ("note", "Lead Puller note")]
+
+
+def enriched_file(header, rows, fmt="csv"):
+    """2.3: your own file, same rows and order, with the results added on the right. Returns (bytes, mime, ext)."""
+    added = [label for _, label in ENRICH_ADDED]
+    names = list(header) + [a if a not in header else f"{a} (Lead Puller)" for a in added]
+    data = []
+    for r in rows:
+        inp = r["input"]
+        vals = list(inp) if isinstance(inp, list) else [inp.get(h, "") for h in header]
+        vals = (vals + [""] * len(header))[:len(header)]
+        data.append([cell(v) for v in vals] + [cell(r.get(k, "")) for k, _ in ENRICH_ADDED])
+    if fmt == "xlsx":
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Enriched"
+        ws.append(names)
+        for d in data:
+            ws.append(d)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(names)
+    w.writerows(data)
+    return ("\ufeff" + buf.getvalue()).encode("utf-8"), "text/csv", "csv"

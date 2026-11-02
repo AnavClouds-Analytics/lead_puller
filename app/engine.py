@@ -21,6 +21,7 @@ Where credits go, and how each is saved:
             - checked again right before paying; never resent automatically after an error;
             - max credits per pull and the monthly budgets are never exceeded.
 """
+import collections
 import hashlib
 import json
 import math
@@ -28,7 +29,7 @@ import re
 import threading
 import time
 
-from . import accounts, companies as CO, db, dnscheck, filters as F, guess, memory, seamless, verifier
+from . import accounts, companies as CO, db, dnscheck, filters as F, guess, memory, prospeo, seamless, verifier
 from .config import cfg
 
 NOW = time.time            # tests swap in a fake clock
@@ -39,7 +40,9 @@ class PullError(Exception):
 
 
 DELIVERABLE = "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0"
-NOT_GUESSED = "COALESCE(email_source,'')!='guessed'"
+# People actually researched in Seamless (guesses, Prospeo-first finds and enrichment rows filled from what you
+# already had are never counted in Seamless's email rate). 2.3: "submitted_at IS NOT NULL" added.
+NOT_GUESSED = "COALESCE(email_source,'')!='guessed' AND submitted_at IS NOT NULL"
 OPEN_STATES = ("kept", "queued", "done", "unconfirmed", "timed_out", "no_email", "failed")
 
 
@@ -216,6 +219,8 @@ def _slice_domains(sl):
 
 def _plan(p):
     """Split the search into company-size slices (each remembered separately, per account)."""
+    if p.get("mode") == "enrich":
+        return                                         # 2.3: the people come from your file, nothing is searched
     if p.get("mode") == "companies":
         return _plan_companies(p)
     f = p["filters"]
@@ -341,7 +346,14 @@ def step(p):
         db.update_pull(pid, status="paused", pause_kind="spending",
                        error="Paused: spending is switched off (SPENDING_ENABLED=0 in .env).")
         return
+    # 2.3: Prospeo fills in people Seamless had no usable email for (it charges only when it finds one)
+    if _prospeo_misses(p, math.ceil(p["target"] - expected)):
+        return
+    enrich = p.get("mode") == "enrich"
     if credits_left(p) < 1:
+        if enrich and st["kept"]:
+            return _enrich_without_seamless(pid, f"Not looked up in Seamless: this enrichment's max of "
+                                                 f"{p['max_credits']:,} Seamless credits was reached.")
         if st["pending"]:
             return _wait(p, st)
         return _finish(p, f"Reached your max of {p['max_credits']:,} credits with {st['emails']:,} emails.")
@@ -364,8 +376,20 @@ def step(p):
             return
     need_people = max(1, math.ceil((p["target"] - expected) / hit))
     batch = min(cfg.RESEARCH_BATCH, need_people)
+    if enrich:
+        batch = min(cfg.RESEARCH_BATCH, max(1, st["kept"]))     # 2.3: everyone in your file is looked up
     if not st["researched"] and cfg.FIRST_BATCH:
         batch = min(batch, cfg.FIRST_BATCH)
+    if enrich:
+        if st["kept"]:
+            if not cfg.ENRICH_USE_SEAMLESS:
+                return _enrich_without_seamless(pid, "Not looked up in Seamless (ENRICH_USE_SEAMLESS=0).")
+            if not _research(p, min(batch, st["kept"])) and not st["pending"]:
+                db.update_pull(pid, error="Waiting: nothing could be sent to Seamless this step.")
+            return
+        if st["pending"]:
+            return _wait(p, st)
+        return _finish(p, f"Done: {st['emails']:,} of the {p['target']:,} people in your file have an email.")
     sl = _current_slice(pid)
     # 2.2: reopen companies only once every answer is back, so they're searched together in one go (one search
     # for many companies costs far less than one per company)
@@ -415,6 +439,9 @@ def _finish(p, reason):
     pid = p["id"]
     now = NOW()
     _settle_unmatched(pid)
+    if p.get("mode") == "enrich":                       # 2.3: rows from your file are never banked for other pulls
+        db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='kept'",
+             ("Not looked up: the enrichment was stopped before its turn.", now, pid))
     left = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state='kept'", (pid,))["n"]
     # Found but not needed: keep them for the next pull with the same filters (no search needed then).
     db.x("UPDATE contacts SET state='banked', banked_at=? WHERE pull_id=? AND state='kept'", (now, pid))
@@ -863,6 +890,11 @@ def _research(p, n):
         if credits_left(p) < 1:
             return 0
         if room < 1:
+            if p.get("mode") == "enrich":
+                # 2.3: nothing is banked for an enrichment; these people go to Prospeo (if set up) instead
+                _enrich_without_seamless(pid, "Not looked up in Seamless: the account's budget or balance is used up.",
+                                         account_id=grp["account_id"])
+                continue
             # This account can't pay: keep these people for later (their search IDs belong to this account).
             db.x("UPDATE contacts SET state='banked', banked_at=? WHERE pull_id=? AND state='kept' AND account_id=?",
                  (NOW(), pid, grp["account_id"]))
@@ -927,6 +959,9 @@ def _research(p, n):
             else:
                 db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (why_not, c["id"]))
                 to_pay.append(c)
+        if to_pay and prospeo.order() == "prospeo_first":
+            found, to_pay = _prospeo_first(p, to_pay)        # 2.3: Seamless only for people Prospeo has no email for
+            done += found
         if to_pay:
             _send(p, acct, to_pay[:max(0, min(k - done, room))])
         return done + len(to_pay)
@@ -976,6 +1011,8 @@ def _apply_guess(c, email, note, how="format"):
 
 def _send(p, acct, people):
     pid = p["id"]
+    if any(not c["sid"] for c in people):
+        return _send_clues(p, acct, [c for c in people if not c["sid"]])
     sids = [c["sid"] for c in people]
     before = accounts.get(acct["id"])["balance"]
     try:
@@ -1060,6 +1097,365 @@ def _free_fill_unconfirmed(p):
         else:
             db.x("UPDATE contacts SET state='no_email', filled_free=1, research_message=? WHERE id=?",
                  ("Seamless didn't answer and no saved contact was found.", c["id"]))
+
+
+# ================================================================ 2.3: Prospeo and enrichment
+def _send_clues(p, acct, people):
+    """Enrichment rows: look each person up in Seamless by LinkedIn, or full name + company (1 credit each).
+    The answers come back without a search ID; each is checked to be the same person before it's used."""
+    pid = p["id"]
+    clues = [seamless.clue_for(c) for c in people]
+    try:
+        rids = seamless.research_clues(clues, acct, pid)
+    except seamless.SeamlessError as e:
+        if e.code == "unconfirmed":
+            return _unconfirmed(p, acct, people, accounts.get(acct["id"])["balance"], e)
+        if e.code == "insufficientCredits":
+            seamless.test_connection(acct)
+            return
+        if e.code == "bad_request":
+            db.x(f"UPDATE contacts SET state='no_email', research_message=? WHERE id IN ({','.join('?' * len(people))})",
+                 ("Seamless couldn't take this lookup (not enough details).", *[c["id"] for c in people]))
+            return
+        raise
+    now = NOW()
+    same = len(rids) == len(people)
+    if p.get("current_account_id") != acct["id"]:
+        db.update_pull(pid, current_account_id=acct["id"])
+    with db.tx() as con:
+        for i, c in enumerate(people):
+            con.execute("UPDATE contacts SET state='queued', submitted_at=?, request_id=?, account_id=? WHERE id=?",
+                        (now, rids[i] if same else None, acct["id"], c["id"]))
+        for i, rid in enumerate(rids):
+            con.execute("""INSERT OR IGNORE INTO research_requests(request_id,pull_id,account_id,contact_id,guess_sid,
+                           created_at) VALUES(?,?,?,?,?,?)""",
+                        (rid, pid, acct["id"], people[i]["id"] if same else None, None, now))
+    for c in people:
+        memory.remember(db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"]), "pull", pid,
+                        acct["id"], "pending")
+
+
+def _enrich_without_seamless(pid, why, account_id=None):
+    """Enrichment rows Seamless won't be asked about: they go to Prospeo (if set up), else stay without an email."""
+    sql = "UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='kept'"
+    args = [why, NOW(), pid]
+    if account_id is not None:
+        sql += " AND account_id IS ?"
+        args.append(account_id)
+    db.x(sql, args)
+
+
+PROSPEO_ELIGIBLE = (f"(state IN ('no_email','failed') OR (state='done' AND (LOWER(COALESCE(email_status,''))='invalid' "
+                    f"OR dup_email=1)) OR (state='done' AND (email IS NULL OR email='')))")
+
+
+def _prospeo_misses(p, need):
+    """Seamless-first: ask Prospeo about people Seamless had no usable email for. Returns True if it did anything
+    (one call per step, so Pause and Stop answer quickly)."""
+    pid = p["id"]
+    if need < 1 or p["stopping"]:
+        return False
+    ok, _why = prospeo.ready()
+    if not ok:
+        return False
+    rows = db.q(f"""SELECT * FROM contacts WHERE pull_id=? AND {PROSPEO_ELIGIBLE} AND
+                    COALESCE(prospeo_state,'') IN ('','retry') ORDER BY id LIMIT 200""", (pid,))
+    if not rows:
+        return False
+    room = prospeo.room(pid)
+    if room is not None and room < 1:
+        db.x(f"UPDATE contacts SET prospeo_state='skipped', prospeo_note=? WHERE pull_id=? AND {PROSPEO_ELIGIBLE} "
+             f"AND COALESCE(prospeo_state,'') IN ('','retry')",
+             (f"Prospeo not asked: this pull reached PROSPEO_MAX_CREDITS_PER_PULL ({cfg.PROSPEO_MAX_CREDITS_PER_PULL}).",
+              pid))
+        return False
+    n = max(1, min(50, cfg.PROSPEO_PER_STEP, need if p.get("mode") != "enrich" else 50,
+                   room if room is not None else 50))
+    batch = _prospeo_screen(pid, rows, n)
+    if not batch:
+        return True                                   # some were settled without a call; look again next step
+    res = prospeo.enrich(batch, pid)
+    _prospeo_apply(batch, res)
+    return True
+
+
+def _prospeo_screen(pid, rows, n):
+    """Free checks before asking Prospeo: enough details, not on do-not-pull, not asked in the last 90 days."""
+    block = memory.Blocklist()
+    batch = []
+    for c in rows:
+        if len(batch) >= n:
+            break
+        keys = db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"])
+        if not prospeo.lookup_input(c):
+            db.x("UPDATE contacts SET prospeo_state='skipped', prospeo_note=? WHERE id=?",
+                 ("Not enough details for Prospeo (needs LinkedIn, or full name + company website).", c["id"]))
+            continue
+        why = block.reason(c["name"], c["company"], c["domain"], c["li_url"], c["row_email"])
+        if why:
+            db.x("UPDATE contacts SET prospeo_state='skipped', prospeo_note=? WHERE id=?", (why, c["id"]))
+            continue
+        prev = prospeo.recently_asked(keys)
+        if prev and prev["result"] != "found":
+            db.x("UPDATE contacts SET prospeo_state=?, prospeo_note=? WHERE id=?",
+                 (prev["result"], "Asked Prospeo about this person recently: " + (prev["note"] or ""), c["id"]))
+            continue
+        if prev and prev["result"] == "found" and prev["email"]:
+            _apply_prospeo(c, prev["email"], "Found by Prospeo earlier (no new charge).")
+            continue
+        batch.append(c)
+    return batch
+
+
+def _prospeo_apply(batch, res):
+    for c in batch:
+        result, email, note = res.get(c["id"], ("error", None, "No answer from Prospeo."))
+        if result == "found" and email:
+            _apply_prospeo(c, email, note)
+        elif result == "error":
+            st = "retry" if (c.get("prospeo_state") or "") == "" else "error"
+            db.x("UPDATE contacts SET prospeo_state=?, prospeo_note=? WHERE id=?", (st, note, c["id"]))
+        else:
+            db.x("UPDATE contacts SET prospeo_state=?, prospeo_note=? WHERE id=?", (result, note, c["id"]))
+
+
+def _apply_prospeo(c, email, note):
+    """Use an email Prospeo verified for this person (unless it already belongs to someone else you have)."""
+    em = db.norm_email(email)
+    keys = db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"])
+    owner = db.q1("SELECT pull_id, source FROM memory WHERE key=?", ("em:" + em,))
+    other = db.q1("SELECT id FROM contacts WHERE id!=? AND LOWER(email)=? AND state='done' AND dup_email=0 LIMIT 1",
+                  (c["id"], em))
+    if other or (owner and "em:" + em not in keys and owner["source"] in ("seamless", "pull")):
+        db.x("UPDATE contacts SET prospeo_state='dup', prospeo_note=? WHERE id=?",
+             ("Prospeo's email already belongs to someone else you have, so it wasn't used.", c["id"]))
+        return
+    old = c["email"] if c["email"] and db.norm_email(c["email"]) != em else None
+    msg = ((c["research_message"] + " · ") if c["research_message"] else "") + "Email found by Prospeo (verified)."
+    db.x("""UPDATE contacts SET state='done', email=?, email_status='valid', email_source='prospeo', dup_email=0,
+            email_2=COALESCE(?, email_2), prospeo_state='found', prospeo_note=?, research_message=?,
+            resolved_at=COALESCE(resolved_at, ?) WHERE id=?""", (em, old, note, msg[:500], NOW(), c["id"]))
+    memory.remember(keys + ["em:" + em], "pull", c["pull_id"], None, "email")
+    memory.set_outcome(keys, "email")
+    guess.learn(c["first_name"], c["last_name"], em, c["domain"], "prospeo")
+
+
+def _prospeo_first(p, people):
+    """Prospeo-first (SOURCE_ORDER=prospeo,seamless): ask Prospeo before paying Seamless. Returns (found, rest)."""
+    ok, _why = prospeo.ready()
+    room = prospeo.room(p["id"])
+    if not ok or (room is not None and room < 1):
+        return 0, people
+    ask = [c for c in people if not (c.get("prospeo_state") or "") and prospeo.lookup_input(c)][:min(50, room or 50)]
+    if not ask:
+        return 0, people
+    screened = _prospeo_screen(p["id"], ask, len(ask))
+    res = prospeo.enrich(screened, p["id"]) if screened else {}
+    _prospeo_apply(screened, res)
+    found = {r["id"] for r in db.q(f"SELECT id FROM contacts WHERE id IN ({','.join('?' * len(ask))}) AND "
+                                   f"state='done'", [c["id"] for c in ask])}
+    return len(found), [c for c in people if c["id"] not in found]
+
+
+ENRICH_COLS = {
+    "first_name": ("first_name", "firstname", "first", "given_name"),
+    "last_name": ("last_name", "lastname", "last", "surname", "family_name"),
+    "full_name": ("full_name", "fullname", "name", "contact_name", "person", "contact"),
+    "company": ("company", "company_name", "organization", "organisation", "account_name", "employer",
+                "account"),
+    "website": ("website", "domain", "company_domain", "company_website", "website_url", "company_url", "url",
+                "homepage"),
+    "linkedin": ("linkedin", "linkedin_url", "linkedin_profile", "li_url", "profile_url", "person_linkedin_url",
+                 "linkedin_profile_url"),
+    "title": ("title", "job_title", "position", "role", "jobtitle"),
+    "email": ("email", "work_email", "old_email", "email_address", "contact_email"),
+}
+
+
+def enrich_columns(header):
+    """Which of your columns hold the name, company, website, LinkedIn, job title and old email."""
+    norm = [re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_") for h in header]
+    out = {}
+    for field, names in ENRICH_COLS.items():
+        for n in names:
+            if n in norm and norm.index(n) not in out.values():
+                out[field] = norm.index(n)
+                break
+    return out
+
+
+FREE_MAIL = {"gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com", "outlook.com", "live.com",
+             "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "gmx.com", "gmx.de", "web.de", "proton.me",
+             "protonmail.com", "yandex.com", "mail.com", "zoho.com", "rediffmail.com", "comcast.net", "att.net",
+             "verizon.net", "sbcglobal.net", "hotmail.co.uk", "yahoo.co.uk", "live.co.uk", "outlook.co.il",
+             "walla.co.il", "bezeqint.net", "t-online.de", "orange.fr", "free.fr", "laposte.net", "libero.it"}
+
+
+def enrich_parse(header, rows, mapping):
+    """Your rows -> people to look up. Free: nothing is spent here."""
+    from .companies import _domain
+    get = lambda r, f: (r[mapping[f]].strip() if f in mapping and mapping[f] is not None and mapping[f] < len(r)
+                        else "")
+    people = []
+    for idx, r in enumerate(rows):
+        first, last, full = get(r, "first_name"), get(r, "last_name"), get(r, "full_name")
+        if not (first and last) and full and len(full.split()) >= 2:
+            parts = full.split()
+            first, last = first or parts[0], last or parts[-1]
+        name = f"{first} {last}".strip() if first or last else full
+        old = db.norm_email(get(r, "email"))
+        site = _domain(get(r, "website"))
+        if not site and old and old.split("@")[1] not in FREE_MAIL:
+            site = _domain(old.split("@")[1])
+        li = get(r, "linkedin")
+        li = li if db.norm_li(li) else ""
+        people.append({"idx": idx, "input": list(r), "first_name": first, "last_name": last,
+                       "name": name, "company": get(r, "company"), "domain": site, "li_url": li,
+                       "title": get(r, "title"), "old_email": old})
+    return people
+
+
+def enrich_check(header, rows, mapping=None):
+    """Before anything is spent: how many rows can be looked up, how many you already have, the most it can cost."""
+    mapping = mapping if mapping is not None else enrich_columns(header)
+    people = enrich_parse(header, rows, mapping)
+    block = memory.Blocklist()
+    st = collections.Counter()
+    seen = set()
+    known = _known_index()
+    for c in people:
+        kind = _enrich_kind(c, block, seen, known)[0]
+        st[kind] += 1
+    return {"columns": {k: (header[v] if v is not None and v < len(header) else None) for k, v in mapping.items()},
+            "mapping": mapping, "rows": len(people), "counts": dict(st),
+            "seamless_max": st["lookup"], "seamless_on": cfg.ENRICH_USE_SEAMLESS,
+            "prospeo_ready": prospeo.ready()[0], "prospeo_why": prospeo.ready()[1],
+            "guessing_ready": verifier.ready()[0],
+            "default_max_credits": math.ceil(st["lookup"] * cfg.ENRICH_DEFAULT_MAX_CREDITS) if st["lookup"] else 0,
+            "sample": [{k: c[k] for k in ("name", "company", "domain", "li_url", "title")} for c in people[:5]]}
+
+
+def _enrich_kind(c, block, seen, known):
+    """('lookup'|'have'|'looked_before'|'thin'|'dnp'|'dup', detail)."""
+    keys = db.person_keys(c["name"], c["company"], c["li_url"])
+    if keys and seen & set(keys):
+        return "dup", None
+    seen.update(keys)
+    has_name = bool(c["first_name"] and c["last_name"])
+    if not (db.norm_li(c["li_url"]) or (has_name and (c["company"] or c["domain"]))):
+        return "thin", None
+    why = block.reason(c["name"], c["company"], c["domain"], c["li_url"], None)
+    if why:
+        return "dnp", why
+    have = next((known[k] for k in keys if k in known), None)
+    if have:
+        return "have", have
+    hit = memory.find(keys)
+    if hit:
+        for a in accounts.all_accounts():              # researched in Seamless before: its saved contact is free
+            rec = memory.saved_match(a["id"], c["name"], c["company"], c["li_url"])
+            email = pick_email(rec)[0] if rec else None
+            if email and db.norm_email(email):
+                return "have", {"email": db.norm_email(email)}
+        return "looked_before", hit
+    return "lookup", None
+
+
+def _known_index():
+    """Every person you already have a usable email for, by memory key (built once per file)."""
+    idx = {}
+    for r in db.q(f"SELECT * FROM contacts WHERE {DELIVERABLE} ORDER BY id DESC"):
+        for k in db.person_keys(r["name"], r["company"], r["li_url"], r["row_email"]):
+            if not k.startswith("em:"):
+                idx.setdefault(k, r)
+    return idx
+
+
+def create_enrich(name, header, rows, mapping=None, max_credits=None, account_choice="auto"):
+    """A pull of mode 'enrich': your rows are the people; nothing is searched."""
+    if not rows:
+        raise PullError("That file has no rows.")
+    if len(rows) > cfg.ENRICH_MAX_ROWS:
+        raise PullError(f"That file has {len(rows):,} rows; the most is {cfg.ENRICH_MAX_ROWS:,} (ENRICH_MAX_ROWS).")
+    mapping = mapping if mapping is not None else enrich_columns(header)
+    if not any(f in mapping for f in ("linkedin", "full_name", "last_name")):
+        raise PullError("Couldn't find a name or LinkedIn column. Tell Lead Puller which column is which.")
+    order = accounts.ordered_for(account_choice or "auto")
+    if cfg.ENRICH_USE_SEAMLESS and not order:
+        raise PullError("No Seamless account is switched on. Add your API key on the Accounts page.")
+    people = enrich_parse(header, rows, mapping)
+    block = memory.Blocklist()
+    seen = set()
+    known = _known_index()
+    kinds = [(c, *_enrich_kind(c, block, seen, known)) for c in people]
+    lookups = sum(1 for _, k, _ in kinds if k == "lookup")
+    if max_credits in (None, "", 0, "0"):
+        max_credits = max(1, math.ceil(lookups * cfg.ENRICH_DEFAULT_MAX_CREDITS))
+    max_credits = int(max_credits)
+    if max_credits < 1:
+        raise PullError("Max credits must be at least 1.")
+    usable = sum(1 for _, k, _ in kinds if k not in ("thin", "dnp", "dup"))
+    now = NOW()
+    aid = order[0]["id"] if order else None
+    pid = db.x("""INSERT INTO pulls(name,prompt,filters_json,target,max_credits,max_per_company,account_choice,status,
+                  created_at,updated_at,mode,enrich_header) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+               ((name or f"Enrich {len(rows):,} contacts")[:90], "", "{}", max(1, usable), max_credits, 0,
+                str(account_choice or "auto"), "queued", now, now, "enrich", json.dumps(header)))
+    with db.tx() as con:
+        for c, kind, detail in kinds:
+            state, reason, skind, msg, email, src, ffree = "kept", None, None, None, None, None, 0
+            if kind == "thin":
+                state, reason, skind = "skipped", "Not enough to look up (needs LinkedIn, or full name + company)", "thin"
+            elif kind == "dnp":
+                state, reason, skind = "skipped", detail, "dnp"
+            elif kind == "dup":
+                state, reason, skind = "skipped", "Same person twice in your file", "filedup"
+            elif kind == "have":
+                state, msg, email, src, ffree = "done", "You already had this email (no credits).", detail["email"], \
+                    "already", 1
+            elif kind == "looked_before":
+                state, msg = "no_email", "Already looked up in Seamless before, so not paid for again."
+            con.execute(
+                """INSERT INTO contacts(pull_id,account_id,state,skip_reason,skip_kind,name,first_name,last_name,title,
+                   company,domain,li_url,research_message,email,email_status,email_source,filled_free,resolved_at,
+                   enrich_idx,enrich_input,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (pid, aid, state, reason, skind, c["name"], c["first_name"], c["last_name"], c["title"], c["company"],
+                 c["domain"], c["li_url"], msg, email, "valid" if email else None, src, ffree,
+                 now if state in ("done", "no_email") else None, c["idx"], json.dumps(c["input"]), now))
+    return pid
+
+
+def enrich_rows(pid):
+    """Your file back, in its order, with the results added. Rows for the same person twice share the answer."""
+    p = db.get_pull(pid)
+    header = json.loads(p.get("enrich_header") or "[]")
+    rows = db.q("SELECT * FROM contacts WHERE pull_id=? ORDER BY enrich_idx, id", (pid,))
+    by_key = {}
+    for c in rows:
+        if c["skip_kind"] != "filedup":
+            for k in db.person_keys(c["name"], c["company"], c["li_url"]):
+                by_key.setdefault(k, c)
+    out = []
+    for c in rows:
+        src = c
+        if c["skip_kind"] == "filedup":
+            src = next((by_key[k] for k in db.person_keys(c["name"], c["company"], c["li_url"]) if k in by_key), c)
+        usable = src["state"] == "done" and src["email"] and (src["email_status"] or "").lower() != "invalid" \
+            and not src["dup_email"]
+        note = src["skip_reason"] if src["state"] == "skipped" else (src["research_message"] or src["prospeo_note"] or "")
+        if src["state"] in ("no_email", "failed") and src["prospeo_note"] and src["prospeo_state"] not in ("found",):
+            note = ((src["research_message"] or "") + " · Prospeo: " + src["prospeo_note"]).strip(" ·")
+        out.append({"input": json.loads(c["enrich_input"] or "[]"), "email": src["email"] if usable else "",
+                    "email_status": "valid" if usable and src["email_source"] in ("prospeo", "guessed", "already")
+                    else (src["email_status"] or "" if usable else ""),
+                    "source": SOURCE_LABEL.get(src["email_source"] or "", "") if usable else "",
+                    "title": src["title"] or "", "linkedin": src["li_url"] or "", "company": src["company"] or "",
+                    "website": src["domain"] or "", "note": note or ("" if usable else "No email found.")})
+    return header, out
+
+
+SOURCE_LABEL = {"seamless": "seamless", "prospeo": "prospeo (verified)", "guessed": "guessed (MillionVerifier: valid)",
+                "already": "already had"}
 
 
 # ================================================================ answers
@@ -1174,6 +1570,11 @@ def _apply_result(row, account_id):
         # is looked up free in your Seamless saved contacts when the pull finishes.
         cand = db.q1("SELECT * FROM contacts WHERE id=?", (req["contact_id"],))
         c = cand if cand and _same_person(cand, rec) else None
+    looked_up = None
+    if not c and req["contact_id"]:
+        cand = db.q1("SELECT * FROM contacts WHERE id=?", (req["contact_id"],))
+        if cand and not cand["sid"]:
+            looked_up = cand                     # 2.3: a person from your file, looked up by LinkedIn / name + company
     late = bool(req["gave_up"])
     now = NOW()
     first_time = not req["status"]
@@ -1183,6 +1584,14 @@ def _apply_result(row, account_id):
         db.log_credits(req["pull_id"], account_id, "research", -1, None,
                        "already researched before in Seamless: not charged" if status != "error" else
                        "Seamless error on one person: not charged")
+    if not c and looked_up and looked_up["state"] in ("queued", "timed_out"):
+        msg = ("Seamless answered with a different person, so it wasn't used." if status == "done" and rec else
+               (row.get("message") or f"Seamless: {status}"))
+        db.x("UPDATE contacts SET state='no_email', research_status=?, research_message=?, resolved_at=? WHERE id=?",
+             (status, msg, now, looked_up["id"]))
+        memory.set_outcome(db.person_keys(looked_up["name"], looked_up["company"], looked_up["li_url"],
+                                          looked_up["row_email"]), "no_email")
+        return
     if not c:
         return
     if c["state"] not in ("queued", "timed_out"):

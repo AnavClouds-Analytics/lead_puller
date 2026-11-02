@@ -7,8 +7,8 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import claude, db, dnscheck, engine, guess, seamless, verifier
-from tests.fakes import FakeClaude, FakeMillionVerifier, FakeSeamless, email_for
+from app import claude, db, dnscheck, engine, guess, prospeo, seamless, verifier
+from tests.fakes import FakeClaude, FakeMillionVerifier, FakeProspeo, FakeSeamless, email_for
 
 ENV = {"APP_PASSWORD": "test-pass-123", "COOKIE_SECURE": "0", "POLL_SECONDS": "0", "RATE_LIMIT_PER_MIN": "100000",
        "MONTHLY_CREDIT_BUDGET": "0", "ACCOUNT_RESERVE": "0", "LOW_BALANCE_WARNING": "0", "UPDATED_WITHIN_MONTHS": "0",
@@ -45,6 +45,11 @@ def env(tmp_path, monkeypatch):
     fake.mv = mv
     monkeypatch.setattr(verifier, "TRANSPORT", httpx.MockTransport(mv.handler))
     monkeypatch.setattr(verifier, "NOW", clock)
+    pr = FakeProspeo(fake)                     # 2.3: off until a test (or LP_TEST_PROSPEO=1) adds the key
+    pr.clock = clock
+    fake.pr = pr
+    monkeypatch.setattr(prospeo, "TRANSPORT", httpx.MockTransport(pr.handler))
+    monkeypatch.setattr(prospeo, "NOW", clock)
     monkeypatch.setattr(guess, "NOW", clock)
     monkeypatch.setattr(dnscheck, "LOOKUP", lambda d: "no" if d in ("acme13.com", "acme26.com") else "yes")
     from app import main
@@ -55,12 +60,20 @@ def env(tmp_path, monkeypatch):
     assert r.status_code == 200, r.text
     if os.environ.get("LP_TEST_GUESSING") == "1":
         add_verifier(client)          # run the whole suite again with email guessing on
+    if os.environ.get("LP_TEST_PROSPEO") == "1":
+        add_prospeo(client)           # 2.3: and again with Prospeo filling what Seamless misses
     yield client, fake, clock
     client.__exit__(None, None, None)
 
 
 def add_verifier(client, key="mv-key-7d3e"):
     r = client.post("/api/verifier", json={"api_key": key})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def add_prospeo(client, key="prospeo-key-9f1c"):
+    r = client.post("/api/prospeo", json={"api_key": key})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -99,6 +112,10 @@ def check_books(fake):
         assert logged == fake.charged_by_key.get(a["api_key"], 0), (a["name"], logged, fake.charged_by_key)
     assert db.q1("SELECT COUNT(*) n FROM ledger WHERE account_id IS NULL AND credits!=0")["n"] == 0
     assert fake.foreign_sid_rejected == 0, "sent one account's search results to another account"
+    pr = getattr(fake, "pr", None)
+    if pr is not None:                # 2.3: Prospeo's books too, to the credit
+        logged = db.q1("SELECT COALESCE(SUM(cost),0) s FROM prospeo_log")["s"]
+        assert logged == pr.charged, ("prospeo", logged, pr.charged)
 
 
 def check_people(fake):
@@ -121,6 +138,10 @@ def check_people(fake):
             continue                      # a test-made shared address (several people)
         assert c["email"] == email_for(p) or c["email"] == fake.email_override.get(pid)
         assert c["name"] == p["name"] and c["company"] == p["company"], (c["email"], c["name"], p["name"])
+    # 2.3: a Prospeo email is only ever used when Prospeo said VERIFIED and it's that person's own mailbox (above);
+    # it is never used when Seamless already gave a usable email.
+    for c in db.q("SELECT * FROM contacts WHERE email_source='prospeo'"):
+        assert c["prospeo_state"] == "found", c
     # Guessed people were never researched in Seamless, and every guess was checked "ok" first.
     for c in db.q("SELECT * FROM contacts WHERE email_source='guessed'"):
         assert c["submitted_at"] is None and c["request_id"] is None

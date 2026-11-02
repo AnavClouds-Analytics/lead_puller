@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import accounts, claude, companies, db, engine, exports, guess, importer, memory, seamless, verifier
+from . import accounts, claude, companies, db, engine, exports, guess, importer, memory, prospeo, seamless, verifier
 from . import filters as F
 from .config import APP_VERSION, cfg, shown_settings
 
@@ -42,7 +42,8 @@ def _err(status):
     return handler
 
 
-for _exc in (engine.PullError, seamless.SeamlessError, claude.ClaudeError, verifier.VerifierError, ValueError):
+for _exc in (engine.PullError, seamless.SeamlessError, claude.ClaudeError, verifier.VerifierError,
+             prospeo.ProspeoError, ValueError):
     app.add_exception_handler(_exc, _err(400))
 
 
@@ -115,8 +116,8 @@ def _overview():
             "budget_left": max(0, budget - spent) if budget else None, "spending_enabled": cfg.SPENDING_ENABLED,
             "shared_pools": _shared_pools(), "low": [a["name"] for a in accs if a["enabled"] and a["low"]],
             "people_pulled": db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL OR "
-                                   "email_source='guessed'")["n"],
-            "verifier": verifier.status(),
+                                   "email_source IN ('guessed','prospeo')")["n"],
+            "verifier": verifier.status(), "prospeo": prospeo.status(),
             "seamless_saved": db.q1("SELECT COUNT(*) n FROM saved_contacts")["n"],
             "emails_in_memory": db.q1("SELECT COUNT(*) n FROM memory WHERE key LIKE 'em:%'")["n"]}
 
@@ -227,6 +228,21 @@ def _pull_out(pid):
                 "checks": sum(vl.values()), "valid": vl.get("ok", 0), "catch_all": vl.get("catch_all", 0),
                 "not_valid": sum(n for k, n in vl.items() if k not in ("ok", "catch_all")),
                 "ready": verifier.ready()[0], "why_not": verifier.ready()[1]}
+    pl = {r["result"]: (r["n"], r["c"]) for r in db.q("SELECT result, COUNT(*) n, COALESCE(SUM(cost),0) c FROM "
+                                                     "prospeo_log WHERE pull_id=? GROUP BY result", (pid,))}
+    p["prospeo"] = {"found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='prospeo' AND "
+                                   f"{engine.DELIVERABLE}", (pid,))["n"],
+                    "asked": sum(v[0] for k, v in pl.items() if k != "charge"),
+                    "credits": prospeo.spent(pid), "none": pl.get("none", (0, 0))[0],
+                    "mismatch": pl.get("mismatch", (0, 0))[0], "errors": pl.get("error", (0, 0))[0],
+                    "waiting": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND {engine.PROSPEO_ELIGIBLE} "
+                                     f"AND COALESCE(prospeo_state,'') IN ('','retry')", (pid,))["n"],
+                    "ready": prospeo.ready()[0], "why_not": prospeo.ready()[1], "order": prospeo.order(),
+                    "cap": cfg.PROSPEO_MAX_CREDITS_PER_PULL}
+    if p.get("mode") == "enrich":
+        p["enrich"] = {"rows": db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=?", (pid,))["n"],
+                       "already": db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='already'",
+                                        (pid,))["n"]}
     if p.get("mode") == "companies":
         cs = db.q1("SELECT COUNT(*) n, SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END) r FROM pull_companies "
                    "WHERE pull_id=?", (pid,))
@@ -237,7 +253,7 @@ def _pull_out(pid):
                             "SELECT COUNT(*) n FROM research_requests WHERE pull_id=? AND gave_up=1", (pid,))["n"],
                         "oldest_pending_at": oldest, "skips": skips,
                         "downloadable": len(exports.anavmail_rows(pid)) if p["status"] == "done" else emails},
-              "slices": slices, "account": acct["name"] if acct else None, "summary": F.summary(p["filters"]),
+              "slices": slices, "account": acct["name"] if acct else None, "summary": "Enrich contacts from your file" if p.get("mode") == "enrich" else F.summary(p["filters"]),
               "overview": _overview()})
     return p
 
@@ -311,7 +327,8 @@ def list_pulls(offset: int = 0, limit: int = 0, q: str = ""):
         out.append({"id": p["id"], "name": p["name"], "status": p["status"], "stopping": p["stopping"],
                     "created_at": p["created_at"], "target": p["target"], "emails": st["emails"], "credits": cr,
                     "per_email": round(cr / st["emails"], 2) if st["emails"] else None,
-                    "accounts": ", ".join(a["name"] for a in acc), "stop_reason": p["stop_reason"]})
+                    "accounts": ", ".join(a["name"] for a in acc), "stop_reason": p["stop_reason"],
+                    "mode": p.get("mode") or "filters"})
     return {"rows": out, "total": total}
 
 
@@ -334,6 +351,9 @@ def pull_action(pid: int, action: str):
         engine.finish_now(pid)
     elif action == "rerun":
         p = db.get_pull(pid)
+        if p.get("mode") == "enrich":
+            raise engine.PullError("An enrichment runs once. Upload the file again to enrich it again (nobody is paid "
+                                   "for twice).")
         clist = None
         if p.get("mode") == "companies":
             clist = [{"name": r["name"], "domain_raw": r["domain"], "signal": r["signal"]} for r in
@@ -369,10 +389,11 @@ def stop_all():
 
 PEOPLE_COLS = """id, name, first_name, last_name, title, company, domain, li_url, country, city, size, industry, state,
                  skip_reason, skip_kind, email, email_status, phone, research_status, research_message, filled_free,
-                 dup_email, email_source, guess_note"""
+                 dup_email, email_source, guess_note, prospeo_state, prospeo_note"""
 PEOPLE_VIEWS = {
     "emails": "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0",
-    "no_email": "submitted_at IS NOT NULL AND (email IS NULL OR email='') AND state!='queued'",
+    "no_email": "(email IS NULL OR email='') AND (state IN ('no_email','failed','timed_out','unconfirmed') OR "
+                "(submitted_at IS NOT NULL AND state!='queued'))",
     "researched": "submitted_at IS NOT NULL",
     "skipped": "state='skipped'",
     "waiting": "state IN ('kept','queued')",
@@ -417,6 +438,12 @@ def download(pid: int, kind: str = "anavmail", format: str = "csv", columns: str
     elif kind == "no_email":
         cols = exports.parse_columns(columns, exports.NO_EMAIL_COLUMNS)
         rows, name = exports.no_email_rows(pid), f"{base}-no-email"
+    elif kind == "enriched":
+        if p.get("mode") != "enrich":
+            raise HTTPException(400, "Only for Enrich contacts.")
+        header, rows = engine.enrich_rows(pid)
+        data, mime, ext = exports.enriched_file(header, rows, format)
+        return _download(data, f"{base}-enriched.{ext}", mime)
     else:
         cols = exports.parse_columns(columns, [k for k, _, _ in exports.COLUMNS])
         rows, name = exports.all_rows(pid), f"{base}-everything"
@@ -527,6 +554,122 @@ async def verifier_set(request: Request):
 def verifier_delete():
     verifier.remove_key()
     return verifier.status()
+
+
+# ---------------------------------------------------------------- 2.3: Prospeo (second source)
+@app.get("/api/prospeo", dependencies=AUTH)
+def prospeo_status():
+    return prospeo.status()
+
+
+@app.post("/api/prospeo", dependencies=AUTH)
+async def prospeo_set(request: Request):
+    b = await request.json()
+    if b.get("api_key"):
+        prospeo.set_key(b["api_key"])
+    if "enabled" in b:
+        prospeo.set_enabled(bool(b["enabled"]))
+    if b.get("check"):
+        prospeo.refresh_credits()
+    return prospeo.status()
+
+
+@app.delete("/api/prospeo", dependencies=AUTH)
+def prospeo_delete():
+    prospeo.remove_key()
+    return prospeo.status()
+
+
+# ---------------------------------------------------------------- 2.3: Enrich contacts
+def _read_table(raw, filename):
+    """CSV (or Excel) -> (header, rows). Empty rows are dropped."""
+    name = (filename or "").lower()
+    if name.endswith((".xlsx", ".xlsm")):
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(raw), read_only=True, data_only=True)
+        ws = wb.active
+        it = ws.iter_rows(values_only=True)
+        header = [str(h).strip() if h is not None else "" for h in next(it, [])]
+        rows = [[("" if v is None else str(v)).strip() for v in r] for r in it]
+    else:
+        text = raw.decode("utf-8-sig", errors="replace")
+        try:
+            dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(io.StringIO(text), dialect)
+        header = [h.strip() for h in next(reader, [])]
+        rows = [[v.strip() for v in r] for r in reader]
+    rows = [r + [""] * (len(header) - len(r)) for r in rows if any((v or "").strip() for v in r)]
+    if not header or not rows:
+        raise engine.PullError("That file is empty (it needs a header row and at least one person).")
+    return header, rows
+
+
+@app.post("/api/enrich/check", dependencies=AUTH)
+async def enrich_check(file: UploadFile = File(...)):
+    """Free: read the file, find the columns, and say what it would cost. The file is kept for an hour."""
+    raw = await file.read()
+    if len(raw) > 30 * 1024 * 1024:
+        raise engine.PullError("That file is bigger than 30 MB.")
+    header, rows = _read_table(raw, file.filename)
+    if len(rows) > cfg.ENRICH_MAX_ROWS:
+        raise engine.PullError(f"That file has {len(rows):,} rows; the most is {cfg.ENRICH_MAX_ROWS:,} (ENRICH_MAX_ROWS).")
+    token = secrets.token_hex(12)
+    db.set_meta("enrich_upload:" + token, {"at": time.time(), "header": header, "rows": rows,
+                                           "file": (file.filename or "upload.csv")[:120]})
+    for r in db.q("SELECT k, v FROM meta WHERE k LIKE 'enrich_upload:%'"):
+        try:
+            if time.time() - json.loads(r["v"]).get("at", 0) > 3600:
+                db.x("DELETE FROM meta WHERE k=?", (r["k"],))
+        except ValueError:
+            db.x("DELETE FROM meta WHERE k=?", (r["k"],))
+    out = engine.enrich_check(header, rows)
+    out.update(token=token, header=header, file=(file.filename or "upload.csv")[:120])
+    return out
+
+
+def _enrich_upload(token):
+    up = db.get_meta("enrich_upload:" + (token or "")) if token else None
+    if not up:
+        raise engine.PullError("Upload the file again (it's kept for an hour after checking).")
+    return up
+
+
+def _mapping(b, header):
+    m = b.get("mapping")
+    if not isinstance(m, dict):
+        return None
+    out = {}
+    for k, v in m.items():
+        if k in engine.ENRICH_COLS and v not in (None, "", -1):
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= v < len(header):
+                out[k] = v
+    return out
+
+
+@app.post("/api/enrich/recheck", dependencies=AUTH)
+async def enrich_recheck(request: Request):
+    """Free: the same file with the columns you picked."""
+    b = await request.json()
+    up = _enrich_upload(b.get("token"))
+    out = engine.enrich_check(up["header"], up["rows"], _mapping(b, up["header"]))
+    out.update(token=b.get("token"), header=up["header"], file=up["file"])
+    return out
+
+
+@app.post("/api/enrich", dependencies=AUTH)
+async def enrich_start(request: Request):
+    b = await request.json()
+    up = _enrich_upload(b.get("token"))
+    pid = engine.create_enrich(b.get("name") or f"Enrich: {up['file']}", up["header"], up["rows"],
+                               _mapping(b, up["header"]), b.get("max_credits"), str(b.get("account") or "auto"))
+    db.x("DELETE FROM meta WHERE k=?", ("enrich_upload:" + b.get("token"),))
+    return _pull_out(pid)
 
 
 # ---------------------------------------------------------------- do-not-pull

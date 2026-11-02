@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS verify_log(id INTEGER PRIMARY KEY, at REAL, pull_id I
   email TEXT, result TEXT, cached INTEGER DEFAULT 0, credits_after INTEGER, note TEXT);
 CREATE INDEX IF NOT EXISTS vl_pull ON verify_log(pull_id);
 CREATE INDEX IF NOT EXISTS vl_email ON verify_log(email, at);
+CREATE TABLE IF NOT EXISTS prospeo(id INTEGER PRIMARY KEY CHECK(id=1), api_key TEXT, enabled INTEGER DEFAULT 1,
+  credits INTEGER, credits_at REAL, plan TEXT, last_error TEXT, errors_in_row INTEGER DEFAULT 0, paused_until REAL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS prospeo_log(id INTEGER PRIMARY KEY, at REAL, pull_id INTEGER, contact_id INTEGER,
+  person_key TEXT, result TEXT, cost INTEGER DEFAULT 0, email TEXT, note TEXT);
+CREATE INDEX IF NOT EXISTS pl_pull ON prospeo_log(pull_id);
+CREATE INDEX IF NOT EXISTS pl_key ON prospeo_log(person_key, at);
 """
 # Columns added after 2.0 (old databases get them on start).
 MIGRATIONS = {
@@ -87,6 +93,10 @@ MIGRATIONS = {
     # 2.2: accept_all_checked = a made-up address was checked at this company (accept_all = it came back valid too)
     "domain_guess": [("accept_all_checked", "INTEGER DEFAULT 0"), ("probe_tries", "INTEGER DEFAULT 0")],
 }
+# 2.3: Prospeo (second source) and the Enrich contacts page
+MIGRATIONS["contacts"] += [("prospeo_state", "TEXT"), ("prospeo_note", "TEXT"), ("enrich_idx", "INTEGER"),
+                           ("enrich_input", "TEXT")]
+MIGRATIONS["pulls"] += [("enrich_header", "TEXT")]
 
 _local = threading.local()
 _path = None

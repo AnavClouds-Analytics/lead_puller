@@ -1,10 +1,51 @@
-# Lead Puller 2.2
+# Lead Puller 2.3
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## New in 2.3 (Prospeo as a second source, and Enrich contacts)
+
+- **Prospeo fills what Seamless misses.** When Seamless has no usable email for a person (not found, no email, or
+  an invalid one), Lead Puller asks Prospeo. Only emails Prospeo has **verified** are used, and only when the answer
+  is the same person (same LinkedIn, or same name and company website); anything else is thrown away. Prospeo charges
+  1 credit per email it finds, nothing when it has none, and nothing for the same person again within 90 days.
+  Add the Prospeo key on the **Accounts** page (checked with a free call first; a key Prospeo doesn't accept is never
+  saved). Without a key, Lead Puller works exactly as before.
+- **Order is one .env line:** `SOURCE_ORDER=seamless,prospeo` (default: Seamless first, Prospeo for the misses) or
+  `prospeo,seamless` (Prospeo first; Seamless only for people Prospeo has no verified email for).
+- **Limits:** `PROSPEO_MAX_CREDITS_PER_PULL` (default 500), `PROSPEO_MIN_CREDITS_LEFT` (stops asking below 20),
+  errors pause Prospeo for 30 minutes after 3 in a row. Prospeo's credits are logged apart from Seamless's, so the
+  Seamless spending history stays exact.
+- **Enrich contacts (new tab).** Upload a CSV or Excel file of people you already have (first/last or full name,
+  company, website, LinkedIn, job title, old email; Lead Puller finds the columns and you can change them). Before
+  anything is spent it shows how many rows will be looked up, how many you already have (free), how many were looked
+  up in Seamless before (never paid twice: Prospeo only) and which rows don't have enough details. Each person:
+  already have the email → free; guess + MillionVerifier where the company's format is known → free in Seamless;
+  then Seamless (by LinkedIn, or name + company, 1 credit) and Prospeo, in your SOURCE_ORDER. Download: **your own
+  file, same rows and order, with Email, Email status, How we got the email, Job title, LinkedIn, Company website and
+  a note added on the right** (CSV or Excel), plus the usual AnavMail file. Settings: `ENRICH_MAX_ROWS`,
+  `ENRICH_USE_SEAMLESS` (0 = only free checks and Prospeo), `ENRICH_DEFAULT_MAX_CREDITS`.
+- The download's "How we got the email" column now also says `prospeo (verified)` and `already had`.
+
+### Upgrading to 2.3 (from 2.1 or 2.2)
+
+Replace the code, keep `data/` and `.env`. Nothing is redone from scratch:
+
+```bash
+cd lead-puller-2 && docker compose down
+cp -r data ../lead-puller-2-data-backup            # backup first
+# unzip lead-puller-2.3.0.zip over this folder (it never contains data/ or .env)
+docker compose up -d --build
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.3.0"}
+```
+
+The database gets its new columns and tables on start (tested on a 2.2 database: every pull, person, credit and
+setting is kept). No `.env` change is needed: every new setting has a default and is listed in `.env.example`.
+Then add the Prospeo key on the Accounts page. Rollback: stop or finish any running enrichment first, then unzip
+the previous version and rebuild.
 
 ## New in 2.2 (fewer Seamless credits per email on company lists)
 
@@ -173,9 +214,10 @@ Seamless charged each key.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 107 tests, ~15 s, against a fake Seamless + fake MillionVerifier
+python -m pytest -q                       # 143 tests, ~15 s, against a fake Seamless + fake MillionVerifier
 FAKE_SEED=7 python -m pytest -q           # same tests on a differently shuffled fake
 LP_TEST_GUESSING=1 python -m pytest -q    # every test again with email guessing switched on
+LP_TEST_PROSPEO=1 python -m pytest -q     # every test again with Prospeo switched on
 ```
 
 Or inside the container: `docker compose exec leadpuller python -m pytest -q`.

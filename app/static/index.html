@@ -187,12 +187,13 @@ function pagedTable(host, key, o) {
 }
 
 // ------------------------------------------------------------ shell
-const NAV = [["#/new","New pull"],["#/history","History"],["#/accounts","Accounts"],["#/dnp","Do-not-pull"],["#/settings","Settings"]];
+const NAV = [["#/new","New pull"],["#/enrich","Enrich contacts"],["#/history","History"],["#/accounts","Accounts"],["#/dnp","Do-not-pull"],["#/settings","Settings"]];
 function balHtml(ov) {
   const accs = (ov.accounts||[]).filter(a=>a.enabled);
   const mv = ov.verifier || {};
   return accs.map(a=>`<span>${esc(a.name)}: <b>${fmt(a.balance)}</b></span>`).join("") +
     (mv.has_key ? `<span>MillionVerifier: <b>${fmt(mv.credits)}</b> checks</span>` : "") +
+    ((ov.prospeo||{}).has_key ? `<span>Prospeo: <b>${fmt(ov.prospeo.credits)}</b></span>` : "") +
     `<span>This month: <b>${fmt(ov.spent_this_month)}</b>${ov.monthly_budget?` of ${fmt(ov.monthly_budget)}`:""}</span>
      <button class="btn small danger" id="stopAll" title="Stops every pull now. People already sent to Seamless still come back.">Emergency stop</button>`;
 }
@@ -221,11 +222,11 @@ async function route() {
   META = await api("/api/meta");
   if (my !== ROUTE_SEQ) return;
   const h = location.hash || "#/new"; let m;
-  const narrow = /^#\/(pull|accounts|dnp|settings)/.test(h);
+  const narrow = /^#\/(pull|accounts|dnp|settings|enrich)/.test(h);
   $("#app").innerHTML = shell('<div class="muted">Loading…</div>', narrow);
   if ((m = h.match(/^#\/pull\/(\d+)/))) return renderPull(+m[1]);
   if ((m = h.match(/^#\/new(?:\?from=(\d+))?/))) return renderNew(m[1] ? +m[1] : null);
-  ({"#/history":renderHistory, "#/accounts":renderAccounts, "#/dnp":renderDnp, "#/settings":renderSettings}[h] || (()=>renderNew(null)))();
+  ({"#/history":renderHistory, "#/enrich":renderEnrich, "#/accounts":renderAccounts, "#/dnp":renderDnp, "#/settings":renderSettings}[h] || (()=>renderNew(null)))();
 }
 window.addEventListener("hashchange", route);
 document.addEventListener("click", e => {
@@ -521,7 +522,8 @@ function drawLive(p) {
     p.status==="paused" ? `<button class="btn primary" data-act="resume">Resume</button>` : "",
     p.status!=="done" && !p.stopping ? `<button class="btn danger" data-act="stop">Stop (keep what's found)</button>` : "",
     p.status!=="done" && onlyWaiting ? `<button class="btn" data-act="finish-now">Finish now</button>` : "",
-    p.status==="done" ? `<button class="btn" data-act="rerun">Run again, new people only</button><a class="btn" href="#/new?from=${p.id}">Change filters</a><button class="btn danger" data-act="delete">Delete</button>` : ""].join("");
+    p.status==="done" && p.mode!=="enrich" ? `<button class="btn" data-act="rerun">Run again, new people only</button><a class="btn" href="#/new?from=${p.id}">Change filters</a>` : "",
+    p.status==="done" ? `<button class="btn danger" data-act="delete">Delete</button>` : ""].join("");
   $$("#actions [data-act]").forEach(b => b.onclick = () => pullAction(p, b));
   const pctE = p.target ? Math.min(100, s.emails/p.target*100) : 0, pctC = p.max_credits ? Math.min(100, s.credits/p.max_credits*100) : 0;
   const wait = s.oldest_pending_at ? Math.max(0, Math.round((s.oldest_pending_at + META.defaults.wait_minutes*60 - Date.now()/1000)/60)) : null;
@@ -537,7 +539,7 @@ function drawLive(p) {
         <div class="stat"><div class="k">Cost per email</div><div class="v">${s.per_email ?? "—"}</div><div class="h">${fmt(s.search_credits)} to search · ${fmt(s.research_credits)} to research</div></div>
         <div class="stat"><div class="k">Account in use</div><div class="v" style="font-size:18px">${esc(p.account||"—")}</div><div class="h">${META.overview.accounts.filter(a=>a.enabled).length>1?"switches to the next account if it runs low":"add a second account to continue when this one runs low"}</div></div></div></section>
     <section class="card" aria-label="So far"><h2>So far</h2>
-      <div class="grid g4"><div><div style="font-size:20px;font-weight:700">${fmt(s.seen)}</div><div class="small muted">people Seamless showed</div></div>
+      <div class="grid g4"><div><div style="font-size:20px;font-weight:700">${fmt(s.seen)}</div><div class="small muted">${p.mode==="enrich"?"people in your file":"people Seamless showed"}</div></div>
         <div><div style="font-size:20px;font-weight:700">${fmt(s.researched)}</div><div class="small muted">researched (paid)</div></div>
         <div><div style="font-size:20px;font-weight:700">${fmt(s.emails)}</div><div class="small muted">got a usable email</div></div>
         <div><div style="font-size:20px;font-weight:700">${fmt(skipTotal)}</div><div class="small muted">skipped, not paid for</div></div></div>
@@ -545,6 +547,7 @@ function drawLive(p) {
         ${s.skips.map(r=>`<div class="skiprow small"><button type="button" class="linkbtn" data-skip="${esc(r.kind)}">${esc(SKIP[r.kind]||r.example||r.kind)}</button><b>${fmt(r.n)}</b></div>`).join("")}</div>` : ""}
       <div class="small muted" style="margin-top:10px">Memory holds ${fmt(p.overview.people_pulled)} people pulled with this tool and ${fmt(p.overview.seamless_saved)} contacts already in your Seamless accounts (${fmt(p.overview.emails_in_memory)} emails), on every account.</div></section>
     ${guessCard(p)}
+    ${prospeoCard(p)}
 
     ${p.slices.length ? `<section class="card" aria-label="Smart scanning"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Smart scanning</h2><span class="small muted">${p.mode==="companies"?"One search per 100 companies. Companies that already have enough people are left out of later searches.":"Search split by company size, freshest first. A slice is left for later when new people get too expensive to find."}</span></div>
       <div class="tablewrap"><table><thead><tr><th>Slice</th><th class="right">Pages</th><th class="right">New people</th><th class="right">Per new email</th><th>Status</th></tr></thead><tbody>
@@ -565,6 +568,22 @@ function guessCard(p) {
     <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else. At a new company the common formats are tried first, after checking that the company doesn't accept every address.
       ${!g.ready && g.why_not ? `<div style="color:var(--warn);margin-top:4px">Guessing is paused right now: ${esc(g.why_not)}</div>` : ""}</div></section>`;
 }
+function prospeoCard(p) {
+  const r = p.prospeo || {}, pr = (p.overview||{}).prospeo || {};
+  if (!pr.has_key && !r.asked) return "";
+  const first = r.order === "prospeo_first";
+  return `<section class="card" aria-label="Prospeo"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Prospeo <span class="small muted" style="font-weight:500">· ${first?"asked before Seamless":"fills what Seamless misses"}</span></h2>
+      ${r.ready?'<span class="badge b-ok">Working</span>':`<span class="badge b-warn">Not asked now</span>`}</div>
+    <div class="grid g4"><div class="stat"><div class="k">Emails from Prospeo</div><div class="v" style="color:var(--ok)">${fmt(r.found)}</div><div class="h">verified by Prospeo</div></div>
+      <div class="stat"><div class="k">Asked</div><div class="v">${fmt(r.asked)}</div><div class="h">${fmt(r.none)} had no verified email (free)</div></div>
+      <div class="stat"><div class="k">Prospeo credits</div><div class="v">${fmt(r.credits)}</div><div class="h">${r.cap?`of ${fmt(r.cap)} max for this ${p.mode==="enrich"?"file":"pull"}`:"no limit per pull"}</div></div>
+      <div class="stat"><div class="k">Waiting for Prospeo</div><div class="v">${fmt(r.waiting)}</div><div class="h">${fmt(r.mismatch)} answers about a different person were thrown away</div></div></div>
+    <div class="small muted" style="margin-top:10px">${first?"People Prospeo has a verified email for aren't paid for in Seamless. ":"Only people Seamless had no usable email for are sent to Prospeo. "}Prospeo charges 1 credit per email it finds and nothing when it has none. Every answer is checked to be the same person (name and company website, or LinkedIn).
+      ${!r.ready && r.why_not ? `<div style="color:var(--warn);margin-top:4px">${esc(r.why_not)}</div>` : ""}</div></section>`;
+}
+const SRC_BADGE = r => r.email_source==="guessed" ? `<span class="badge b-ok" title="${esc(r.guess_note||"")}">Guessed · verified valid</span>`
+  : r.email_source==="prospeo" ? `<span class="badge b-ok" title="${esc(r.prospeo_note||"")}">Prospeo · verified</span>`
+  : r.email_source==="already" ? `<span class="badge">Already had</span>` : `<span class="badge b-brand">Seamless</span>`;
 const FORMAT_HTML = f => f === "catch_all" ? `<span class="badge b-warn">Catch-all</span><div class="small muted">accepts any address, can't guess</div>`
   : f ? `<code>${esc(f)}</code>` : `<span class="muted">—</span>`;
 function drawCompanies(p) {
@@ -592,11 +611,13 @@ async function pullAction(p, btn) {
 }
 function drawResults(p, keep) {
   const host = $("#results"); const s = p.stats; if (!host) return;
-  if (!s.researched && p.status !== "done") { host.innerHTML = ""; return; }
+  if (!s.researched && p.status !== "done" && p.mode !== "enrich") { host.innerHTML = ""; return; }
   const view = PV.view, cols = META.defaults.columns;
   host.innerHTML = `<section class="card hl" aria-label="Download"><h2>Download</h2>
       <p class="small muted" style="margin:-6px 0 12px">${p.status==="done"?"":"You can already download what has come back. "}Invalid emails, shared emails and your do-not-pull list are left out.</p>
-      <div class="row"><a class="btn primary" id="dlMain" href="/api/pulls/${p.id}/download?kind=anavmail">Download for AnavMail (CSV, ${fmt(s.downloadable)})</a>
+      ${p.mode==="enrich" ? `<div class="row" style="margin-bottom:10px"><a class="btn primary" href="/api/pulls/${p.id}/download?kind=enriched">Your file with emails added (CSV)</a><a class="btn" href="/api/pulls/${p.id}/download?kind=enriched&format=xlsx">Same, Excel</a></div>
+        <div class="small muted" style="margin:-4px 0 12px">Every row of your file, in its order, with Email, Email status, How we got the email, Job title, LinkedIn, Company website and a note added on the right.</div>` : ""}
+      <div class="row"><a class="btn ${p.mode==="enrich"?"":"primary"}" id="dlMain" href="/api/pulls/${p.id}/download?kind=anavmail">Download for AnavMail (CSV, ${fmt(s.downloadable)})</a>
         <a class="btn" href="/api/pulls/${p.id}/download?kind=all&format=xlsx">Everything, all columns (Excel)</a>
         <a class="btn" id="dlNo" href="/api/pulls/${p.id}/download?kind=no_email" ${s.no_email?"":'aria-disabled="true"'}>${fmt(s.no_email)} without email (LinkedIn, phone)</a></div>
       <div class="small muted" style="margin-top:10px">AnavMail columns: <b style="color:var(--ink)">${esc(cols.join(", "))}</b> (DEFAULT_COLUMNS in .env). The Excel file also has <b style="color:var(--ink)">How we got the email</b>${p.mode==="companies"?` and <b style="color:var(--ink)">Signal</b>`:""}.</div></section>
@@ -609,8 +630,8 @@ function drawResults(p, keep) {
     {label:"Country", sort:"country", html:r=>esc(r.country)}];
   const extra = view === "skipped" ? [{label:"Why skipped", html:r=>`<span class="small">${esc(r.skip_reason)}</span>`}]
     : view === "emails" ? [{label:"Email", sort:"email", html:r=>`${esc(r.email)} ${r.email_status&&r.email_status.toLowerCase()!=="valid"?`<span class="badge b-warn">${esc(r.email_status)}</span>`:""}${r.filled_free?' <span class="badge b-ok">free</span>':""}`},
-        {label:"How we got it", html:r=>r.email_source==="guessed"?`<span class="badge b-ok" title="${esc(r.guess_note||"")}">Guessed · verified valid</span>`:`<span class="badge b-brand">Seamless</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}]
-    : [{label:"Seamless said", html:r=>`<span class="small">${esc(r.research_status||"")}${r.research_message?`<div class="muted">${esc(r.research_message)}</div>`:""}</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}];
+        {label:"How we got it", html:SRC_BADGE}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}]
+    : [{label:"Seamless said", html:r=>`<span class="small">${esc(r.research_status||"")}${r.research_message?`<div class="muted">${esc(r.research_message)}</div>`:""}${r.prospeo_note?`<div class="muted">Prospeo: ${esc(r.prospeo_note)}</div>`:""}</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}];
   pagedTable($("#peopleTable"), `people.${p.id}.${view}.${PV.kind||""}`, {placeholder:"Search name, company, title, email or country", sort:"id",
     url: st => `/api/pulls/${p.id}/people?${qs({view, kind:PV.kind||"", offset:st.offset, limit:st.limit, q:st.q, sort:st.sort, dir:st.dir})}`,
     empty: view==="emails" ? "No emails yet." : "Nobody here.", cols: base.concat(extra)});
@@ -632,7 +653,7 @@ async function renderHistory() {
       {label:"When", html:r=>`<span class="nowrap">${when(r.created_at)}</span>`}, {label:"Account", html:r=>`<span class="small">${esc(r.accounts||"—")}</span>`},
       {label:"Emails", cls:"right", html:r=>`<b>${fmt(r.emails)}</b> <span class="muted">/ ${fmt(r.target)}</span>`}, {label:"Credits", cls:"right", html:r=>fmt(r.credits)},
       {label:"Per email", cls:"right", html:r=>r.per_email ?? "—"},
-      {label:"<span class='sr'>Actions</span>", cls:"right nowrap", html:r=>`<a href="/api/pulls/${r.id}/download?kind=anavmail">Download</a> · <a href="#/new?from=${r.id}">Change filters</a>`}]});
+      {label:"<span class='sr'>Actions</span>", cls:"right nowrap", html:r=>r.mode==="enrich"?`<a href="/api/pulls/${r.id}/download?kind=enriched">Download file</a>`:`<a href="/api/pulls/${r.id}/download?kind=anavmail">Download</a> · <a href="#/new?from=${r.id}">Change filters</a>`}]});
 }
 
 // ------------------------------------------------------------ accounts
@@ -658,8 +679,10 @@ async function renderAccounts() {
         <label for="naBud" class="small"><b>Monthly budget (optional)</b></label><input id="naBud" type="number" min="0" placeholder="No own limit" style="margin:4px 0 12px">
         <button class="btn primary" id="naAdd">Check key and add</button><div class="small muted" style="margin-top:6px">Checked with a free call first; a key Seamless doesn't accept is never saved. Only the last 4 characters are ever shown.</div></section></div>
     <section class="card" style="margin-top:16px" id="mvCard"></section>
+    <section class="card" style="margin-top:16px" id="prCard"></section>
     <section class="card" style="margin-top:16px"><h2>Spending history</h2><div id="ledger"></div></section>`);
   drawVerifier(ov.verifier);
+  drawProspeo(ov.prospeo || {});
   const aid = el => +el.closest("[data-aid]").dataset.aid;
   const patch = async (el, body, msg) => { try { await api(`/api/accounts/${aid(el)}`, {method:"PATCH", body}); toast(msg); renderAccounts(); } catch(e) { toast(e.message, true); } };
   $("#main").onchange = e => { if (e.target.matches("[data-budget]")) patch(e.target, {monthly_budget:+e.target.value||0}, "Budget saved.");
@@ -700,6 +723,77 @@ function drawVerifier(mv) {
   $("#mvToggle") && ($("#mvToggle").onclick = e => go(e.currentTarget, {enabled:!mv.enabled}, mv.enabled?"Guessing off: everyone is paid for in Seamless.":"Guessing on."));
   $("#mvRekey") && ($("#mvRekey").onclick = e => { const k = prompt("Paste the new MillionVerifier API key:"); if (k) go(e.currentTarget, {api_key:k}, "Key replaced."); });
   $("#mvDel") && ($("#mvDel").onclick = e => { if (confirm("Remove the MillionVerifier key? Guessing stops; everyone is paid for in Seamless.")) go(e.currentTarget, null, "Key removed.", "DELETE"); });
+}
+
+function drawProspeo(pr) {
+  const box = $("#prCard"); if (!box) return;
+  const paused = pr.paused_until && pr.paused_until*1000 > Date.now();
+  const badge = !pr.has_key ? '<span class="badge">Not set up</span>' : !pr.on ? '<span class="badge">Off in .env</span>' : !pr.enabled ? '<span class="badge">Switched off</span>'
+    : pr.last_error ? '<span class="badge b-bad">Problem</span>' : paused ? '<span class="badge b-warn">Paused</span>' : '<span class="badge b-ok">Working</span>';
+  box.innerHTML = `<div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Prospeo <span class="small muted" style="font-weight:500">· ${pr.order==="prospeo_first"?"asked before Seamless":"second source, after Seamless"}</span></h2>${badge}</div>
+    <p class="small muted" style="margin:0 0 12px">${pr.order==="prospeo_first"?"Each person is looked up in Prospeo first; Seamless is paid only for people Prospeo has no verified email for.":"When Seamless has no usable email for a person, Lead Puller asks Prospeo."} Only emails Prospeo has verified are used, and only for the same person (name and company website, or LinkedIn). Prospeo charges 1 credit per email it finds, nothing when it has none, and nothing for the same person again within 90 days. The order is SOURCE_ORDER in .env.</p>
+    ${pr.last_error ? `<div class="notice bad small">${esc(pr.last_error)}</div>` : ""}
+    ${!pr.on ? `<div class="notice warn small">PROSPEO_ENABLED=0 in .env: Prospeo is never asked.</div>` : ""}
+    ${pr.has_key ? `<div class="kv"><span>API key</span><span><code>${esc(pr.key)}</code>${pr.from_env?' <span class="small muted">from .env</span>':""}</span>
+        <span>Credits left</span><span><b>${fmt(pr.credits)}</b> ${pr.plan?`<span class="small muted">· ${esc(pr.plan)} plan</span>`:""} ${pr.credits_at?`<span class="small muted">· checked ${when(pr.credits_at)}</span>`:""}</span>
+        <span>Used this month</span><span>${fmt(pr.used_this_month)} credits by Lead Puller</span></div>
+      <div class="row" style="margin-top:14px"><button class="btn small" id="prCheck">Check balance (free)</button>${pr.from_env?"":`<button class="btn small" id="prRekey">Replace key</button>`}
+        <button class="btn small" id="prToggle">${pr.enabled?"Switch Prospeo off":"Switch Prospeo on"}</button>${pr.from_env?"":`<button class="btn small danger" id="prDel">Remove key</button>`}</div>`
+    : `<div class="row" style="align-items:flex-end"><div style="flex:1 1 280px"><label for="prKey" class="small"><b>API key</b></label><input id="prKey" type="password" autocomplete="off" placeholder="Prospeo → API" style="margin-top:4px"></div>
+        <button class="btn primary" id="prAdd">Check key and add</button></div>
+      <div class="small muted" style="margin-top:6px">Checked with a free call first; a key Prospeo doesn't accept is never saved. Only the last 4 characters are ever shown. Without a key everything works as before, with Seamless only.</div>`}`;
+  const go = (btn, body, msg, method) => busy(btn, async () => { const r = await api("/api/prospeo", method ? {method} : {body}); toast(msg); drawProspeo(r); META = await api("/api/meta"); refreshTop(META.overview); });
+  $("#prAdd") && ($("#prAdd").onclick = e => go(e.currentTarget, {api_key:$("#prKey").value}, "Prospeo key added."));
+  $("#prCheck") && ($("#prCheck").onclick = e => go(e.currentTarget, {check:1}, "Balance checked."));
+  $("#prToggle") && ($("#prToggle").onclick = e => go(e.currentTarget, {enabled:!pr.enabled}, pr.enabled?"Prospeo off: Seamless only.":"Prospeo on."));
+  $("#prRekey") && ($("#prRekey").onclick = e => { const k = prompt("Paste the new Prospeo API key:"); if (k) go(e.currentTarget, {api_key:k}, "Key replaced."); });
+  $("#prDel") && ($("#prDel").onclick = e => { if (confirm("Remove the Prospeo key? Lead Puller goes back to Seamless only.")) go(e.currentTarget, null, "Key removed.", "DELETE"); });
+}
+
+// ------------------------------------------------------------ enrich contacts (2.3)
+let EN = null;
+const EN_FIELDS = [["first_name","First name"],["last_name","Last name"],["full_name","Full name"],["company","Company"],["website","Company website"],["linkedin","LinkedIn"],["title","Job title"],["email","Old email"]];
+const EN_KIND = {lookup:["Will be looked up",""], have:["You already have the email (free)","b-ok"], looked_before:["Looked up in Seamless before: Prospeo only, never paid twice","b-brand"], thin:["Not enough to look up","b-warn"], dnp:["On your do-not-pull list","b-bad"], dup:["Same person twice in the file",""]};
+async function renderEnrich() {
+  EN = null;
+  const ov = META.overview, accs = (ov.accounts||[]).filter(a=>a.enabled), pr = ov.prospeo || {}, mv = ov.verifier || {};
+  setMain(`<h1>Enrich contacts</h1><p class="sub">Upload people you already have (a CSV or Excel file with names and companies, or LinkedIn links) and get their emails. Your file comes back with the emails added.</p>
+    <section class="card"><h2>1. Your file</h2>
+      <input type="file" id="enFile" accept=".csv,.xlsx,.xlsm,.txt" aria-label="Choose a CSV or Excel file">
+      <div class="small muted" style="margin-top:8px">Needs a header row. Lead Puller finds the columns itself (first/last or full name, company, website, LinkedIn, job title, old email); you can change its choice below. Nothing is spent until you press Start.</div>
+      <div id="enCheck" style="margin-top:14px"></div></section>
+    <section class="card"><h2>How each person is looked up</h2>
+      <ol class="small" style="margin:0;padding-left:18px;line-height:1.7">
+        <li><b>Already have their email?</b> Filled in free (any earlier pull or your Seamless saved contacts).</li>
+        <li><b>Guess + MillionVerifier</b> where the company's email format is known ${mv.has_key?'<span class="badge b-ok">on</span>':'<span class="badge">no key</span>'}: no Seamless credit.</li>
+        <li><b>${pr.order==="prospeo_first"?"Prospeo, then Seamless":"Seamless, then Prospeo"}</b>: Seamless costs 1 credit per person ${accs.length?'':'<span class="badge b-bad">no account</span>'}; Prospeo 1 credit per email it finds ${pr.has_key?'<span class="badge b-ok">on</span>':'<span class="badge">no key: <a href="#/accounts">add it</a></span>'}.</li></ol>
+      <div class="small muted" style="margin-top:8px">Nobody is ever paid for twice, on any Seamless account or in Prospeo. People on your do-not-pull list are skipped.</div></section>`);
+  $("#enFile").onchange = async e => { const f = e.target.files[0]; if (!f) return; const fd = new FormData(); fd.append("file", f);
+    $("#enCheck").innerHTML = '<span class="spin"></span> Reading the file…';
+    try { EN = await api("/api/enrich/check", {body:fd}); drawEnrichCheck(); } catch(err) { $("#enCheck").innerHTML = `<div class="notice bad">${esc(err.message)}</div>`; } };
+}
+function drawEnrichCheck() {
+  const c = EN, n = c.counts || {}, accs = (META.overview.accounts||[]).filter(a=>a.enabled);
+  const opt = (f) => `<select data-map="${f}" aria-label="${f}"><option value="">— not in my file —</option>${c.header.map((h,i)=>`<option value="${i}" ${c.mapping[f]===i?"selected":""}>${esc(h||"(column "+(i+1)+")")}</option>`).join("")}</select>`;
+  $("#enCheck").innerHTML = `<div class="small" style="margin-bottom:10px"><b>${esc(c.file)}</b> · ${fmt(c.rows)} rows</div>
+    <h3 style="margin:6px 0">Columns</h3>
+    <div class="grid g2" style="gap:8px 16px">${EN_FIELDS.map(([f,l])=>`<label class="small" style="display:flex;gap:8px;align-items:center"><span style="flex:0 0 120px;white-space:nowrap"><b>${l}</b></span><span style="flex:1;min-width:0">${opt(f)}</span></label>`).join("")}</div>
+    <h3 style="margin:16px 0 6px">What will happen</h3>
+    ${Object.keys(EN_KIND).filter(k=>n[k]).map(k=>`<div class="skiprow small"><span><span class="badge ${EN_KIND[k][1]}">${fmt(n[k])}</span> ${EN_KIND[k][0]}</span></div>`).join("")}
+    ${c.sample && c.sample.length ? `<div class="small muted" style="margin-top:8px">First rows as read: ${c.sample.map(x=>esc([x.name, x.company||x.domain].filter(Boolean).join(" · "))).join("; ")}</div>` : ""}
+    <div class="grid g3" style="margin-top:16px">
+      <label class="small"><b>Name</b><input id="enName" value="Enrich: ${esc(c.file)}" style="margin-top:4px"></label>
+      <label class="small"><b>Max Seamless credits</b><input id="enMax" type="number" min="1" value="${c.default_max_credits||1}" style="margin-top:4px"><span class="muted">at most ${fmt(c.seamless_max)} people need a lookup${c.seamless_on?"":" · Seamless is off (ENRICH_USE_SEAMLESS=0)"}</span></label>
+      <label class="small"><b>Seamless account</b><select id="enAcct" style="margin-top:4px"><option value="auto">Automatic (in your order)</option>${accs.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join("")}</select></label></div>
+    ${!c.prospeo_ready ? `<div class="small muted" style="margin-top:8px">Prospeo won't be asked: ${esc(c.prospeo_why||"")}</div>` : ""}
+    <div class="row" style="margin-top:16px"><button class="btn primary" id="enStart" ${(n.lookup||0)+(n.looked_before||0)+(n.have||0)?"":"disabled"}>Start</button><span class="small muted">You can pause or stop it at any time; everything found is kept.</span></div>`;
+  $$("#enCheck [data-map]").forEach(sel => sel.onchange = async () => {
+    const mapping = {}; $$("#enCheck [data-map]").forEach(s2 => { if (s2.value !== "") mapping[s2.dataset.map] = +s2.value; });
+    try { const name = $("#enName").value; EN = await api("/api/enrich/recheck", {body:{token:EN.token, mapping}}); drawEnrichCheck(); $("#enName").value = name; } catch(err) { toast(err.message, true); } });
+  $("#enStart").onclick = e => { const mapping = {}; $$("#enCheck [data-map]").forEach(s2 => { if (s2.value !== "") mapping[s2.dataset.map] = +s2.value; });
+    if (!confirm(`Start? Up to ${fmt(+$("#enMax").value||0)} Seamless credits${(META.overview.prospeo||{}).has_key?" plus Prospeo credits for the emails it finds":""}.`)) return;
+    busy(e.currentTarget, async () => { const p = await api("/api/enrich", {body:{token:EN.token, mapping, name:$("#enName").value.trim(), max_credits:+$("#enMax").value||0, account:$("#enAcct").value}});
+      location.hash = "#/pull/" + p.id; }); };
 }
 
 // ------------------------------------------------------------ do-not-pull
