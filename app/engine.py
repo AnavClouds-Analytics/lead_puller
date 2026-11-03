@@ -155,7 +155,8 @@ def counts(pid):
         "pending": one("SELECT COUNT(*) n FROM research_requests WHERE pull_id=? AND resolved_at IS NULL"),
         "kept": one("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state='kept'"),
         "researched": one("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND submitted_at IS NOT NULL"),
-        "seen": one("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state!='banked_in'"),
+        "seen": one("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state!='banked_in' AND COALESCE(icy_search,0)=0"),
+        "icy_seen": one("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND COALESCE(icy_search,0)=1"),
         "skipped": one("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND state='skipped'"),
     }
 
@@ -418,6 +419,9 @@ def step(p):
     if _icy_search_step(p, p["target"] - st["emails"]):
         return
     used = " or Icypeas" if db.q1("SELECT 1 x FROM icypeas_log WHERE pull_id=? AND result='search' LIMIT 1", (pid,)) else ""
+    if used:
+        used += (f" (Seamless was searched first and had {st['seen']:,} new people; Icypeas's search found "
+                 f"{st['icy_seen']:,} more)")
     return _finish(p, f"Seamless{used} has no more new people for these filters: {st['emails']:,} of "
                       f"{p['target']:,} when it finished (late answers can still add a few). Widen the filters (more titles, countries or sizes) to get more.")
 

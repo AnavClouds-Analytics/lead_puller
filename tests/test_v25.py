@@ -255,6 +255,16 @@ def test_people_search_fills_companies_seamless_ran_out_of(env):
                                                        f"{engine.DELIVERABLE}", (pid,)))
     assert max(by.values()) <= 3
     assert p["icypeas"]["search_people"] > 0
+    # 2.5.1: "people Seamless showed" counts only Seamless's people; Icypeas's search is shown on its own
+    p = client.get(f"/api/pulls/{pid}").json()
+    n_icy = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND icy_search=1", (pid,))["n"]
+    assert p["stats"]["icy_seen"] == n_icy > 0
+    assert p["stats"]["seen"] == db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND COALESCE(icy_search,0)=0 "
+                                       "AND state!='banked_in'", (pid,))["n"]
+    assert "Seamless was searched first" in (p.get("stop_reason") or "")
+    # Seamless was asked about every company before Icypeas's search was used
+    asked = {d for _, b in fake.searches for d in (b.get("companyDomain") or [])}
+    assert set(doms) <= asked
     check_books(fake)
     check_people(fake)
 

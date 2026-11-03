@@ -1,10 +1,17 @@
-# Lead Puller 2.5.0
+# Lead Puller 2.5.1
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## 2.5.1 fix
+
+On a company list, "people Seamless showed" also counted people found by Icypeas's search, which made it look
+as if Seamless was skipped. It now counts only Seamless's people, shows "+ N found by Icypeas's search" under it,
+and the finish message says how many new people Seamless had before Icypeas's search was used. Display only: how
+pulls run is unchanged.
 
 ## New in 2.5: Icypeas replaces Prospeo (Seamless first, Icypeas second)
 
@@ -44,9 +51,9 @@ Replace the code, keep `data/` and `.env`. Nothing is redone from scratch:
 ```bash
 cd lead-puller-2 && docker compose down
 cp -r data ../lead-puller-2-data-backup            # backup first
-# unzip lead-puller-2.5.0.zip over this folder (it never contains data/ or .env)
+# unzip lead-puller-2.5.1.zip over this folder (it never contains data/ or .env)
 docker compose up -d --build
-curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.5.0"}
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.5.1"}
 ```
 
 New tables and columns are added on start (tested on a 2.4.1 database with Prospeo data: every pull, person, credit

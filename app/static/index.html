@@ -539,7 +539,7 @@ function drawLive(p) {
         <div class="stat"><div class="k">Cost per email</div><div class="v">${s.per_email ?? "—"}</div><div class="h">${fmt(s.search_credits)} to search · ${fmt(s.research_credits)} to research</div></div>
         <div class="stat"><div class="k">Account in use</div><div class="v" style="font-size:18px">${esc(p.account||"—")}</div><div class="h">${META.overview.accounts.filter(a=>a.enabled).length>1?"switches to the next account if it runs low":"add a second account to continue when this one runs low"}</div></div></div></section>
     <section class="card" aria-label="So far"><h2>So far</h2>
-      <div class="grid g4"><div><div style="font-size:20px;font-weight:700">${fmt(s.seen)}</div><div class="small muted">${p.mode==="enrich"?"people in your file":"people Seamless showed"}</div></div>
+      <div class="grid g4"><div><div style="font-size:20px;font-weight:700">${fmt(s.seen)}</div><div class="small muted">${p.mode==="enrich"?"people in your file":"people Seamless showed"}</div>${s.icy_seen?`<div class="small muted">+ ${fmt(s.icy_seen)} found by Icypeas's search</div>`:""}</div>
         <div><div style="font-size:20px;font-weight:700">${fmt(s.researched)}</div><div class="small muted">researched (paid)</div></div>
         <div><div style="font-size:20px;font-weight:700">${fmt(s.emails)}</div><div class="small muted">got a usable email</div></div>
         <div><div style="font-size:20px;font-weight:700">${fmt(skipTotal)}</div><div class="small muted">skipped, not paid for</div></div></div>

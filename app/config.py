@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
