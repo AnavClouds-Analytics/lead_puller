@@ -48,15 +48,16 @@ OPEN_STATES = ("kept", "queued", "done", "unconfirmed", "timed_out", "no_email",
 
 # ================================================================ creating and controlling pulls
 def create_pull(name, prompt, filters, target, max_credits=None, account_choice="auto", max_per_company=None,
-                rerun_of=None, company_list=None):
+                rerun_of=None, company_list=None, include_recent=False):
     f = F.clean(filters)
     items = None
     if company_list is not None:
-        items = CO.check(company_list, skip_recent=rerun_of is None)
+        items = CO.check(company_list, skip_recent=rerun_of is None and not include_recent)
         if not any(i["status"] == "ready" for i in items):
             if any(i["status"] == "done_before" for i in items):
                 raise PullError(f"All of these companies were already in a pull in the last {cfg.COMPANY_SKIP_DAYS} days, "
-                                f"so their people are already pulled. Use \"Run again\" on that pull for new people there.")
+                                f"so their people are already pulled. Tick \"Include them anyway\" to search them again (only new people "
+                                f"are pulled; nobody is paid for twice).")
             raise PullError("None of those companies has a website Lead Puller can search. Add websites (e.g. acme.com).")
         f = CO.people_filters(f)
         if max_per_company in (None, "", 0, "0"):

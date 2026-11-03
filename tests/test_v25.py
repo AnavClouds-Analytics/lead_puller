@@ -385,7 +385,7 @@ def test_new_list_leaves_out_companies_pulled_recently(env, monkeypatch):
     # A list made only of recent companies says why.
     bad = client.post("/api/pulls", json={"filters": {"seniority": {"in": ["VP"]}}, "target": 10, "max_credits": 50,
                                           "max_per_company": 2, "companies": [{"domain": d} for d in doms[:20]]})
-    assert bad.status_code == 400 and "already in a pull" in bad.json()["error"]
+    assert bad.status_code == 400 and "Include them anyway" in bad.json()["error"]
     check_books(fake)
 
 
@@ -435,3 +435,27 @@ def test_2_5_gets_more_emails_for_the_same_seamless_credits(env, monkeypatch, tm
     assert s1 / e1 <= s0 / e0
     check_books(fake2)
     check_people(fake2)
+
+
+def test_include_recent_companies_anyway_with_new_titles(env, monkeypatch):
+    """2.5.1: the same companies again with new job titles: tick "Include them anyway". Only new people, nobody paid
+    twice; the CSV upload and the check both honour it."""
+    client, fake, clock = env
+    monkeypatch.setenv("COMPANY_SKIP_DAYS", "90")
+    doms = company_domains(fake, 20)
+    run(client, start_list(client, doms, per_company=2, filters={"jobTitle": {"in": ["CTO"]}}))
+    csv_text = "Company,Website\n" + "\n".join(f"Co {i},{d}" for i, d in enumerate(doms))
+    up = client.post("/api/companies/upload", files={"file": ("hsf.csv", csv_text, "text/csv")}).json()
+    assert up["summary"]["ready"] == 0 and up["summary"]["done_before"] == 20
+    up = client.post("/api/companies/upload?include_recent=1", files={"file": ("hsf.csv", csv_text, "text/csv")}).json()
+    assert up["summary"]["ready"] == 20 and up["summary"]["done_before"] == 0
+    chk = client.post("/api/companies/check", json={"text": "\n".join(doms), "include_recent": True}).json()
+    assert chk["summary"]["ready"] == 20
+    body = {"filters": {"jobTitle": {"in": ["VP Engineering", "Head of IT", "CTO"]}}, "target": 40, "max_credits": 400,
+            "max_per_company": 2, "companies": [{"domain": d} for d in doms]}
+    assert client.post("/api/pulls", json=body).status_code == 400
+    r = client.post("/api/pulls", json=dict(body, include_recent=True))
+    assert r.status_code == 200, r.text
+    run(client, r.json()["id"])
+    check_books(fake)
+    check_people(fake)

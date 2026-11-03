@@ -253,12 +253,13 @@ function fieldsBy() { const g = {}; META.fields.forEach(f => (g[f.group] = g[f.g
 async function renderNew(fromId) {
   const d = META.defaults;
   NP = {filters: JSON.parse(JSON.stringify(d.filters)), target: d.target, max: null, maxEdited: false, account: "auto",
-        cap: d.max_per_company, name: "", prompt: "", count: null, who: "filters", list: null, perCo: d.per_company, targetEdited: false};
+        cap: d.max_per_company, name: "", prompt: "", count: null, who: "filters", list: null, perCo: d.per_company, targetEdited: false,
+        includeRecent: !!fromId};   // 2.5.1: "Change filters" on a pull = the same companies again, with other filters
   if (fromId) { try { const p = await api("/api/pulls/" + fromId);
     Object.assign(NP, {filters: p.filters, target: p.target, max: p.max_credits, maxEdited: true, account: p.account_choice, cap: p.max_per_company, name: p.name, prompt: p.prompt});
     if (p.mode === "companies") { const c = await api(`/api/pulls/${fromId}/companies?all=1`);
       NP.who = "companies"; NP.perCo = p.max_per_company || d.per_company; NP.targetEdited = true;
-      NP.list = await api("/api/companies/check", {body:{items:c.rows.map(r=>({name:r.name, domain:r.domain, signal:r.signal})), per_company:NP.perCo, target:NP.target}}); NP.list.file = `the list from pull #${fromId}`; } } catch(e) {} }
+      NP.list = await api("/api/companies/check", {body:{items:c.rows.map(r=>({name:r.name, domain:r.domain, signal:r.signal})), per_company:NP.perCo, target:NP.target, include_recent:NP.includeRecent}}); NP.list.file = `the list from pull #${fromId}`; } } catch(e) {} }
   const accs = META.overview.accounts.filter(a => a.enabled);
   setMain(`<h1>New pull</h1><p class="sub">Pick filters like in Seamless, say how many emails you want, press Start. Nobody you've pulled before, on any account, is pulled or paid for again.</p>
     ${!accs.length ? `<div class="notice warn">No Seamless account yet. <a href="#/accounts">Add your API key</a> first.</div>` : ""}
@@ -308,9 +309,9 @@ async function renderNew(fromId) {
   drawWho(); drawFilters(); drawTarget();
   $$("[data-who]").forEach(b => b.onclick = () => { NP.who = b.dataset.who; drawWho(); drawFilters(); drawTarget(); });
   $("#coCheck").onclick = e => busy(e.currentTarget, async () => { if (!$("#coText").value.trim()) return toast("Paste at least one website.", true);
-    NP.list = await api("/api/companies/check", {body:{text:$("#coText").value, per_company:NP.perCo, target:NP.targetEdited?NP.target:0}}); NP.list.file = null; onList(); });
+    NP.list = await api("/api/companies/check", {body:{text:$("#coText").value, per_company:NP.perCo, target:NP.targetEdited?NP.target:0, include_recent:NP.includeRecent}}); NP.list.file = null; onList(); });
   $("#coFile").onchange = async e => { const f = e.target.files[0]; if (!f) return; const fd = new FormData(); fd.append("file", f);
-    try { NP.list = await api(`/api/companies/upload?${qs({per_company:NP.perCo, target:NP.targetEdited?NP.target:0})}`, {body:fd}); onList(); } catch(err) { toast(err.message, true); } };
+    try { NP.list = await api(`/api/companies/upload?${qs({per_company:NP.perCo, target:NP.targetEdited?NP.target:0, include_recent:NP.includeRecent?1:0})}`, {body:fd}); onList(); } catch(err) { toast(err.message, true); } };
   $("#target").oninput = e => { NP.target = Math.max(0, +e.target.value||0); NP.targetEdited = true; drawTarget(true); };
   $("#maxc").oninput = e => { NP.max = +e.target.value||0; NP.maxEdited = true; drawEstimate(); };
   $("#acct").onchange = e => NP.account = e.target.value;
@@ -322,6 +323,7 @@ async function renderNew(fromId) {
   $("#startBtn").onclick = e => {
     if (!NP.target) return toast("Enter how many contacts with email you want.", true);
     const co = NP.who === "companies";
+    if (co && NP.list && !NP.list.summary.ready && NP.list.summary.done_before) return toast(`All ${fmt(NP.list.summary.done_before)} companies were already pulled in the last ${NP.list.summary.skip_days} days. Tick "Include them anyway" under the list to search them again.`, true);
     if (co && !(NP.list && NP.list.summary.ready)) return toast("Add your companies first (paste websites or upload a CSV).", true);
     const noTitles = co && !((NP.filters.jobTitle||{}).in||[]).length && !((NP.filters.seniority||{}).in||[]).length;   // 2.2
     if (noTitles && !confirm("No job titles or seniority are set, so anyone at these companies can be picked (interns, support staff…). Most people add 5-10 titles first. Start anyway?")) return;
@@ -330,7 +332,7 @@ async function renderNew(fromId) {
     const filters = co ? Object.fromEntries(Object.entries(NP.filters).filter(([k]) => !META.defaults.company_only.includes(k))) : NP.filters;
     busy(e.currentTarget, async () => { const p = await api("/api/pulls", {body:{filters, target:NP.target, max_credits:NP.max, account:NP.account,
         max_per_company: co ? NP.perCo : NP.cap, name:$("#pname").value.trim(), prompt:$("#desc")?.value.trim()||"",
-        companies: co ? NP.list.items.filter(i=>i.status==="ready") : undefined}});
+        companies: co ? NP.list.items.filter(i=>i.status==="ready") : undefined, include_recent: co && NP.includeRecent}});
       location.hash = "#/pull/" + p.id; }); };
   $("#fill") && ($("#fill").onclick = e => busy(e.currentTarget, async () => {
     const r = await api("/api/describe", {body:{text:$("#desc").value}});
@@ -354,7 +356,7 @@ function drawWho() {
 }
 function onList() { NP.targetEdited = false; drawList(); drawTarget(); }
 async function refreshList() { if (!NP.list) return; const file = NP.list.file;
-  NP.list = await api("/api/companies/check", {body:{items:NP.list.items.map(i=>({name:i.name, domain:i.domain, signal:i.signal})), per_company:NP.perCo, target:NP.targetEdited?NP.target:0}});
+  NP.list = await api("/api/companies/check", {body:{items:NP.list.items.map(i=>({name:i.name, domain:i.domain, signal:i.signal})), per_company:NP.perCo, target:NP.targetEdited?NP.target:0, include_recent:NP.includeRecent}});
   NP.list.file = file; drawList(); }
 function drawList() {
   const L = NP.list, box = $("#coResult"); if (!box) return;
@@ -362,10 +364,12 @@ function drawList() {
   const sm = L.summary, show = NP.showAll ? L.items : L.items.slice(0, 6);
   box.innerHTML = `${L.file ? `<div class="small" style="margin-bottom:8px">From <b>${esc(L.file)}</b> · ${fmt(sm.total)} rows</div>` : ""}
     <div class="row" style="gap:6px;margin-bottom:10px"><span class="badge b-ok">${fmt(sm.ready)} ready</span>${sm.no_website?`<span class="badge b-warn">${fmt(sm.no_website)} no website, skipped</span>`:""}${sm.dnp?`<span class="badge">${fmt(sm.dnp)} on do-not-pull</span>`:""}${sm.duplicate?`<span class="badge">${fmt(sm.duplicate)} duplicate</span>`:""}${sm.too_many?`<span class="badge">${fmt(sm.too_many)} over the limit</span>`:""}${sm.done_before?`<span class="badge" title="Already in a pull you made in the last ${sm.skip_days} days (COMPANY_SKIP_DAYS): their people are already pulled, so they're left out">${fmt(sm.done_before)} already pulled in the last ${sm.skip_days} days, left out</span>`:""}${sm.known_format?`<span class="badge b-brand">${fmt(sm.known_format)} email format already known</span>`:""}</div>
+    ${sm.done_before || NP.includeRecent ? `<label class="small" style="display:flex;gap:8px;align-items:flex-start;justify-content:flex-start;text-align:left;margin:0 0 10px;font-weight:400"><input type="checkbox" id="coRecent" ${NP.includeRecent?"checked":""} style="width:auto;flex:none;margin:3px 0 0"><span style="flex:1"><b>Include them anyway</b> (companies pulled in the last ${sm.skip_days} days). Use this to search the same companies with new job titles: only new people are pulled, nobody is paid for twice.</span></label>` : ""}
     <div class="tablewrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>Company</th><th>Website</th><th>Signal (from your file)</th><th>Status</th></tr></thead><tbody>
       ${show.map(i=>{ const [l,c] = CO_STATUS[i.status]||[i.status,""]; return `<tr><td>${esc(i.name)}</td><td>${i.domain?esc(i.domain):'<span class="muted">none found</span>'}</td><td class="small">${esc(i.signal||"")}</td><td><span class="badge ${c}">${l}</span></td></tr>`; }).join("")}</tbody></table></div>
     ${L.items.length > 6 ? `<button type="button" class="linkbtn small" id="coAll" style="margin-top:8px">${NP.showAll?"Show fewer":`See all ${fmt(L.items.length)}`}</button>` : ""}`;
   $("#coAll") && ($("#coAll").onclick = () => { NP.showAll = !NP.showAll; drawList(); });
+  $("#coRecent") && ($("#coRecent").onchange = e => { NP.includeRecent = e.target.checked; NP.targetEdited = false; refreshList().then(drawTarget); });
   const e = L.estimate;
   $("#coEst").innerHTML = `<h2 style="margin-bottom:8px">Estimate</h2>
     <div class="skiprow small"><span>Search</span><b>about ${fmt(e.search_low)}–${fmt(e.search_high)} credits</b></div>

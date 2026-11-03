@@ -277,7 +277,7 @@ async def new_pull(request: Request):
                  for c in clist if isinstance(c, dict)]
     pid = engine.create_pull(b.get("name"), b.get("prompt"), b.get("filters") or {}, b.get("target"),
                              b.get("max_credits"), str(b.get("account") or "auto"), b.get("max_per_company"),
-                             company_list=clist)
+                             company_list=clist, include_recent=bool(b.get("include_recent")))
     return _pull_out(pid)
 
 
@@ -298,16 +298,18 @@ async def companies_check(request: Request):
     rows = companies.parse(text=b.get("text") or "")
     rows += [{"name": c.get("name") or "", "domain_raw": c.get("domain") or "", "signal": c.get("signal") or ""}
              for c in (b.get("items") or []) if isinstance(c, dict)]
-    return _companies_out(companies.check(rows), b.get("per_company"), b.get("target"))
+    return _companies_out(companies.check(rows, skip_recent=not b.get("include_recent")), b.get("per_company"),
+                          b.get("target"))
 
 
 @app.post("/api/companies/upload", dependencies=AUTH)
-async def companies_upload(file: UploadFile = File(...), per_company: int = 0, target: int = 0):
+async def companies_upload(file: UploadFile = File(...), per_company: int = 0, target: int = 0,
+                           include_recent: int = 0):
     raw = (await file.read()).decode("utf-8-sig", errors="replace")
     rows = companies.parse(csv_text=raw)
     if not rows:
         raise engine.PullError("Couldn't find any companies in that file. It needs a website or domain column.")
-    out = _companies_out(companies.check(rows), per_company, target)
+    out = _companies_out(companies.check(rows, skip_recent=not include_recent), per_company, target)
     out["file"] = (file.filename or "upload.csv")[:120]
     return out
 

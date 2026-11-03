@@ -13,6 +13,10 @@ as if Seamless was skipped. It now counts only Seamless's people, shows "+ N fou
 and the finish message says how many new people Seamless had before Icypeas's search was used. Display only: how
 pulls run is unchanged.
 
+Companies already pulled in the last `COMPANY_SKIP_DAYS` days can now be included again with one tick: **Include them
+anyway** under the company list (ticked automatically when you use "Change filters" on a pull). Use it to search the
+same companies with new job titles; only new people are pulled and nobody is paid for twice.
+
 ## New in 2.5: Icypeas replaces Prospeo (Seamless first, Icypeas second)
 
 Prospeo is gone from the app. **Icypeas** now does everything Prospeo did, at a lower cost:
