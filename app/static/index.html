@@ -193,7 +193,7 @@ function balHtml(ov) {
   const mv = ov.verifier || {};
   return accs.map(a=>`<span>${esc(a.name)}: <b>${fmt(a.balance)}</b></span>`).join("") +
     (mv.has_key ? `<span>MillionVerifier: <b>${fmt(mv.credits)}</b> checks</span>` : "") +
-    ((ov.prospeo||{}).has_key ? `<span>Prospeo: <b>${fmt(ov.prospeo.credits)}</b></span>` : "") +
+    ((ov.icypeas||{}).has_key ? `<span>Icypeas: <b>${(ov.icypeas.credits==null)?"on":fmt(Math.floor(ov.icypeas.credits))}</b></span>` : "") +
     `<span>This month: <b>${fmt(ov.spent_this_month)}</b>${ov.monthly_budget?` of ${fmt(ov.monthly_budget)}`:""}</span>
      <button class="btn small danger" id="stopAll" title="Stops every pull now. People already sent to Seamless still come back.">Emergency stop</button>`;
 }
@@ -340,7 +340,7 @@ async function renderNew(fromId) {
     $("#descNotes").innerHTML = `<div class="notice ok small" style="margin:8px 0 0">Filled ${Object.keys(r.filters).length} filters below. Check them; nothing is spent until you press Start.${r.notes.length?`<ul style="margin:4px 0 0;padding-left:18px">${r.notes.map(n=>`<li>${esc(n)}</li>`).join("")}</ul>`:""}</div>`;
     drawFilters(); drawTarget(); }));
 }
-const CO_STATUS = {ready:["Ready","b-ok"], no_website:["No website, skipped","b-warn"], dnp:["On do-not-pull","" ], duplicate:["Duplicate",""], too_many:["Over COMPANY_LIST_MAX",""]};
+const CO_STATUS = {ready:["Ready","b-ok"], no_website:["No website, skipped","b-warn"], dnp:["On do-not-pull","" ], duplicate:["Duplicate",""], too_many:["Over COMPANY_LIST_MAX",""], done_before:["Already pulled recently, left out",""]};
 function drawWho() {
   const co = NP.who === "companies";
   $$("[data-who]").forEach(b => { b.classList.toggle("on", b.dataset.who === NP.who); b.setAttribute("aria-pressed", b.dataset.who === NP.who); });
@@ -361,7 +361,7 @@ function drawList() {
   if (!L) { box.innerHTML = ""; $("#coEst").innerHTML = `<div class="small muted">Add your companies to see the estimate.</div>`; return; }
   const sm = L.summary, show = NP.showAll ? L.items : L.items.slice(0, 6);
   box.innerHTML = `${L.file ? `<div class="small" style="margin-bottom:8px">From <b>${esc(L.file)}</b> · ${fmt(sm.total)} rows</div>` : ""}
-    <div class="row" style="gap:6px;margin-bottom:10px"><span class="badge b-ok">${fmt(sm.ready)} ready</span>${sm.no_website?`<span class="badge b-warn">${fmt(sm.no_website)} no website, skipped</span>`:""}${sm.dnp?`<span class="badge">${fmt(sm.dnp)} on do-not-pull</span>`:""}${sm.duplicate?`<span class="badge">${fmt(sm.duplicate)} duplicate</span>`:""}${sm.too_many?`<span class="badge">${fmt(sm.too_many)} over the limit</span>`:""}${sm.known_format?`<span class="badge b-brand">${fmt(sm.known_format)} email format already known</span>`:""}</div>
+    <div class="row" style="gap:6px;margin-bottom:10px"><span class="badge b-ok">${fmt(sm.ready)} ready</span>${sm.no_website?`<span class="badge b-warn">${fmt(sm.no_website)} no website, skipped</span>`:""}${sm.dnp?`<span class="badge">${fmt(sm.dnp)} on do-not-pull</span>`:""}${sm.duplicate?`<span class="badge">${fmt(sm.duplicate)} duplicate</span>`:""}${sm.too_many?`<span class="badge">${fmt(sm.too_many)} over the limit</span>`:""}${sm.done_before?`<span class="badge" title="Already in a pull you made in the last ${sm.skip_days} days (COMPANY_SKIP_DAYS): their people are already pulled, so they're left out">${fmt(sm.done_before)} already pulled in the last ${sm.skip_days} days, left out</span>`:""}${sm.known_format?`<span class="badge b-brand">${fmt(sm.known_format)} email format already known</span>`:""}</div>
     <div class="tablewrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>Company</th><th>Website</th><th>Signal (from your file)</th><th>Status</th></tr></thead><tbody>
       ${show.map(i=>{ const [l,c] = CO_STATUS[i.status]||[i.status,""]; return `<tr><td>${esc(i.name)}</td><td>${i.domain?esc(i.domain):'<span class="muted">none found</span>'}</td><td class="small">${esc(i.signal||"")}</td><td><span class="badge ${c}">${l}</span></td></tr>`; }).join("")}</tbody></table></div>
     ${L.items.length > 6 ? `<button type="button" class="linkbtn small" id="coAll" style="margin-top:8px">${NP.showAll?"Show fewer":`See all ${fmt(L.items.length)}`}</button>` : ""}`;
@@ -547,7 +547,7 @@ function drawLive(p) {
         ${s.skips.map(r=>`<div class="skiprow small"><button type="button" class="linkbtn" data-skip="${esc(r.kind)}">${esc(SKIP[r.kind]||r.example||r.kind)}</button><b>${fmt(r.n)}</b></div>`).join("")}</div>` : ""}
       <div class="small muted" style="margin-top:10px">Memory holds ${fmt(p.overview.people_pulled)} people pulled with this tool and ${fmt(p.overview.seamless_saved)} contacts already in your Seamless accounts (${fmt(p.overview.emails_in_memory)} emails), on every account.</div></section>
     ${guessCard(p)}
-    ${prospeoCard(p)}
+    ${icyCard(p)}
 
     ${p.slices.length ? `<section class="card" aria-label="Smart scanning"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Smart scanning</h2><span class="small muted">${p.mode==="companies"?"One search per 100 companies. Companies that already have enough people are left out of later searches.":"Search split by company size, freshest first. A slice is left for later when new people get too expensive to find."}</span></div>
       <div class="tablewrap"><table><thead><tr><th>Slice</th><th class="right">Pages</th><th class="right">New people</th><th class="right">Per new email</th><th>Status</th></tr></thead><tbody>
@@ -568,22 +568,23 @@ function guessCard(p) {
     <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else. At a new company the common formats are tried first, after checking that the company doesn't accept every address.
       ${!g.ready && g.why_not ? `<div style="color:var(--warn);margin-top:4px">Guessing is paused right now: ${esc(g.why_not)}</div>` : ""}</div></section>`;
 }
-function prospeoCard(p) {
-  const r = p.prospeo || {}, pr = (p.overview||{}).prospeo || {};
-  if (!pr.has_key && !r.asked) return "";
-  const first = r.order === "prospeo_first";
-  return `<section class="card" aria-label="Prospeo"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Prospeo <span class="small muted" style="font-weight:500">· ${first?"asked before Seamless":"fills what Seamless misses"}</span></h2>
+function icyCard(p) {
+  const r = p.icypeas || {}, ic = (p.overview||{}).icypeas || {};
+  if (!ic.has_key && !r.asked && !r.old_prospeo) return "";
+  return `<section class="card" aria-label="Icypeas"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Icypeas <span class="small muted" style="font-weight:500">· fills what Seamless misses</span></h2>
       ${r.ready?'<span class="badge b-ok">Working</span>':`<span class="badge b-warn">Not asked now</span>`}</div>
-    <div class="grid g4"><div class="stat"><div class="k">Emails from Prospeo</div><div class="v" style="color:var(--ok)">${fmt(r.found)}</div><div class="h">verified by Prospeo</div></div>
-      <div class="stat"><div class="k">Asked</div><div class="v">${fmt(r.asked)}</div><div class="h">${fmt(r.none)} had no verified email (free)</div></div>
-      <div class="stat"><div class="k">Prospeo credits</div><div class="v">${fmt(r.credits)}</div><div class="h">${r.cap?`of ${fmt(r.cap)} max for this ${p.mode==="enrich"?"file":"pull"}`:"no limit per pull"}</div></div>
-      <div class="stat"><div class="k">Waiting for Prospeo</div><div class="v">${fmt(r.waiting)}</div><div class="h">${fmt(r.mismatch)} answers about a different person were thrown away</div></div></div>
-    ${r.search_on ? `<div class="small" style="margin-top:12px"><b>Prospeo search</b> (when Seamless has no more people at your companies): <b>${fmt(r.search_found)}</b> emails for people Seamless didn't have · ${fmt(r.search_pages)} search pages, ${fmt(r.search_credits)} credits${r.search_stopped?`<div style="color:var(--warn)">${esc(r.search_stopped)}</div>`:""}</div>` : ""}
-    <div class="small muted" style="margin-top:10px">${first?"People Prospeo has a verified email for aren't paid for in Seamless. ":"People Seamless had no usable email for are sent to Prospeo. "}${r.search_on?"On company lists, companies that are still short when Seamless runs out are searched in Prospeo's own database (1 credit per page of 25 people). ":""}Prospeo charges 1 credit per email it finds and nothing when it has none. Every answer is checked to be the same person (name and company website, or LinkedIn).
+    <div class="grid g4"><div class="stat"><div class="k">Emails from Icypeas</div><div class="v" style="color:var(--ok)">${fmt(r.found)}</div><div class="h">${ic.accept_probable?"ultra sure, very sure or probable":"ultra sure or very sure only"}</div></div>
+      <div class="stat"><div class="k">Looked up</div><div class="v">${fmt(r.asked)}</div><div class="h">${fmt(r.none)} had no email (free)${r.asking?` · ${fmt(r.asking)} answers on their way`:""}</div></div>
+      <div class="stat"><div class="k">Icypeas credits</div><div class="v">${fmt(r.credits)}</div><div class="h">${r.cap?`of ${fmt(r.cap)} max for this ${p.mode==="enrich"?"file":"pull"}`:"no limit per pull"}</div></div>
+      <div class="stat"><div class="k">Waiting for Icypeas</div><div class="v">${fmt(r.waiting)}</div><div class="h">${fmt(r.errors)} errors (never used as an email)</div></div></div>
+    ${r.search_on ? `<div class="small" style="margin-top:12px"><b>Icypeas people search</b> (when Seamless has no more people at your companies): ${fmt(r.search_people)} people found · <b>${fmt(r.search_found)}</b> got an email · ${fmt(r.search_credits)} credits for the search${r.search_stopped?`<div style="color:var(--warn)">${esc(r.search_stopped)}</div>`:""}</div>` : ""}
+    ${r.old_prospeo ? `<div class="small muted" style="margin-top:8px">${fmt(r.old_prospeo)} emails in this pull came from Prospeo before 2.5; they're kept and downloadable.</div>` : ""}
+    <div class="small muted" style="margin-top:10px">People Seamless had no usable email for are looked up in Icypeas in the background; answers come back within a minute or two. ${r.search_on?"On company lists, companies still short when Seamless runs out are searched in Icypeas's database (0.02 credits per person found). ":""}1 credit per email found, nothing when there's none. Only an email at the person's own company website is used.
       ${!r.ready && r.why_not ? `<div style="color:var(--warn);margin-top:4px">${esc(r.why_not)}</div>` : ""}</div></section>`;
 }
 const SRC_BADGE = r => r.email_source==="guessed" ? `<span class="badge b-ok" title="${esc(r.guess_note||"")}">Guessed · verified valid</span>`
-  : r.email_source==="prospeo" ? `<span class="badge b-ok" title="${esc(r.prospeo_note||"")}">${r.prospeo_pid?"Prospeo search · verified":"Prospeo · verified"}</span>`
+  : r.email_source==="icypeas" ? `<span class="badge b-ok" title="${esc(r.icy_note||"")}">${r.icy_search?"Icypeas search":"Icypeas"}</span>`
+  : r.email_source==="prospeo" ? `<span class="badge b-ok">Prospeo (before 2.5)</span>`
   : r.email_source==="already" ? `<span class="badge">Already had</span>` : `<span class="badge b-brand">Seamless</span>`;
 const FORMAT_HTML = f => f === "catch_all" ? `<span class="badge b-warn">Catch-all</span><div class="small muted">accepts any address, can't guess</div>`
   : f ? `<code>${esc(f)}</code>` : `<span class="muted">—</span>`;
@@ -632,7 +633,7 @@ function drawResults(p, keep) {
   const extra = view === "skipped" ? [{label:"Why skipped", html:r=>`<span class="small">${esc(r.skip_reason)}</span>`}]
     : view === "emails" ? [{label:"Email", sort:"email", html:r=>`${esc(r.email)} ${r.email_status&&r.email_status.toLowerCase()!=="valid"?`<span class="badge b-warn">${esc(r.email_status)}</span>`:""}${r.filled_free?' <span class="badge b-ok">free</span>':""}`},
         {label:"How we got it", html:SRC_BADGE}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}]
-    : [{label:"Seamless said", html:r=>`<span class="small">${esc(r.research_status||"")}${r.research_message?`<div class="muted">${esc(r.research_message)}</div>`:""}${r.prospeo_note?`<div class="muted">Prospeo: ${esc(r.prospeo_note)}</div>`:""}</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}];
+    : [{label:"Seamless said", html:r=>`<span class="small">${esc(r.research_status||"")}${r.research_message?`<div class="muted">${esc(r.research_message)}</div>`:""}${r.icy_note?`<div class="muted">Icypeas: ${esc(r.icy_note)}</div>`:""}</span>`}, {label:"Phone", html:r=>`<span class="nowrap">${esc(r.phone||"")}</span>`}];
   pagedTable($("#peopleTable"), `people.${p.id}.${view}.${PV.kind||""}`, {placeholder:"Search name, company, title, email or country", sort:"id",
     url: st => `/api/pulls/${p.id}/people?${qs({view, kind:PV.kind||"", offset:st.offset, limit:st.limit, q:st.q, sort:st.sort, dir:st.dir})}`,
     empty: view==="emails" ? "No emails yet." : "Nobody here.", cols: base.concat(extra)});
@@ -680,10 +681,10 @@ async function renderAccounts() {
         <label for="naBud" class="small"><b>Monthly budget (optional)</b></label><input id="naBud" type="number" min="0" placeholder="No own limit" style="margin:4px 0 12px">
         <button class="btn primary" id="naAdd">Check key and add</button><div class="small muted" style="margin-top:6px">Checked with a free call first; a key Seamless doesn't accept is never saved. Only the last 4 characters are ever shown.</div></section></div>
     <section class="card" style="margin-top:16px" id="mvCard"></section>
-    <section class="card" style="margin-top:16px" id="prCard"></section>
+    <section class="card" style="margin-top:16px" id="icyCard"></section>
     <section class="card" style="margin-top:16px"><h2>Spending history</h2><div id="ledger"></div></section>`);
   drawVerifier(ov.verifier);
-  drawProspeo(ov.prospeo || {});
+  drawIcypeas(ov.icypeas || {});
   const aid = el => +el.closest("[data-aid]").dataset.aid;
   const patch = async (el, body, msg) => { try { await api(`/api/accounts/${aid(el)}`, {method:"PATCH", body}); toast(msg); renderAccounts(); } catch(e) { toast(e.message, true); } };
   $("#main").onchange = e => { if (e.target.matches("[data-budget]")) patch(e.target, {monthly_budget:+e.target.value||0}, "Budget saved.");
@@ -726,40 +727,44 @@ function drawVerifier(mv) {
   $("#mvDel") && ($("#mvDel").onclick = e => { if (confirm("Remove the MillionVerifier key? Guessing stops; everyone is paid for in Seamless.")) go(e.currentTarget, null, "Key removed.", "DELETE"); });
 }
 
-function drawProspeo(pr) {
-  const box = $("#prCard"); if (!box) return;
-  const paused = pr.paused_until && pr.paused_until*1000 > Date.now();
-  const badge = !pr.has_key ? '<span class="badge">Not set up</span>' : !pr.on ? '<span class="badge">Off in .env</span>' : !pr.enabled ? '<span class="badge">Switched off</span>'
-    : pr.last_error ? '<span class="badge b-bad">Problem</span>' : pr.pause_reason ? '<span class="badge b-warn">Waiting for its limit</span>' : paused ? '<span class="badge b-warn">Paused</span>' : '<span class="badge b-ok">Working</span>';
-  box.innerHTML = `<div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Prospeo <span class="small muted" style="font-weight:500">· ${pr.order==="prospeo_first"?"asked before Seamless":"second source, after Seamless"}</span></h2>${badge}</div>
-    <p class="small muted" style="margin:0 0 12px">${pr.order==="prospeo_first"?"Each person is looked up in Prospeo first; Seamless is paid only for people Prospeo has no verified email for.":"When Seamless has no usable email for a person, Lead Puller asks Prospeo."} Only emails Prospeo has verified are used, and only for the same person (name and company website, or LinkedIn). Prospeo charges 1 credit per email it finds, nothing when it has none, and nothing for the same person again within 90 days. The order is SOURCE_ORDER in .env.</p>
-    ${pr.last_error ? `<div class="notice bad small">${esc(pr.last_error)}</div>` : ""}
-    ${!pr.on ? `<div class="notice warn small">PROSPEO_ENABLED=0 in .env: Prospeo is never asked.</div>` : ""}
-    ${pr.has_key ? `<div class="kv"><span>API key</span><span><code>${esc(pr.key)}</code>${pr.from_env?' <span class="small muted">from .env</span>':""}</span>
-        <span>Credits left</span><span><b>${fmt(pr.credits)}</b> ${pr.plan?`<span class="small muted">· ${esc(pr.plan)} plan</span>`:""} ${pr.credits_at?`<span class="small muted">· checked ${when(pr.credits_at)}</span>`:""}</span>
-        <span>Used this month</span><span>${fmt(pr.used_this_month)} credits by Lead Puller</span>
-        ${["enrich","search"].filter(k=>(pr.limits||{})[k]&&(pr.limits[k].day_limit!=null)).map(k=>{ const l = pr.limits[k]; return `<span>${k==="enrich"?"Email lookups today":"Searches today"}</span><span>${fmt(l.day_left)} of ${fmt(l.day_limit)} left <span class="small muted">· ${fmt(l.minute_limit)} a minute on your plan</span></span>`; }).join("")}</div>
-      ${pr.pause_reason ? `<div class="notice warn small" style="margin-top:10px">${esc(pr.pause_reason)}</div>` : ""}
-      <div class="row" style="margin-top:14px"><button class="btn small" id="prCheck">Check balance (free)</button>${pr.from_env?"":`<button class="btn small" id="prRekey">Replace key</button>`}
-        <button class="btn small" id="prToggle">${pr.enabled?"Switch Prospeo off":"Switch Prospeo on"}</button>${pr.from_env?"":`<button class="btn small danger" id="prDel">Remove key</button>`}</div>`
-    : `<div class="row" style="align-items:flex-end"><div style="flex:1 1 280px"><label for="prKey" class="small"><b>API key</b></label><input id="prKey" type="password" autocomplete="off" placeholder="Prospeo → API" style="margin-top:4px"></div>
-        <button class="btn primary" id="prAdd">Check key and add</button></div>
-      <div class="small muted" style="margin-top:6px">Checked with a free call first; a key Prospeo doesn't accept is never saved. Only the last 4 characters are ever shown. Without a key everything works as before, with Seamless only.</div>`}`;
-  const go = (btn, body, msg, method) => busy(btn, async () => { const r = await api("/api/prospeo", method ? {method} : {body}); toast(msg); drawProspeo(r); META = await api("/api/meta"); refreshTop(META.overview); });
-  $("#prAdd") && ($("#prAdd").onclick = e => go(e.currentTarget, {api_key:$("#prKey").value}, "Prospeo key added."));
-  $("#prCheck") && ($("#prCheck").onclick = e => go(e.currentTarget, {check:1}, "Balance checked."));
-  $("#prToggle") && ($("#prToggle").onclick = e => go(e.currentTarget, {enabled:!pr.enabled}, pr.enabled?"Prospeo off: Seamless only.":"Prospeo on."));
-  $("#prRekey") && ($("#prRekey").onclick = e => { const k = prompt("Paste the new Prospeo API key:"); if (k) go(e.currentTarget, {api_key:k}, "Key replaced."); });
-  $("#prDel") && ($("#prDel").onclick = e => { if (confirm("Remove the Prospeo key? Lead Puller goes back to Seamless only.")) go(e.currentTarget, null, "Key removed.", "DELETE"); });
+function drawIcypeas(ic) {
+  const box = $("#icyCard"); if (!box) return;
+  const paused = ic.paused_until && ic.paused_until*1000 > Date.now();
+  const badge = !ic.has_key ? '<span class="badge">Not set up</span>' : !ic.on ? '<span class="badge">Off in .env</span>' : !ic.enabled ? '<span class="badge">Switched off</span>'
+    : ic.last_error ? '<span class="badge b-bad">Problem</span>' : ic.pause_reason ? '<span class="badge b-warn">Waiting</span>' : paused ? '<span class="badge b-warn">Paused</span>' : '<span class="badge b-ok">Working</span>';
+  const samples = Object.entries(ic.samples||{});
+  box.innerHTML = `<div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Icypeas <span class="small muted" style="font-weight:500">· second source, after Seamless</span></h2>${badge}</div>
+    <p class="small muted" style="margin:0 0 12px">When Seamless has no usable email for a person, Lead Puller looks them up in Icypeas (first + last name and company website). Only emails Icypeas rates ${ic.accept_probable?"ultra sure, very sure or probable":"ultra sure or very sure"} and at the person's own company website are used. 1 credit per email found, nothing when there's none. ${ic.search_on?"On company lists, when Seamless runs out, the companies still short are searched in Icypeas's database (0.02 credits per person found).":""}</p>
+    ${ic.last_error ? `<div class="notice bad small">${esc(ic.last_error)}</div>` : ""}
+    ${ic.pause_reason ? `<div class="notice warn small">${esc(ic.pause_reason)}</div>` : ""}
+    ${!ic.on ? `<div class="notice warn small">ICYPEAS_ENABLED=0 in .env: Icypeas is never asked.</div>` : ""}
+    ${ic.has_key ? `<div class="kv"><span>API key</span><span><code>${esc(ic.key)}</code>${ic.from_env?' <span class="small muted">from .env</span>':""}</span>
+        <span>Credits left</span><span>${ic.credits==null?'<span class="muted">add your Icypeas login email below to see them</span>':`<b>${fmt(Math.floor(ic.credits))}</b>`} ${ic.credits_at?`<span class="small muted">· checked ${when(ic.credits_at)}</span>`:""}</span>
+        <span>Icypeas login email</span><span><input id="icyEmail" value="${esc(ic.account_email||"")}" placeholder="only to read the credits left" style="max-width:260px" aria-label="Icypeas login email"></span>
+        <span>Used this month</span><span>${fmt(ic.used_this_month)} credits by Lead Puller</span></div>
+      <div class="row" style="margin-top:14px"><button class="btn small" id="icyCheck">Check balance (free)</button>${ic.from_env?"":`<button class="btn small" id="icyRekey">Replace key</button>`}
+        <button class="btn small" id="icyToggle">${ic.enabled?"Switch Icypeas off":"Switch Icypeas on"}</button>${ic.from_env?"":`<button class="btn small danger" id="icyDel">Remove key</button>`}</div>
+      ${samples.length ? `<details style="margin-top:12px"><summary class="small">Icypeas's last answers (for your developer)</summary>${samples.map(([k,v])=>`<div class="small" style="margin-top:6px"><b>${esc(k)}</b> · HTTP ${esc(v.http)} · ${when(v.at)}<pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font-size:11px">${esc(v.body)}</pre></div>`).join("")}</details>` : ""}`
+    : `<div class="row" style="align-items:flex-end"><div style="flex:1 1 260px"><label for="icyKey" class="small"><b>API key</b></label><input id="icyKey" type="password" autocomplete="off" placeholder="Icypeas → your profile → API" style="margin-top:4px"></div>
+        <div style="flex:1 1 220px"><label for="icyEmail" class="small"><b>Icypeas login email</b> (optional)</label><input id="icyEmail" placeholder="to show the credits left" style="margin-top:4px"></div>
+        <button class="btn primary" id="icyAdd">Check key and add</button></div>
+      <div class="small muted" style="margin-top:6px">Checked with a free call first; a key Icypeas doesn't accept is never saved. Only the last 4 characters are ever shown. Without a key, everything works with Seamless only.</div>`}`;
+  const go = (btn, body, msg, method) => busy(btn, async () => { const r = await api("/api/icypeas", method ? {method} : {body}); toast(msg); drawIcypeas(r); META = await api("/api/meta"); refreshTop(META.overview); });
+  $("#icyAdd") && ($("#icyAdd").onclick = e => go(e.currentTarget, {api_key:$("#icyKey").value, account_email:$("#icyEmail").value.trim()}, "Icypeas key added."));
+  $("#icyCheck") && ($("#icyCheck").onclick = e => go(e.currentTarget, {check:1}, "Balance checked."));
+  ic.has_key && $("#icyEmail") && ($("#icyEmail").onchange = e => go(e.target, {account_email:e.target.value.trim()}, "Saved."));
+  $("#icyToggle") && ($("#icyToggle").onclick = e => go(e.currentTarget, {enabled:!ic.enabled}, ic.enabled?"Icypeas off: Seamless only.":"Icypeas on."));
+  $("#icyRekey") && ($("#icyRekey").onclick = e => { const k = prompt("Paste the new Icypeas API key:"); if (k) go(e.currentTarget, {api_key:k}, "Key replaced."); });
+  $("#icyDel") && ($("#icyDel").onclick = e => { if (confirm("Remove the Icypeas key? Lead Puller goes back to Seamless only.")) go(e.currentTarget, null, "Key removed.", "DELETE"); });
 }
 
 // ------------------------------------------------------------ enrich contacts (2.3)
 let EN = null;
 const EN_FIELDS = [["first_name","First name"],["last_name","Last name"],["full_name","Full name"],["company","Company"],["website","Company website"],["linkedin","LinkedIn"],["title","Job title"],["email","Old email"]];
-const EN_KIND = {lookup:["Will be looked up",""], have:["You already have the email (free)","b-ok"], looked_before:["Looked up in Seamless before: Prospeo only, never paid twice","b-brand"], thin:["Not enough to look up","b-warn"], dnp:["On your do-not-pull list","b-bad"], dup:["Same person twice in the file",""]};
+const EN_KIND = {lookup:["Will be looked up",""], have:["You already have the email (free)","b-ok"], looked_before:["Looked up in Seamless before: Icypeas only, never paid twice","b-brand"], thin:["Not enough to look up","b-warn"], dnp:["On your do-not-pull list","b-bad"], dup:["Same person twice in the file",""]};
 async function renderEnrich() {
   EN = null;
-  const ov = META.overview, accs = (ov.accounts||[]).filter(a=>a.enabled), pr = ov.prospeo || {}, mv = ov.verifier || {};
+  const ov = META.overview, accs = (ov.accounts||[]).filter(a=>a.enabled), pr = ov.icypeas || {}, mv = ov.verifier || {};
   setMain(`<h1>Enrich contacts</h1><p class="sub">Upload people you already have (a CSV or Excel file with names and companies, or LinkedIn links) and get their emails. Your file comes back with the emails added.</p>
     <section class="card"><h2>1. Your file</h2>
       <input type="file" id="enFile" accept=".csv,.xlsx,.xlsm,.txt" aria-label="Choose a CSV or Excel file">
@@ -769,8 +774,8 @@ async function renderEnrich() {
       <ol class="small" style="margin:0;padding-left:18px;line-height:1.7">
         <li><b>Already have their email?</b> Filled in free (any earlier pull or your Seamless saved contacts).</li>
         <li><b>Guess + MillionVerifier</b> where the company's email format is known ${mv.has_key?'<span class="badge b-ok">on</span>':'<span class="badge">no key</span>'}: no Seamless credit.</li>
-        <li><b>${pr.order==="prospeo_first"?"Prospeo, then Seamless":"Seamless, then Prospeo"}</b>: Seamless costs 1 credit per person ${accs.length?'':'<span class="badge b-bad">no account</span>'}; Prospeo 1 credit per email it finds ${pr.has_key?'<span class="badge b-ok">on</span>':'<span class="badge">no key: <a href="#/accounts">add it</a></span>'}.</li></ol>
-      <div class="small muted" style="margin-top:8px">Nobody is ever paid for twice, on any Seamless account or in Prospeo. People on your do-not-pull list are skipped.</div></section>`);
+        <li><b>Seamless, then Icypeas</b>: Seamless costs 1 credit per person ${accs.length?'':'<span class="badge b-bad">no account</span>'}; Icypeas 1 credit per email it finds ${pr.has_key?'<span class="badge b-ok">on</span>':'<span class="badge">no key: <a href="#/accounts">add it</a></span>'}.</li></ol>
+      <div class="small muted" style="margin-top:8px">Nobody is ever paid for twice, on any Seamless account or in Icypeas. People on your do-not-pull list are skipped.</div></section>`);
   $("#enFile").onchange = async e => { const f = e.target.files[0]; if (!f) return; const fd = new FormData(); fd.append("file", f);
     $("#enCheck").innerHTML = '<span class="spin"></span> Reading the file…';
     try { EN = await api("/api/enrich/check", {body:fd}); drawEnrichCheck(); } catch(err) { $("#enCheck").innerHTML = `<div class="notice bad">${esc(err.message)}</div>`; } };
@@ -788,13 +793,13 @@ function drawEnrichCheck() {
       <label class="small"><b>Name</b><input id="enName" value="Enrich: ${esc(c.file)}" style="margin-top:4px"></label>
       <label class="small"><b>Max Seamless credits</b><input id="enMax" type="number" min="1" value="${c.default_max_credits||1}" style="margin-top:4px"><span class="muted">at most ${fmt(c.seamless_max)} people need a lookup${c.seamless_on?"":" · Seamless is off (ENRICH_USE_SEAMLESS=0)"}</span></label>
       <label class="small"><b>Seamless account</b><select id="enAcct" style="margin-top:4px"><option value="auto">Automatic (in your order)</option>${accs.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join("")}</select></label></div>
-    ${!c.prospeo_ready ? `<div class="small muted" style="margin-top:8px">Prospeo won't be asked: ${esc(c.prospeo_why||"")}</div>` : ""}
+    ${!c.icypeas_ready ? `<div class="small muted" style="margin-top:8px">Icypeas won't be asked: ${esc(c.icypeas_why||"")}</div>` : ""}
     <div class="row" style="margin-top:16px"><button class="btn primary" id="enStart" ${(n.lookup||0)+(n.looked_before||0)+(n.have||0)?"":"disabled"}>Start</button><span class="small muted">You can pause or stop it at any time; everything found is kept.</span></div>`;
   $$("#enCheck [data-map]").forEach(sel => sel.onchange = async () => {
     const mapping = {}; $$("#enCheck [data-map]").forEach(s2 => { if (s2.value !== "") mapping[s2.dataset.map] = +s2.value; });
     try { const name = $("#enName").value; EN = await api("/api/enrich/recheck", {body:{token:EN.token, mapping}}); drawEnrichCheck(); $("#enName").value = name; } catch(err) { toast(err.message, true); } });
   $("#enStart").onclick = e => { const mapping = {}; $$("#enCheck [data-map]").forEach(s2 => { if (s2.value !== "") mapping[s2.dataset.map] = +s2.value; });
-    if (!confirm(`Start? Up to ${fmt(+$("#enMax").value||0)} Seamless credits${(META.overview.prospeo||{}).has_key?" plus Prospeo credits for the emails it finds":""}.`)) return;
+    if (!confirm(`Start? Up to ${fmt(+$("#enMax").value||0)} Seamless credits${(META.overview.icypeas||{}).has_key?" plus Icypeas credits for the emails it finds":""}.`)) return;
     busy(e.currentTarget, async () => { const p = await api("/api/enrich", {body:{token:EN.token, mapping, name:$("#enName").value.trim(), max_credits:+$("#enMax").value||0, account:$("#enAcct").value}});
       location.hash = "#/pull/" + p.id; }); };
 }

@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -85,52 +85,58 @@ SETTINGS = [
     ("MILLIONVERIFIER_BASE_URL", "https://api.millionverifier.com/api/v3", "str", "Email guessing",
      "MillionVerifier API address"),
 
-    ("PROSPEO_ENABLED", "1", "bool", "Prospeo (second source)",
-     "2.3: when Seamless has no usable email for a person, ask Prospeo (needs the Prospeo key on the Accounts page; "
-     "0 = off, everything works as in 2.2)"),
-    ("SOURCE_ORDER", "seamless,prospeo", "str", "Prospeo (second source)",
-     "Which paid source is asked first: seamless,prospeo (Prospeo only fills what Seamless misses) or "
-     "prospeo,seamless (Prospeo first; Seamless only for the people Prospeo has no verified email for)"),
-    ("PROSPEO_SEARCH", "1", "bool", "Prospeo (second source)",
-     "2.4: on \"People at my companies\" pulls, when Seamless has no more people, search Prospeo's own database for "
-     "the companies that are still short (same job titles), then get their verified emails. Search costs 1 Prospeo credit "
-     "per page of up to 25 people; each verified email 1 more (0 = off)"),
-    ("PROSPEO_SEARCH_BATCH", "100", "int", "Prospeo (second source)",
-     "Companies per Prospeo search (Prospeo takes up to 500)"),
-    ("PROSPEO_SEARCH_MAX_PAGES", "20", "int", "Prospeo (second source)",
-     "Most pages of 25 people read per batch of companies (each page 1 Prospeo credit)"),
-    ("PROSPEO_ONLY_VERIFIED", "1", "bool", "Prospeo (second source)",
-     "Only take emails Prospeo has verified (recommended); Prospeo charges nothing when it has none"),
-    ("PROSPEO_MAX_CREDITS_PER_PULL", "500", "int", "Prospeo (second source)",
-     "Most Prospeo credits one pull or enrichment may use (0 = no limit). Prospeo charges 1 credit per email found"),
-    ("PROSPEO_MIN_CREDITS_LEFT", "20", "int", "Prospeo (second source)",
-     "Stop asking Prospeo when it has fewer credits left than this"),
-    ("PROSPEO_PER_STEP", "50", "int", "Prospeo (second source)",
-     "People sent to Prospeo per step (one call, Prospeo's max is 50), so Pause and Stop always answer quickly"),
-    ("PROSPEO_TIMEOUT_SECONDS", "40", "int", "Prospeo (second source)",
-     "Prospeo answer time limit per call; a slow answer is never counted as found (the person is tried again)"),
-    ("PROSPEO_SECONDS_BETWEEN_CALLS", "2", "float", "Prospeo (second source)",
-     "2.4.1: wait at least this long between two Prospeo calls (Prospeo limits requests per second, minute and day "
-     "by plan; when it says a limit is reached, Lead Puller waits exactly as long as Prospeo says)"),
-    ("PROSPEO_LATE_DAYS", "3", "int", "Prospeo (second source)",
-     "2.4.1: people still waiting for Prospeo when a pull finishes (e.g. Prospeo's daily limit was reached) are asked "
-     "later by themselves, for this many days (0 = never)"),
-    ("PROSPEO_ERRORS_PAUSE", "3", "int", "Prospeo (second source)",
-     "After this many Prospeo errors in a row, stop asking Prospeo for 30 minutes"),
-    ("PROSPEO_API_KEY", "", "secret", "Prospeo (second source)",
-     "Optional. The Prospeo key is normally added on the Accounts page; a key here is used when none is set there"),
-    ("PROSPEO_BASE_URL", "https://api.prospeo.io", "str", "Prospeo (second source)", "Prospeo API address"),
+    ("ICYPEAS_ENABLED", "1", "bool", "Icypeas (second source)",
+     "2.5: when Seamless has no usable email for a person, ask Icypeas (needs the Icypeas key on the Accounts page; "
+     "0 = off, Seamless only)"),
+    ("ICYPEAS_SEARCH", "1", "bool", "Icypeas (second source)",
+     "On \"People at my companies\" pulls, when Seamless has no more people, search Icypeas's database for the "
+     "companies that are still short (same job titles), then look up their emails. 0.02 Icypeas credits per person "
+     "the search returns; 1 per email found (0 = off)"),
+    ("ICYPEAS_ACCEPT_PROBABLE", "0", "bool", "Icypeas (second source)",
+     "1 = also use emails Icypeas rates \"probable\" (up to 5% bounce); 0 (recommended) = only ultra sure / very sure "
+     "(under 1% bounce)"),
+    ("ICYPEAS_MAX_CREDITS_PER_PULL", "500", "int", "Icypeas (second source)",
+     "Most Icypeas credits one pull or enrichment may use (0 = no limit)"),
+    ("ICYPEAS_MIN_CREDITS_LEFT", "20", "int", "Icypeas (second source)",
+     "Stop asking Icypeas when it has fewer credits left than this (only known when the account email is set)"),
+    ("ICYPEAS_BATCH", "100", "int", "Icypeas (second source)",
+     "People sent to Icypeas in one lookup (it works in the background; answers are read a few seconds later)"),
+    ("ICYPEAS_SEARCH_MAX_PAGES", "10", "int", "Icypeas (second source)",
+     "Most pages of 100 people read per batch of companies in the people search"),
+    ("ICYPEAS_WAIT_MINUTES", "20", "int", "Icypeas (second source)",
+     "A pull waits this long for Icypeas's answers before finishing; later answers still fill in (for LATE_DAYS)"),
+    ("ICYPEAS_LATE_DAYS", "3", "int", "Icypeas (second source)",
+     "People still waiting for Icypeas when a pull finishes are asked / read later by themselves, for this many days "
+     "(0 = never); never for pulls you stopped"),
+    ("ICYPEAS_SECONDS_BETWEEN_CALLS", "1.5", "float", "Icypeas (second source)",
+     "Wait at least this long between two lookups or searches (Icypeas allows 1 bulk lookup a second; results are read "
+     "at most 25 times a minute)"),
+    ("ICYPEAS_POLL_SECONDS", "4", "float", "Icypeas (second source)",
+     "How often a running Icypeas lookup is checked for answers (free)"),
+    ("ICYPEAS_READS_PER_MINUTE", "25", "int", "Icypeas (second source)",
+     "Most answer checks per minute (Icypeas allows 30)"),
+    ("ICYPEAS_TIMEOUT_SECONDS", "40", "int", "Icypeas (second source)", "Icypeas answer time limit per call"),
+    ("ICYPEAS_ERRORS_PAUSE", "3", "int", "Icypeas (second source)",
+     "After this many Icypeas errors in a row, stop asking Icypeas for 30 minutes"),
+    ("ICYPEAS_API_KEY", "", "secret", "Icypeas (second source)",
+     "Optional. The Icypeas key is normally added on the Accounts page; a key here is used when none is set there"),
+    ("ICYPEAS_ACCOUNT_EMAIL", "", "str", "Icypeas (second source)",
+     "Optional. Your Icypeas login email, only to read the credits left (also settable on the Accounts page)"),
+    ("ICYPEAS_BASE_URL", "https://app.icypeas.com/api", "str", "Icypeas (second source)", "Icypeas API address"),
 
     ("ENRICH_MAX_ROWS", "5000", "int", "Enrich contacts",
      "2.3: largest file the Enrich contacts page accepts"),
     ("ENRICH_USE_SEAMLESS", "1", "bool", "Enrich contacts",
-     "Look people up in Seamless on the Enrich contacts page (1 credit each); 0 = only free checks, guessing and Prospeo"),
+     "Look people up in Seamless on the Enrich contacts page (1 credit each); 0 = only free checks, guessing and Icypeas"),
     ("ENRICH_DEFAULT_MAX_CREDITS", "1.2", "float", "Enrich contacts",
      "Max Seamless credits pre-filled for an enrichment = rows that need a lookup × this"),
 
     ("DEFAULT_PER_COMPANY", "2", "int", "Company lists",
      "People per company preselected for \"People at my companies\" pulls (most senior first)"),
     ("COMPANY_LIST_MAX", "2000", "int", "Company lists", "Largest company list one pull accepts"),
+    ("COMPANY_SKIP_DAYS", "90", "int", "Company lists",
+     "2.5: a new company list leaves out companies already in a pull you made in the last N days (their people are "
+     "already pulled; searching them again only costs search credits). \"Run again\" on a pull is not affected (0 = off)"),
     ("COMPANY_BATCH", "100", "int", "Company lists", "Companies per Seamless search (Seamless allows up to 100)"),
     ("RESLICE_FULL_SHARE", "50", "int", "Company lists",
      "Only used when Seamless doesn't say how many people match: when this % of a batch's companies already have "

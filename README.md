@@ -1,4 +1,4 @@
-# Lead Puller 2.4.1
+# Lead Puller 2.5.0
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
@@ -6,86 +6,57 @@ memory of everyone already paid for is copied over automatically (see "Moving fr
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
 
-## 2.4.1: Prospeo's plan limits
+## New in 2.5: Icypeas replaces Prospeo (Seamless first, Icypeas second)
 
-Prospeo limits requests per plan (free plan: 1 a second, 20 a minute, 50 a day for email lookups, the same again for
-searches), and a bulk lookup counts **one request per person**. 2.4.0 sent 50 people at once, so the free plan
-answered "too many requests". Now:
-- Lead Puller reads Prospeo's limits from every answer and never sends more people than the minute and the day
-  still allow; it waits `PROSPEO_SECONDS_BETWEEN_CALLS` (2) between calls.
-- "Too many requests" is a wait (exactly as long as Prospeo says), never an error: nobody is given up on.
-- When the daily limit is used up, the pull finishes normally and the people still waiting are asked by themselves
-  when the limit resets, for `PROSPEO_LATE_DAYS` (3) days. Never for a pull you stopped.
-- The Accounts page shows "Email lookups today: X of 50 left" and why Prospeo is waiting.
+Prospeo is gone from the app. **Icypeas** now does everything Prospeo did, at a lower cost:
 
-## New in 2.4: Prospeo also finds people Seamless doesn't have
+- **Seamless misses.** When Seamless has no usable email for a person (not found, no email, an invalid one or a
+  duplicate), Lead Puller asks Icypeas in the background while the pull carries on. Icypeas answers lookups a little
+  later (usually seconds to minutes), so the pull waits up to `ICYPEAS_WAIT_MINUTES` (20) for the last answers; anything
+  later still fills in on its own for `ICYPEAS_LATE_DAYS` (3) days. Never for a pull you stopped.
+- **Only safe emails are used:** Icypeas rates every email `ultra sure`, `very sure` (both under 1% bounce) or
+  `probable` (under 5%). Only the first two are used, unless you set `ICYPEAS_ACCEPT_PROBABLE=1`. An email at another
+  company's website is thrown away. Answers are matched to people by Lead Puller's own id, never by position.
+- **People Seamless doesn't have (company lists).** When Seamless runs out of people at your companies, Icypeas's own
+  people database is searched with the same job titles, exclusions and countries, never more per company than you
+  asked for, and never anyone already paid for. `ICYPEAS_SEARCH=1` (0 = off). Filter pulls never use the search.
+- **Enrich contacts** uses Icypeas instead of Prospeo (after the free checks and Seamless).
+- **Cost (Icypeas):** 1 credit per email found (Icypeas may also charge for some misses: these are counted), 0.02 per
+  person a people search returns. All of it counts towards `ICYPEAS_MAX_CREDITS_PER_PULL` (500); below
+  `ICYPEAS_MIN_CREDITS_LEFT` (20) Icypeas isn't asked. Icypeas credits are logged apart from Seamless's.
+- **Errors never become emails.** A failure, timeout or unreadable answer leaves the person to be asked again;
+  3 errors in a row (`ICYPEAS_ERRORS_PAUSE`) pause Icypeas for 30 minutes; "too many requests" is only a wait.
+  An unpaid Icypeas plan (the API needs a paid plan) is shown on the Accounts page in plain words.
+- **Accounts page:** Icypeas API key (checked with a free call, a wrong key is never saved), the email you log in to
+  Icypeas with (used to show your credits), on/off and people-search switches, and "Icypeas's last answers (for your
+  developer)": the raw shape of the last answers, in case Icypeas changes its format.
+- **Companies already pulled are left out of new company lists.** A company that was in a company-list pull in the
+  last `COMPANY_SKIP_DAYS` (90) days shows as "already pulled, left out" when you check a new list, and is not searched
+  again (0 = off). "Run again" on a pull is not affected (it only looks for new people there). People already paid for
+  were never paid for twice, and still aren't.
+- **Old data is kept.** Prospeo's tables, logs and emails stay in the database; old Prospeo emails still download,
+  marked `prospeo (verified, before 2.5)`.
 
-On **People at my companies** pulls, when Seamless has no more people, the companies that are still short (fewer
-people with an email than you asked for) are searched in **Prospeo's own database** with the same job titles (or,
-with no titles, the same seniority). People you already have (any pull, any account), people on do-not-pull, people
-your title excludes leave out and people outside your countries are skipped for free; the rest, most senior first and
-never more per company than you asked for, get a Prospeo-verified email.
-
-- Cost: 1 Prospeo credit per search page of up to 25 people (pages with nobody are free) + 1 per verified email
-  (nothing when there's none). Both count towards `PROSPEO_MAX_CREDITS_PER_PULL`.
-- Settings: `PROSPEO_SEARCH=1` (0 = off), `PROSPEO_SEARCH_BATCH=100` companies per search,
-  `PROSPEO_SEARCH_MAX_PAGES=20` pages per batch.
-- If your Prospeo plan doesn't include the search, the pull says so and finishes normally.
-- The pull page's Prospeo card shows emails from the search, pages and credits; the download's "How we got the
-  email" says `prospeo search (verified)`.
-- Together with 2.3: a person Seamless has but without a usable email gets a Prospeo email lookup; a person Seamless
-  doesn't have at all can now be found by Prospeo's search. "Anyone matching filters" pulls are unchanged (Prospeo
-  only fills Seamless's misses there).
-
-Upgrade: same as 2.3 (unzip over the folder, keep `data/` and `.env`, `docker compose up -d --build`); healthz says
-`2.4.0`. No `.env` change needed.
-
-## 2.3.1 fix
-
-Prospeo answers `NO_MATCH` when nobody in a batch has a verified email. 2.3.0 counted that as an error and paused
-Prospeo for 30 minutes; it is now "no Prospeo email" (no charge) and Prospeo carries on. People already marked that
-way are put right on the first start.
-
-## New in 2.3 (Prospeo as a second source, and Enrich contacts)
-
-- **Prospeo fills what Seamless misses.** When Seamless has no usable email for a person (not found, no email, or
-  an invalid one), Lead Puller asks Prospeo. Only emails Prospeo has **verified** are used, and only when the answer
-  is the same person (same LinkedIn, or same name and company website); anything else is thrown away. Prospeo charges
-  1 credit per email it finds, nothing when it has none, and nothing for the same person again within 90 days.
-  Add the Prospeo key on the **Accounts** page (checked with a free call first; a key Prospeo doesn't accept is never
-  saved). Without a key, Lead Puller works exactly as before.
-- **Order is one .env line:** `SOURCE_ORDER=seamless,prospeo` (default: Seamless first, Prospeo for the misses) or
-  `prospeo,seamless` (Prospeo first; Seamless only for people Prospeo has no verified email for).
-- **Limits:** `PROSPEO_MAX_CREDITS_PER_PULL` (default 500), `PROSPEO_MIN_CREDITS_LEFT` (stops asking below 20),
-  errors pause Prospeo for 30 minutes after 3 in a row. Prospeo's credits are logged apart from Seamless's, so the
-  Seamless spending history stays exact.
-- **Enrich contacts (new tab).** Upload a CSV or Excel file of people you already have (first/last or full name,
-  company, website, LinkedIn, job title, old email; Lead Puller finds the columns and you can change them). Before
-  anything is spent it shows how many rows will be looked up, how many you already have (free), how many were looked
-  up in Seamless before (never paid twice: Prospeo only) and which rows don't have enough details. Each person:
-  already have the email → free; guess + MillionVerifier where the company's format is known → free in Seamless;
-  then Seamless (by LinkedIn, or name + company, 1 credit) and Prospeo, in your SOURCE_ORDER. Download: **your own
-  file, same rows and order, with Email, Email status, How we got the email, Job title, LinkedIn, Company website and
-  a note added on the right** (CSV or Excel), plus the usual AnavMail file. Settings: `ENRICH_MAX_ROWS`,
-  `ENRICH_USE_SEAMLESS` (0 = only free checks and Prospeo), `ENRICH_DEFAULT_MAX_CREDITS`.
-- The download's "How we got the email" column now also says `prospeo (verified)` and `already had`.
-
-### Upgrading to 2.3 (from 2.1 or 2.2)
+### Upgrading to 2.5 (from 2.1 - 2.4.1)
 
 Replace the code, keep `data/` and `.env`. Nothing is redone from scratch:
 
 ```bash
 cd lead-puller-2 && docker compose down
 cp -r data ../lead-puller-2-data-backup            # backup first
-# unzip lead-puller-2.3.0.zip over this folder (it never contains data/ or .env)
+# unzip lead-puller-2.5.0.zip over this folder (it never contains data/ or .env)
 docker compose up -d --build
-curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.3.1"}
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.5.0"}
 ```
 
-The database gets its new columns and tables on start (tested on a 2.2 database: every pull, person, credit and
-setting is kept). No `.env` change is needed: every new setting has a default and is listed in `.env.example`.
-Then add the Prospeo key on the Accounts page. Rollback: stop or finish any running enrichment first, then unzip
-the previous version and rebuild.
+New tables and columns are added on start (tested on a 2.4.1 database with Prospeo data: every pull, person, credit
+and setting is kept). No `.env` change is needed; the `PROSPEO_*` and `SOURCE_ORDER` lines can be deleted (they are
+ignored). Optionally add `ICYPEAS_API_KEY=` and `ICYPEAS_ACCOUNT_EMAIL=` to `.env`, or add both on the Accounts page.
+
+## Before 2.5
+
+2.3 - 2.4.1 used Prospeo as the second source (email lookups, people search, Enrich contacts); 2.5 replaces it with
+Icypeas and keeps everything else those versions added (Enrich contacts, the company list improvements).
 
 ## New in 2.2 (fewer Seamless credits per email on company lists)
 
@@ -254,10 +225,10 @@ Seamless charged each key.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest -q                       # 158 tests, ~15 s, against a fake Seamless + fake MillionVerifier
+python -m pytest -q                       # 157 tests, ~90 s, against fake Seamless, MillionVerifier and Icypeas
 FAKE_SEED=7 python -m pytest -q           # same tests on a differently shuffled fake
 LP_TEST_GUESSING=1 python -m pytest -q    # every test again with email guessing switched on
-LP_TEST_PROSPEO=1 python -m pytest -q     # every test again with Prospeo switched on
+LP_TEST_ICYPEAS=1 python -m pytest -q     # every test again with Icypeas switched on
 ```
 
 Or inside the container: `docker compose exec leadpuller python -m pytest -q`.

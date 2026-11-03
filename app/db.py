@@ -84,6 +84,15 @@ CREATE TABLE IF NOT EXISTS prospeo_log(id INTEGER PRIMARY KEY, at REAL, pull_id 
   person_key TEXT, result TEXT, cost INTEGER DEFAULT 0, email TEXT, note TEXT);
 CREATE INDEX IF NOT EXISTS pl_pull ON prospeo_log(pull_id);
 CREATE INDEX IF NOT EXISTS pl_key ON prospeo_log(person_key, at);
+CREATE TABLE IF NOT EXISTS icypeas(id INTEGER PRIMARY KEY CHECK(id=1), api_key TEXT, account_email TEXT,
+  enabled INTEGER DEFAULT 1, credits REAL, credits_at REAL, last_error TEXT, errors_in_row INTEGER DEFAULT 0,
+  paused_until REAL DEFAULT 0, pause_reason TEXT);
+CREATE TABLE IF NOT EXISTS icypeas_jobs(job TEXT PRIMARY KEY, pull_id INTEGER, created_at REAL, rows_n INTEGER,
+  polls INTEGER DEFAULT 0, last_poll_at REAL DEFAULT 0, done_at REAL, gave_up INTEGER DEFAULT 0);
+CREATE INDEX IF NOT EXISTS ij_pull ON icypeas_jobs(pull_id, done_at);
+CREATE TABLE IF NOT EXISTS icypeas_log(id INTEGER PRIMARY KEY, at REAL, pull_id INTEGER, contact_id INTEGER,
+  person_key TEXT, result TEXT, cost REAL DEFAULT 0, email TEXT, note TEXT);
+CREATE INDEX IF NOT EXISTS il_pull ON icypeas_log(pull_id);
 """
 # Columns added after 2.0 (old databases get them on start).
 MIGRATIONS = {
@@ -98,6 +107,9 @@ MIGRATIONS["contacts"] += [("prospeo_state", "TEXT"), ("prospeo_note", "TEXT"), 
                            ("enrich_input", "TEXT")]
 MIGRATIONS["pulls"] += [("enrich_header", "TEXT")]
 MIGRATIONS["contacts"] += [("prospeo_pid", "TEXT")]          # 2.4: a person found by Prospeo's own search
+# 2.5: Icypeas (second source); the old Prospeo columns/tables are kept, unused, so nothing you had is deleted
+MIGRATIONS["contacts"] += [("icy_state", "TEXT"), ("icy_note", "TEXT"), ("icy_job", "TEXT"), ("icy_asked_at", "REAL"),
+                           ("icy_search", "INTEGER DEFAULT 0")]
 # 2.4.1: Prospeo's own request limits (per plan), read from its answers, and why it is paused
 MIGRATIONS["prospeo"] = [("pause_reason", "TEXT"), ("limits_json", "TEXT"), ("last_call_at", "REAL DEFAULT 0")]
 

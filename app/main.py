@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import accounts, claude, companies, db, engine, exports, guess, importer, memory, prospeo, seamless, verifier
+from . import accounts, claude, companies, db, engine, exports, guess, icypeas, importer, memory, seamless, verifier
 from . import filters as F
 from .config import APP_VERSION, cfg, shown_settings
 
@@ -25,7 +25,6 @@ async def lifespan(app):
     db.connect()
     importer.auto_import()
     accounts.sync_env_key()
-    prospeo.repair_no_match()                      # 2.3.1: NO_MATCH was wrongly counted as an error in 2.3.0
     if not os.environ.get("DISABLE_WORKER"):
         _worker = engine.Worker()
         _worker.start()
@@ -44,7 +43,7 @@ def _err(status):
 
 
 for _exc in (engine.PullError, seamless.SeamlessError, claude.ClaudeError, verifier.VerifierError,
-             prospeo.ProspeoError, ValueError):
+             icypeas.IcypeasError, ValueError):
     app.add_exception_handler(_exc, _err(400))
 
 
@@ -117,8 +116,8 @@ def _overview():
             "budget_left": max(0, budget - spent) if budget else None, "spending_enabled": cfg.SPENDING_ENABLED,
             "shared_pools": _shared_pools(), "low": [a["name"] for a in accs if a["enabled"] and a["low"]],
             "people_pulled": db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL OR "
-                                   "email_source IN ('guessed','prospeo')")["n"],
-            "verifier": verifier.status(), "prospeo": prospeo.status(),
+                                   "email_source IN ('guessed','prospeo','icypeas')")["n"],
+            "verifier": verifier.status(), "icypeas": _icy_public(),
             "seamless_saved": db.q1("SELECT COUNT(*) n FROM saved_contacts")["n"],
             "emails_in_memory": db.q1("SELECT COUNT(*) n FROM memory WHERE key LIKE 'em:%'")["n"]}
 
@@ -229,22 +228,27 @@ def _pull_out(pid):
                 "checks": sum(vl.values()), "valid": vl.get("ok", 0), "catch_all": vl.get("catch_all", 0),
                 "not_valid": sum(n for k, n in vl.items() if k not in ("ok", "catch_all")),
                 "ready": verifier.ready()[0], "why_not": verifier.ready()[1]}
-    pl = {r["result"]: (r["n"], r["c"]) for r in db.q("SELECT result, COUNT(*) n, COALESCE(SUM(cost),0) c FROM "
-                                                     "prospeo_log WHERE pull_id=? GROUP BY result", (pid,))}
-    p["prospeo"] = {"found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='prospeo' AND "
+    il = {r["result"]: (r["n"], r["c"]) for r in db.q("SELECT result, COUNT(*) n, COALESCE(SUM(cost),0) c FROM "
+                                                     "icypeas_log WHERE pull_id=? GROUP BY result", (pid,))}
+    p["icypeas"] = {"found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='icypeas' AND "
                                    f"{engine.DELIVERABLE}", (pid,))["n"],
-                    "asked": sum(v[0] for k, v in pl.items() if k not in ("charge", "search")),
-                    "search_pages": pl.get("search", (0, 0))[0], "search_credits": pl.get("search", (0, 0))[1],
-                    "search_found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND prospeo_pid IS NOT NULL "
+                    "asked": sum(v[0] for k, v in il.items() if k != "search"),
+                    "search_people": db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND icy_search=1", (pid,))["n"],
+                    "search_credits": round(il.get("search", (0, 0))[1], 2),
+                    "search_found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND icy_search=1 "
                                           f"AND {engine.DELIVERABLE}", (pid,))["n"],
-                    "search_on": cfg.PROSPEO_SEARCH and p.get("mode") == "companies",
-                    "search_stopped": (db.get_meta(f"prospeo_search:{pid}") or {}).get("stopped"),
-                    "credits": prospeo.spent(pid), "none": pl.get("none", (0, 0))[0],
-                    "mismatch": pl.get("mismatch", (0, 0))[0], "errors": pl.get("error", (0, 0))[0],
-                    "waiting": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND {engine.PROSPEO_ELIGIBLE} "
-                                     f"AND COALESCE(prospeo_state,'') IN ('','retry')", (pid,))["n"],
-                    "ready": prospeo.ready()[0], "why_not": prospeo.ready()[1], "order": prospeo.order(),
-                    "cap": cfg.PROSPEO_MAX_CREDITS_PER_PULL}
+                    "search_on": cfg.ICYPEAS_SEARCH and p.get("mode") == "companies",
+                    "search_stopped": (db.get_meta(f"icypeas_search:{pid}") or {}).get("stopped"),
+                    "credits": icypeas.spent(pid), "none": il.get("none", (0, 0))[0],
+                    "errors": il.get("error", (0, 0))[0],
+                    "asking": db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND icy_state='asked'", (pid,))["n"],
+                    "waiting": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND {engine.ICY_ELIGIBLE} "
+                                     f"AND COALESCE(icy_state,'') IN ('','retry')", (pid,))["n"],
+                    "ready": icypeas.ready()[0], "why_not": icypeas.ready()[1],
+                    "cap": cfg.ICYPEAS_MAX_CREDITS_PER_PULL}
+    old_p = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='prospeo'", (pid,))["n"]
+    if old_p:
+        p["icypeas"]["old_prospeo"] = old_p           # emails found by Prospeo before 2.5 (kept, still downloadable)
     if p.get("mode") == "enrich":
         p["enrich"] = {"rows": db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=?", (pid,))["n"],
                        "already": db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='already'",
@@ -395,7 +399,7 @@ def stop_all():
 
 PEOPLE_COLS = """id, name, first_name, last_name, title, company, domain, li_url, country, city, size, industry, state,
                  skip_reason, skip_kind, email, email_status, phone, research_status, research_message, filled_free,
-                 dup_email, email_source, guess_note, prospeo_state, prospeo_note, prospeo_pid"""
+                 dup_email, email_source, guess_note, icy_state, icy_note, icy_search"""
 PEOPLE_VIEWS = {
     "emails": "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0",
     "no_email": "(email IS NULL OR email='') AND (state IN ('no_email','failed','timed_out','unconfirmed') OR "
@@ -562,28 +566,38 @@ def verifier_delete():
     return verifier.status()
 
 
-# ---------------------------------------------------------------- 2.3: Prospeo (second source)
-@app.get("/api/prospeo", dependencies=AUTH)
-def prospeo_status():
-    return prospeo.status()
+# ---------------------------------------------------------------- 2.5: Icypeas (second source)
+def _icy_public():
+    st = icypeas.status()
+    st["samples"] = {k: {"at": v.get("at"), "http": v.get("http"), "body": v.get("body")}
+                     for k, v in (st.get("samples") or {}).items()}
+    return st
 
 
-@app.post("/api/prospeo", dependencies=AUTH)
-async def prospeo_set(request: Request):
+@app.get("/api/icypeas", dependencies=AUTH)
+def icypeas_status():
+    return _icy_public()
+
+
+@app.post("/api/icypeas", dependencies=AUTH)
+async def icypeas_set(request: Request):
     b = await request.json()
     if b.get("api_key"):
-        prospeo.set_key(b["api_key"])
+        icypeas.set_key(b["api_key"], b.get("account_email"))
+    elif "account_email" in b:
+        icypeas.set_email(b.get("account_email"))
+        icypeas.refresh_credits(quiet=True)
     if "enabled" in b:
-        prospeo.set_enabled(bool(b["enabled"]))
+        icypeas.set_enabled(bool(b["enabled"]))
     if b.get("check"):
-        prospeo.refresh_credits()
-    return prospeo.status()
+        icypeas.refresh_credits()
+    return _icy_public()
 
 
-@app.delete("/api/prospeo", dependencies=AUTH)
-def prospeo_delete():
-    prospeo.remove_key()
-    return prospeo.status()
+@app.delete("/api/icypeas", dependencies=AUTH)
+def icypeas_delete():
+    icypeas.remove_key()
+    return _icy_public()
 
 
 # ---------------------------------------------------------------- 2.3: Enrich contacts

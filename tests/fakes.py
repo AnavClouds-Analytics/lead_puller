@@ -488,35 +488,30 @@ class FakeClaude:
 
 
 
-class FakeProspeo:
-    """Prospeo (2.3): knows about two thirds of the people, sometimes better than Seamless. Charges 1 credit per
-    email it reveals, nothing when it has none, and nothing for the same person again within 90 days. Some answers
-    are unverified, and a few are about the wrong person (a trap: they must never be used)."""
+class FakeIcypeas:
+    """Icypeas (2.5): bulk email lookups answered in the background, read later; a people database with extra people
+    Seamless doesn't have (every 3rd company). Charges 1 credit per email found (DEBITED), sometimes for a miss
+    (DEBITED_NOT_FOUND, as Icypeas documents), nothing for NOT_FOUND, and 0.02 per person a people search returns.
+    Some emails are only 'probable' (not used by default); some answers are at another company's domain (a trap)."""
 
-    def __init__(self, seamless_fake, credits=5000, key="prospeo-key-9f1c"):
+    def __init__(self, seamless_fake, credits=5000.0, key="icy-key-4b2e9a"):
         self.s = seamless_fake
-        self.credits = credits
+        self.credits = float(credits)
         self.key = key
-        self.charged = 0
+        self.charged = 0.0
         self.calls = 0
-        self.asked = []                     # identifiers of every person asked about
-        self.revealed_to = {}               # pid -> first reveal time
-        self.fail_next = []                 # "500" | "timeout" | "garbage" | "no_credits" | "429"
+        self.jobs = {}                       # file -> [item]
+        self.asked = []                      # contact ids looked up (externalIds)
+        self.searches = []
+        self.reads = 0
+        self.fail_next = []                  # "500" | "timeout" | "garbage" | "429" | "unpaid"
         self.clock = lambda: 0.0
-        self.unknown_pids = set()
-        self.mobile_asked = 0               # calls that asked for mobile numbers (10 credits each): must stay 0
-        # 2.4: people only Prospeo has (Seamless never shows them), at every 3rd company
+        self.read_limit = None               # e.g. 30 reads a minute -> 429 beyond
+        self.read_log = []
+        self.need_reads = 1                  # reads before a lookup is finished
         self.extra = []
-        self.search_pages = 0
-        self.search_calls = []
-        self.search_plan_required = False
-        # 2.4.1: Prospeo's plan limits (None = unlimited). FREE plan: {"second": 1, "minute": 20, "day": 50}.
-        # A bulk enrich call counts one request PER PERSON sent.
-        self.limits = None
-        self.used = {}                      # (kind, "minute"|"day"|"second", window) -> requests
-        self.rate_limited = 0
         doms = sorted({p["domain"] for p in seamless_fake.people if p["domain"]})
-        n = 50000
+        n = 60000
         firsts = ["Kara", "Leo", "Mina", "Ravi", "Tess", "Ugo"]
         lasts = ["Novak", "Ortiz", "Pryce", "Quinn", "Reyes", "Sato"]
         titles = ["CTO", "VP Engineering", "Head of IT", "Engineering Intern", "Director of Engineering", "Recruiter"]
@@ -537,115 +532,28 @@ class FakeProspeo:
                 seamless_fake.mailboxes[p["email"]] = n
 
     def covers(self, pid):
-        return (pid >= 50000 or pid % 3 != 0) and pid not in self.unknown_pids
+        return (pid >= 60000 or pid % 3 != 0)
 
-    SEN = {"C-Suite": "C-Level", "Founder/Owner": "C-Level", "Vice President": "VP", "Director": "Director",
-           "Head": "Director"}
+    def certainty(self, pid):
+        return "probable" if pid % 13 == 7 else ("very_sure" if pid % 2 else "ultra_sure")
 
-    def search(self, body):
-        """2.4: Prospeo's people search: companies by website, job title CONTAINS or seniority; 25 per page."""
-        self.search_calls.append(body)
-        if self.search_plan_required:
-            return httpx.Response(400, json={"error": True, "error_code": "PLAN_REQUIRED"})
-        f = body.get("filters") or {}
-        sites = {x.lower() for x in (((f.get("company") or {}).get("websites") or {}).get("include") or [])}
-        assert len(sites) <= 500
-        titles = [t.lower() for t in ((f.get("person_job_title") or {}).get("include") or [])]
-        sens = {self.SEN.get(x) for x in ((f.get("person_seniority") or {}).get("include") or [])}
-        pool = [p for p in self.s.people + self.extra if p["domain"] in sites and
-                (p["pid"] >= 50000 or self.covers(p["pid"]))]
-        if titles:
-            pool = [p for p in pool if any(t in p["title"].lower() for t in titles)]
-        elif sens:
-            pool = [p for p in pool if p["seniority"] in sens]
-        pool.sort(key=lambda p: p["pid"])
-        if not pool:
-            return httpx.Response(400, json={"error": True, "error_code": "NO_RESULTS"})
-        page = int(body.get("page") or 1)
-        chunk = pool[(page - 1) * 25: page * 25]
-        if chunk:
-            if self.credits < 1:
-                return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
-            self.credits -= 1
-            self.charged += 1
-            self.search_pages += 1
-        res = [{"person": {"person_id": f"p{p['pid']}", "first_name": p["first"], "last_name": p["last"],
-                           "full_name": p["name"], "linkedin_url": p["liUrl"] or None, "current_job_title": p["title"],
-                           "location": {"country": p["country"], "city": "Springfield"},
-                           "email": {"revealed": False}},
-                "company": {"name": p["company"], "domain": p["domain"], "website": "https://" + p["domain"]}}
-               for p in chunk]
-        return httpx.Response(200, json={"error": False, "free": False, "results": res, "pagination": {
-            "current_page": page, "per_page": 25, "total_page": -(-len(pool) // 25), "total_count": len(pool)}})
-
-    def verified(self, pid):
-        return pid % 10 != 7
-
-    def wrong_person(self, pid):
-        return pid % 37 == 5
-
-    def _find(self, d):
-        if d.get("person_id"):
-            pid = int(str(d["person_id"]).lstrip("p"))
-            return self.s.by_pid.get(pid)
-        li = (d.get("linkedin_url") or "").lower()
-        m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", li)
-        if m:
-            for p in self.s.people:
-                pm = re.search(r"linkedin\.com/(?:in|pub)/([^/?#\s]+)", (p["liUrl"] or "").lower())
-                if pm and pm.group(1).rstrip("/") == m.group(1).rstrip("/"):
-                    return p
-            return None
-        first, last = (d.get("first_name") or "").lower(), (d.get("last_name") or "").lower()
-        if d.get("full_name") and not first:
-            parts = d["full_name"].lower().split()
-            first, last = parts[0], parts[-1]
-        site = (d.get("company_website") or "").lower()
-        hits = [p for p in self.s.people if p["first"].lower() == first and p["last"].lower() == last and
-                p["domain"] and p["domain"] == site]
-        return hits[0] if len(hits) == 1 else None
-
-    def _limit(self, kind, n):
-        """Count n requests; None if allowed, else the 429 response. Headers like the real Prospeo."""
-        if not self.limits:
-            return None
-        t = self.clock()
-        wins = {"second": int(t), "minute": int(t // 60), "day": int(t // 86400)}
-        used = {w: self.used.get((kind, w, wins[w]), 0) for w in wins}
-        over = (used["second"] + 1 > self.limits["second"] or used["minute"] + n > self.limits["minute"] or
-                used["day"] + n > self.limits["day"])
-        if not over:
-            self.used[(kind, "second", wins["second"])] = used["second"] + 1
-            for w in ("minute", "day"):
-                self.used[(kind, w, wins[w])] = used[w] + n
-        u = {w: self.used.get((kind, w, wins[w]), 0) for w in wins}
-        self._hdr = {"x-daily-request-left": str(max(0, self.limits["day"] - u["day"])),
-                     "x-minute-request-left": str(max(0, self.limits["minute"] - u["minute"])),
-                     "x-daily-reset-seconds": str(int(86400 - t % 86400)),
-                     "x-minute-reset-seconds": str(int(60 - t % 60)),
-                     "x-daily-rate-limit": str(self.limits["day"]), "x-minute-rate-limit": str(self.limits["minute"]),
-                     "x-second-rate-limit": str(self.limits["second"])}
-        if over:
-            self.rate_limited += 1
-            return httpx.Response(429, json={"error": True, "message": "Rate limit exceeded"}, headers=self._hdr)
+    def _person(self, first, last, dom):
+        for p in self.s.people + self.extra:
+            if p["first"].lower() == first.lower() and p["last"].lower() == last.lower() and p["domain"] == dom:
+                return p
         return None
 
-    def handler(self, request: httpx.Request):
-        self._hdr = {}
-        resp = self._handle(request)
-        for k, v in (self._hdr or {}).items():
-            resp.headers[k] = v
-        return resp
+    def _charge(self, n):
+        self.credits -= n
+        self.charged = round(self.charged + n, 2)
 
-    def _handle(self, request: httpx.Request):
+    def handler(self, request: httpx.Request):
         self.calls += 1
-        if request.headers.get("X-KEY") != self.key:
-            return httpx.Response(400, json={"error": True, "error_code": "INVALID_API_KEY"})
-        path = request.url.path
-        if path.endswith("/account-information"):
-            return httpx.Response(200, json={"error": False, "response": {
-                "current_plan": "STARTER", "remaining_credits": self.credits, "used_credits": self.charged}})
-        if self.fail_next:
+        if request.headers.get("Authorization") != self.key:
+            return httpx.Response(401, json={"message": "Unauthorized", "code": "unauthorized_access_error"})
+        path = request.url.path.split("/api")[-1]
+        body = json.loads(request.content or b"{}")
+        if self.fail_next and path != "/find-people/count":
             mode = self.fail_next.pop(0)
             if mode == "timeout":
                 raise httpx.ReadTimeout("timed out", request=request)
@@ -654,67 +562,90 @@ class FakeProspeo:
             if mode == "garbage":
                 return httpx.Response(200, text="<html>")
             if mode == "429":
-                return httpx.Response(429, json={"error": True, "error_code": "RATE_LIMITED"})
-            if mode == "no_credits":
-                return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
-        if path.endswith("/search-person"):
-            lim = self._limit("search", 1)
-            if lim is not None:
-                return lim
-            return self.search(json.loads(request.content))
-        if not path.endswith("/bulk-enrich-person"):
-            return httpx.Response(404, json={"error": True, "error_code": "INVALID_REQUEST"})
-        body = json.loads(request.content)
-        data = body.get("data") or []
-        assert len(data) <= 50, "Prospeo takes at most 50 people per call"
-        lim = self._limit("enrich", len(data))
-        if lim is not None:
-            return lim
-        only_verified = body.get("only_verified_email", False)
-        self.mobile_asked += 1 if (body.get("enrich_mobile") or body.get("only_verified_mobile")) else 0
-        matched, not_matched, invalid = [], [], []
-        cost = 0
-        for d in data:
-            ident = d.get("identifier")
-            self.asked.append(ident)
-            ok_input = d.get("person_id") or d.get("linkedin_url") or ((d.get("first_name") and d.get("last_name") or d.get("full_name"))
-                                                 and (d.get("company_website") or d.get("company_name")))
-            if not ok_input:
-                invalid.append(ident)
-                continue
-            p = self._find(d)
-            if p and p["email"] not in self.s.mailboxes and not self.wrong_person(p["pid"]):
-                p = None                         # that mailbox doesn't exist: Prospeo can't verify an email
-            if not p or not self.covers(p["pid"]) or (only_verified and not self.verified(p["pid"])):
-                not_matched.append(ident)
-                continue
-            who = p
-            if self.wrong_person(p["pid"]):
-                who = next(q for q in self.s.people if q["pid"] != p["pid"] and q["domain"] and
-                           q["name"] != p["name"])
-            email = who["email"] if (not who["email"].endswith("@nodomain.example") and
-                                     who["email"] in self.s.mailboxes) else None
-            if not email:
-                not_matched.append(ident)
-                continue
-            now = self.clock()
-            first = self.revealed_to.get(who["pid"])
-            free = first is not None and now - first < 90 * 86400
-            if not free:
-                if self.credits < 1:
-                    return httpx.Response(400, json={"error": True, "error_code": "INSUFFICIENT_CREDITS"})
-                self.credits -= 1
-                self.charged += 1
-                cost += 1
-                self.revealed_to[who["pid"]] = now
-            matched.append({"identifier": ident, "person": {
-                "person_id": f"p{who['pid']}", "first_name": who["first"], "last_name": who["last"], "full_name": who["name"],
-                "linkedin_url": who["liUrl"] or None,
-                "email": {"status": "VERIFIED" if self.verified(p["pid"]) else "UNVERIFIED", "revealed": True,
-                          "email": email, "verification_method": "SMTP", "email_mx_provider": "Google"}},
-                "company": {"name": who["company"], "website": "https://" + who["domain"], "domain": who["domain"]}})
-        if not matched:                     # the real Prospeo: nobody in the batch matched -> 400 NO_MATCH
-            return httpx.Response(400, json={"error": True, "error_code": "INVALID_DATAPOINTS" if invalid and
-                                             not not_matched else "NO_MATCH"})
-        return httpx.Response(200, json={"error": False, "total_cost": cost, "matched": matched,
-                                         "not_matched": not_matched, "invalid_datapoints": invalid})
+                return httpx.Response(429, json={"code": "rate_limit_exceeded_error"})
+            if mode == "unpaid":
+                return httpx.Response(200, json={"success": False, "validationErrors": [
+                    {"code": "unpaid_subscription_error", "humanReadableMessage": "Your subscription is unpaid"}]})
+        if path == "/find-people/count":
+            return httpx.Response(200, json={"success": True, "total": 1234})
+        if path == "/a/actions/subscription-information":
+            return httpx.Response(200, json={"success": True, "subscription": {"plan": "basic",
+                                                                               "credits": {"remaining": self.credits}}})
+        if path == "/bulk-search":
+            data = body.get("data") or []
+            ext = ((body.get("custom") or {}).get("externalIds")) or []
+            assert body.get("task") == "email-search" and len(data) <= 5000 and len(ext) == len(data)
+            file = f"file{len(self.jobs) + 1}"
+            items = []
+            for i, (f, l, d) in enumerate(data):
+                self.asked.append(ext[i])
+                items.append({"_id": f"{file}-{i}", "order": i, "status": "NONE", "reads": 0, "in": (f, l, d),
+                              "userData": {"externalId": ext[i]}})
+            self.jobs[file] = items
+            return httpx.Response(200, json={"success": True, "status": "NONE", "file": file})
+        if path == "/bulk-single-searchs/read":
+            t = self.clock()
+            self.read_log = [x for x in self.read_log if t - x < 60] + [t]
+            if self.read_limit and len(self.read_log) > self.read_limit:
+                return httpx.Response(429, json={"code": "rate_limit_exceeded_error"})
+            self.reads += 1
+            items = self.jobs.get(body.get("file")) or []
+            out = []
+            for it in items[: int(body.get("limit") or 10)]:
+                it["reads"] += 1
+                if it["status"] == "NONE" and it["reads"] >= self.need_reads:
+                    self._finish(it)
+                res = {k: v for k, v in it.items() if k not in ("reads", "in", "pid")}
+                out.append(res)
+            return httpx.Response(200, json={"success": True, "items": out, "total": len(items)})
+        if path == "/find-people":
+            return self.find(body)
+        return httpx.Response(404, json={"message": "not found"})
+
+    def _finish(self, it):
+        f, l, d = it["in"]
+        p = self._person(f, l, d)
+        if not p or not self.covers(p["pid"]) or p["email"] not in self.s.mailboxes:
+            if p and p["pid"] % 23 == 4:
+                it["status"] = "DEBITED_NOT_FOUND"
+                self._charge(1)
+            else:
+                it["status"] = "NOT_FOUND"
+            it["results"] = {"firstname": f, "lastname": l, "emails": []}
+            return
+        email = p["email"]
+        if p["pid"] % 37 == 5:                       # the trap: an address at another company
+            email = email.split("@")[0] + "@elsewhere-example.com"
+        it["status"] = "DEBITED"
+        self._charge(1)
+        it["pid"] = p["pid"]
+        it["results"] = {"firstname": f, "lastname": l, "emails": [{"email": email, "certainty": self.certainty(p["pid"]),
+                                                                    "mxProvider": "google"}]}
+
+    def find(self, body):
+        q = body.get("query") or {}
+        self.searches.append(q)
+        sites = set((q.get("currentCompanyWebsite") or {}).get("include") or [])
+        inc = [t.lower() for t in ((q.get("currentJobTitle") or {}).get("include") or [])]
+        exc = [t.lower() for t in ((q.get("currentJobTitle") or {}).get("exclude") or [])]
+        loc = set((q.get("location") or {}).get("include") or [])
+        code = {"United States": "US", "Canada": "CA", "Israel": "IL", "Germany": "DE"}
+        pool = [p for p in self.s.people + self.extra if p["domain"] in sites and self.covers(p["pid"])]
+        if inc:
+            pool = [p for p in pool if any(t in p["title"].lower() for t in inc)]
+        if exc:
+            pool = [p for p in pool if not any(t in p["title"].lower() for t in exc)]
+        if loc:
+            pool = [p for p in pool if code.get(p["country"]) in loc]
+        pool.sort(key=lambda p: p["pid"])
+        pag = body.get("pagination") or {}
+        size = min(200, int(pag.get("size") or 100))
+        start = int(str(pag.get("token") or "t0")[1:])
+        chunk = pool[start:start + size]
+        self._charge(round(0.02 * len(chunk), 2))
+        leads = [{"firstname": p["first"], "lastname": p["last"], "fullname": p["name"], "lastJobTitle": p["title"],
+                  "lastCompanyName": p["company"], "lastCompanyWebsite": p["domain"], "profileUrl": p["liUrl"],
+                  "country": code.get(p["country"], p["country"])} for p in chunk]
+        nxt = f"t{start + size}" if start + size < len(pool) else None
+        return httpx.Response(200, json={"success": True, "total": len(pool), "leads": leads,
+                                         "pagination": {"size": size, "token": nxt}})

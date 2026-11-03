@@ -29,7 +29,7 @@ import re
 import threading
 import time
 
-from . import accounts, companies as CO, db, dnscheck, filters as F, guess, memory, prospeo, seamless, verifier
+from . import accounts, companies as CO, db, dnscheck, filters as F, guess, icypeas, memory, seamless, verifier
 from .config import cfg
 
 NOW = time.time            # tests swap in a fake clock
@@ -40,7 +40,7 @@ class PullError(Exception):
 
 
 DELIVERABLE = "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALESCE(email_status,''))!='invalid' AND dup_email=0"
-# People actually researched in Seamless (guesses, Prospeo-first finds and enrichment rows filled from what you
+# People actually researched in Seamless (guesses, Icypeas finds and enrichment rows filled from what you
 # already had are never counted in Seamless's email rate). 2.3: "submitted_at IS NOT NULL" added.
 NOT_GUESSED = "COALESCE(email_source,'')!='guessed' AND submitted_at IS NOT NULL"
 OPEN_STATES = ("kept", "queued", "done", "unconfirmed", "timed_out", "no_email", "failed")
@@ -52,8 +52,11 @@ def create_pull(name, prompt, filters, target, max_credits=None, account_choice=
     f = F.clean(filters)
     items = None
     if company_list is not None:
-        items = CO.check(company_list)
+        items = CO.check(company_list, skip_recent=rerun_of is None)
         if not any(i["status"] == "ready" for i in items):
+            if any(i["status"] == "done_before" for i in items):
+                raise PullError(f"All of these companies were already in a pull in the last {cfg.COMPANY_SKIP_DAYS} days, "
+                                f"so their people are already pulled. Use \"Run again\" on that pull for new people there.")
             raise PullError("None of those companies has a website Lead Puller can search. Add websites (e.g. acme.com).")
         f = CO.people_filters(f)
         if max_per_company in (None, "", 0, "0"):
@@ -298,8 +301,8 @@ def tick():
                 pass
     poll_late()
     try:
-        prospeo_late()
-    except Exception:                                    # never let a late Prospeo lookup stop the pulls
+        icypeas_late()
+    except Exception:                                    # never let a late Icypeas lookup stop the pulls
         pass
     running = db.q1("SELECT id FROM pulls WHERE status='running' ORDER BY id LIMIT 1")
     if not running:
@@ -350,9 +353,8 @@ def step(p):
         db.update_pull(pid, status="paused", pause_kind="spending",
                        error="Paused: spending is switched off (SPENDING_ENABLED=0 in .env).")
         return
-    # 2.3: Prospeo fills in people Seamless had no usable email for (it charges only when it finds one)
-    if _prospeo_misses(p, math.ceil(p["target"] - expected)):
-        return
+    # 2.5: Icypeas fills in people Seamless had no usable email for, in the background (charged only when found)
+    icy_busy = _icy_tick(p, math.ceil(p["target"] - expected))
     enrich = p.get("mode") == "enrich"
     if credits_left(p) < 1:
         if enrich and st["kept"]:
@@ -360,6 +362,8 @@ def step(p):
                                                  f"{p['max_credits']:,} Seamless credits was reached.")
         if st["pending"]:
             return _wait(p, st)
+        if icy_busy:
+            return                                   # Icypeas answers on their way
         return _finish(p, f"Reached your max of {p['max_credits']:,} credits with {st['emails']:,} emails.")
     if cfg.PAUSE_BELOW_EMAIL_RATE and not p["rate_ack"] and st["researched"]:
         # The first batch is a small test: check the email rate before spending more on research.
@@ -393,6 +397,8 @@ def step(p):
             return
         if st["pending"]:
             return _wait(p, st)
+        if icy_busy:
+            return
         return _finish(p, f"Done: {st['emails']:,} of the {p['target']:,} people in your file have an email.")
     sl = _current_slice(pid)
     # 2.2: reopen companies only once every answer is back, so they're searched together in one go (one search
@@ -406,12 +412,14 @@ def step(p):
         return _search(p, sl, need_people - st["kept"], hit)
     if st["pending"]:
         return _wait(p, st)
-    # 2.4: Seamless has no more people: search Prospeo's own database for the companies that are still short
-    if _prospeo_search_step(p, p["target"] - st["emails"]):
+    if icy_busy:
+        return                                       # Icypeas answers on their way
+    # 2.5: Seamless has no more people: search Icypeas's database for the companies that are still short
+    if _icy_search_step(p, p["target"] - st["emails"]):
         return
-    used = " or Prospeo" if db.q1("SELECT 1 x FROM prospeo_log WHERE pull_id=? AND result='search' LIMIT 1", (pid,)) else ""
-    return _finish(p, f"Seamless{used} has no more new people for these filters: you have {st['emails']:,} of "
-                      f"{p['target']:,}. Widen the filters (more titles, countries or sizes) to get more.")
+    used = " or Icypeas" if db.q1("SELECT 1 x FROM icypeas_log WHERE pull_id=? AND result='search' LIMIT 1", (pid,)) else ""
+    return _finish(p, f"Seamless{used} has no more new people for these filters: {st['emails']:,} of "
+                      f"{p['target']:,} when it finished (late answers can still add a few). Widen the filters (more titles, countries or sizes) to get more.")
 
 
 def _start(p):
@@ -449,7 +457,7 @@ def _finish(p, reason):
     _settle_unmatched(pid)
     if p.get("stopping") or (reason or "").startswith("Stopped by you"):
         db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='pkept'",
-             ("Found by Prospeo's search; the pull was stopped before its email was looked up (nothing charged).",
+             ("Found by Icypeas's search; the pull was stopped before its email was looked up (nothing charged).",
               now, pid))
     if p.get("mode") == "enrich":                       # 2.3: rows from your file are never banked for other pulls
         db.x("UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='kept'",
@@ -681,7 +689,8 @@ def _listed_count(pid, domain):
 def _good_at(pid, domain):
     """People at a listed company who have an email or are still being looked up."""
     r = db.q1(f"""SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND (state IN ('kept','queued','pkept','unconfirmed','timed_out')
-                  OR ({DELIVERABLE})) AND (domain=? OR domain LIKE ?)""", (pid, domain, "%." + domain))
+                  OR ({DELIVERABLE}) OR icy_state='asked') AND (domain=? OR domain LIKE ?)""",
+              (pid, domain, "%." + domain))
     return int(r["n"] or 0)
 
 
@@ -691,8 +700,8 @@ def _company_full(pid, domain, cap):
     cap + EXTRA_TRIES_PER_COMPANY people paid for in total."""
     if not cap:
         return False
-    r = db.q1(f"""SELECT SUM(CASE WHEN state IN ('kept','queued','pkept','unconfirmed','timed_out') OR ({DELIVERABLE}) THEN 1
-                  ELSE 0 END) good, COUNT(*) tried FROM contacts WHERE pull_id=? AND state IN
+    r = db.q1(f"""SELECT SUM(CASE WHEN state IN ('kept','queued','pkept','unconfirmed','timed_out') OR ({DELIVERABLE})
+                  OR icy_state='asked' THEN 1 ELSE 0 END) good, COUNT(*) tried FROM contacts WHERE pull_id=? AND state IN
                   ('kept','queued','pkept','done','unconfirmed','timed_out','no_email','failed') AND (domain=? OR domain LIKE ?)""",
               (pid, domain, "%." + domain))
     return int(r["good"] or 0) >= cap or int(r["tried"] or 0) >= cap + max(0, cfg.EXTRA_TRIES_PER_COMPANY)
@@ -903,7 +912,7 @@ def _research(p, n):
             return 0
         if room < 1:
             if p.get("mode") == "enrich":
-                # 2.3: nothing is banked for an enrichment; these people go to Prospeo (if set up) instead
+                # 2.3: nothing is banked for an enrichment; these people go to Icypeas (if set up) instead
                 _enrich_without_seamless(pid, "Not looked up in Seamless: the account's budget or balance is used up.",
                                          account_id=grp["account_id"])
                 continue
@@ -971,9 +980,6 @@ def _research(p, n):
             else:
                 db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (why_not, c["id"]))
                 to_pay.append(c)
-        if to_pay and prospeo.order() == "prospeo_first":
-            found, to_pay = _prospeo_first(p, to_pay)        # 2.3: Seamless only for people Prospeo has no email for
-            done += found
         if to_pay:
             _send(p, acct, to_pay[:max(0, min(k - done, room))])
         return done + len(to_pay)
@@ -1111,7 +1117,7 @@ def _free_fill_unconfirmed(p):
                  ("Seamless didn't answer and no saved contact was found.", c["id"]))
 
 
-# ================================================================ 2.3: Prospeo and enrichment
+# ================================================================ 2.3: enrichment (and 2.5: Icypeas)
 def _send_clues(p, acct, people):
     """Enrichment rows: look each person up in Seamless by LinkedIn, or full name + company (1 credit each).
     The answers come back without a search ID; each is checked to be the same person before it's used."""
@@ -1148,7 +1154,7 @@ def _send_clues(p, acct, people):
 
 
 def _enrich_without_seamless(pid, why, account_id=None):
-    """Enrichment rows Seamless won't be asked about: they go to Prospeo (if set up), else stay without an email."""
+    """Enrichment rows Seamless won't be asked about: they go to Icypeas (if set up), else stay without an email."""
     sql = "UPDATE contacts SET state='no_email', research_message=?, resolved_at=? WHERE pull_id=? AND state='kept'"
     args = [why, NOW(), pid]
     if account_id is not None:
@@ -1157,214 +1163,235 @@ def _enrich_without_seamless(pid, why, account_id=None):
     db.x(sql, args)
 
 
-PROSPEO_ELIGIBLE = (f"(state IN ('no_email','failed') OR (state='done' AND (LOWER(COALESCE(email_status,''))='invalid' "
-                    f"OR dup_email=1)) OR (state='done' AND (email IS NULL OR email='')))")
+# ================================================================ 2.5: Icypeas (second source)
+# People Seamless had no usable email for (and people Icypeas's own search found) wait for an Icypeas lookup.
+ICY_ELIGIBLE = ("(state IN ('no_email','failed','pkept') OR (state='done' AND (LOWER(COALESCE(email_status,''))="
+                "'invalid' OR dup_email=1)) OR (state='done' AND (email IS NULL OR email='')))")
 
 
-def _prospeo_misses(p, need):
-    """Seamless-first: ask Prospeo about people Seamless had no usable email for. Returns True if it did anything
-    (one call per step, so Pause and Stop answer quickly)."""
+def _icy_tick(p, need, late=False):
+    """One small Icypeas step that never blocks the pull: read the answers of a lookup in progress (free), else start
+    a lookup for people waiting. Returns True while Icypeas still has work for this pull (so it isn't finished yet)."""
     pid = p["id"]
-    if need < 1 or p["stopping"]:
-        return False
-    ok, _why = prospeo.ready()
-    if not ok:
-        return False
-    rows = db.q(f"""SELECT * FROM contacts WHERE pull_id=? AND {PROSPEO_ELIGIBLE} AND
-                    COALESCE(prospeo_state,'') IN ('','retry') ORDER BY id LIMIT 200""", (pid,))
-    if not rows:
-        return False
-    room = prospeo.room(pid)
+    now = NOW()
+    jobs = db.q("SELECT * FROM icypeas_jobs WHERE pull_id=? AND done_at IS NULL ORDER BY last_poll_at", (pid,))
+    for job in jobs:
+        if now - (job["last_poll_at"] or 0) < cfg.ICYPEAS_POLL_SECONDS:
+            continue
+        _icy_read(p, job, late)
+        break
+    open_jobs = db.q1("SELECT COUNT(*) n FROM icypeas_jobs WHERE pull_id=? AND done_at IS NULL AND gave_up=0",
+                      (pid,))["n"]
+    ok, _why = icypeas.ready()
+    if not ok or need < 1 or p["stopping"] or (p["status"] != "running" and not late):
+        return bool(open_jobs) and ok
+    room = icypeas.room(pid)
     if room is not None and room < 1:
-        db.x(f"UPDATE contacts SET prospeo_state='skipped', prospeo_note=? WHERE pull_id=? AND {PROSPEO_ELIGIBLE} "
-             f"AND COALESCE(prospeo_state,'') IN ('','retry')",
-             (f"Prospeo not asked: this pull reached PROSPEO_MAX_CREDITS_PER_PULL ({cfg.PROSPEO_MAX_CREDITS_PER_PULL}).",
+        db.x(f"UPDATE contacts SET icy_state='skipped', icy_note=?, state=CASE WHEN state='pkept' THEN 'no_email' "
+             f"ELSE state END WHERE pull_id=? AND {ICY_ELIGIBLE} AND COALESCE(icy_state,'') IN ('','retry')",
+             (f"Icypeas not asked: this pull reached ICYPEAS_MAX_CREDITS_PER_PULL ({cfg.ICYPEAS_MAX_CREDITS_PER_PULL}).",
               pid))
-        return False
-    n = max(1, min(prospeo.batch_size(), need if p.get("mode") != "enrich" else 50,
-                   room if room is not None else 50))
-    batch = _prospeo_screen(pid, rows, n)
-    if not batch:
-        return True                                   # some were settled without a call; look again next step
-    res = prospeo.enrich(batch, pid)
-    _prospeo_apply(batch, res)
-    return True
+        return bool(open_jobs)
+    rows = db.q(f"SELECT * FROM contacts WHERE pull_id=? AND {ICY_ELIGIBLE} AND COALESCE(icy_state,'') IN ('','retry') "
+                f"ORDER BY id LIMIT 500", (pid,))
+    n = max(1, min(cfg.ICYPEAS_BATCH, 100, int(room) if room is not None else 500,
+                   need * 2 if p.get("mode") != "enrich" else 500))
+    batch = _icy_screen(pid, rows, n, p)
+    if batch:
+        job, why = icypeas.submit(batch, pid, f"Lead Puller {p['name'] or pid}"[:80])
+        if job:
+            return True
+        if why == "error":
+            for c in batch:
+                db.x("UPDATE contacts SET icy_state=?, icy_note=? WHERE id=?",
+                     ("retry" if (c.get("icy_state") or "") == "" else "error",
+                      (icypeas.status().get("last_error") or "Icypeas error")[:300], c["id"]))
+        return True
+    return bool(open_jobs) or bool(db.q1(f"SELECT 1 x FROM contacts WHERE pull_id=? AND {ICY_ELIGIBLE} AND "
+                                         f"COALESCE(icy_state,'') IN ('','retry') LIMIT 1", (pid,)))
 
 
-def _prospeo_screen(pid, rows, n):
-    """Free checks before asking Prospeo: enough details, not on do-not-pull, not asked in the last 90 days."""
+def _icy_screen(pid, rows, n, p=None):
+    """Free checks before asking Icypeas: enough details, not on do-not-pull, not asked in the last 90 days, and the
+    company doesn't already have as many people with an email as you asked for."""
     block = memory.Blocklist()
     batch = []
+    planned = collections.Counter()
+    cap = (p or {}).get("max_per_company") or 0
     for c in rows:
         if len(batch) >= n:
             break
+        if cap and c["state"] != "pkept" and p.get("mode") != "enrich":
+            d = (CO.listed(pid, c["domain"]) if p.get("mode") == "companies" else None) or db.norm_domain(c["domain"])
+            if d:
+                have = db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND (domain=? OR domain LIKE ?) AND "
+                             f"(state IN ('kept','queued','pkept','unconfirmed','timed_out') OR ({DELIVERABLE}))",
+                             (pid, d, "%." + d))["n"] + db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND "
+                                                              "(domain=? OR domain LIKE ?) AND icy_state='asked'",
+                                                              (pid, d, "%." + d))["n"] + planned[d]
+                if have >= cap:
+                    _icy_settle(c, "skipped", "Not looked up in Icypeas: this company already has enough people.")
+                    continue
+                planned[d] += 1
         keys = db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"])
-        if not prospeo.lookup_input(c):
-            db.x("UPDATE contacts SET prospeo_state='skipped', prospeo_note=? WHERE id=?",
-                 ("Not enough details for Prospeo (needs LinkedIn, or full name + company website).", c["id"]))
+        if not icypeas.lookup_input(c):
+            _icy_settle(c, "skipped", "Not enough details for Icypeas (needs first + last name and company website).")
             continue
         why = block.reason(c["name"], c["company"], c["domain"], c["li_url"], c["row_email"])
         if why:
-            db.x("UPDATE contacts SET prospeo_state='skipped', prospeo_note=? WHERE id=?", (why, c["id"]))
+            _icy_settle(c, "skipped", why)
             continue
-        prev = prospeo.recently_asked(keys)
-        if prev and prev["result"] != "found":
-            db.x("UPDATE contacts SET prospeo_state=?, prospeo_note=? WHERE id=?",
-                 (prev["result"], "Asked Prospeo about this person recently: " + (prev["note"] or ""), c["id"]))
-            continue
+        prev = icypeas.recently_asked(keys)
         if prev and prev["result"] == "found" and prev["email"]:
-            _apply_prospeo(c, prev["email"], "Found by Prospeo earlier (no new charge).")
+            _apply_icy(c, prev["email"], "Found by Icypeas earlier (no new charge).")
+            continue
+        if prev:
+            _icy_settle(c, prev["result"], "Asked Icypeas about this person recently: " + (prev["note"] or ""))
             continue
         batch.append(c)
     return batch
 
 
-def _prospeo_apply(batch, res):
-    for c in batch:
-        result, email, note = res.get(c["id"], ("error", None, "No answer from Prospeo."))
-        if result == "later":
-            continue                                  # 2.4.1: Prospeo's request limit: asked again later, unchanged
+def _icy_settle(c, result, note):
+    """No Icypeas email for this person (a person found by the search then has no email either)."""
+    db.x("UPDATE contacts SET icy_state=?, icy_note=?, state=CASE WHEN state='pkept' THEN 'no_email' ELSE state END, "
+         "resolved_at=COALESCE(resolved_at, ?) WHERE id=?", (result, (note or "")[:300], NOW(), c["id"]))
+    if c.get("state") == "pkept":
+        db.x("UPDATE contacts SET research_message=? WHERE id=?",
+             ("Found by Icypeas's search: " + (note or ""), c["id"]))
+        memory.remember(db.person_keys(c["name"], c["company"], c["li_url"]), "pull", c["pull_id"], None, "no_email")
+
+
+def _icy_read(p, job, late=False):
+    pid = p["id"]
+    now = NOW()
+    cs = db.q("SELECT * FROM contacts WHERE icy_job=? AND icy_state='asked' ORDER BY id", (job["job"],))
+    if not cs:
+        db.x("UPDATE icypeas_jobs SET done_at=? WHERE job=?", (now, job["job"]))
+        return
+    by_id = {c["id"]: c for c in cs}
+    res, finished, unreadable = icypeas.read(job["job"], pid, by_id)
+    db.x("UPDATE icypeas_jobs SET polls=polls+1, last_poll_at=? WHERE job=?", (now, job["job"]))
+    for cid, (result, email, note) in res.items():
+        c = by_id[cid]
         if result == "found" and email:
-            _apply_prospeo(c, email, note)
+            _apply_icy(c, email, note)
         elif result == "error":
-            st = "retry" if (c.get("prospeo_state") or "") == "" else "error"
-            db.x("UPDATE contacts SET prospeo_state=?, prospeo_note=? WHERE id=?", (st, note, c["id"]))
+            db.x("UPDATE contacts SET icy_state=?, icy_note=? WHERE id=?",
+                 ("retry" if not c.get("icy_note") else "error", note, cid))
         else:
-            db.x("UPDATE contacts SET prospeo_state=?, prospeo_note=? WHERE id=?", (result, note, c["id"]))
+            _icy_settle(c, "none", note)
+    if finished:
+        db.x("UPDATE icypeas_jobs SET done_at=? WHERE job=?", (now, job["job"]))
+        for c in db.q("SELECT * FROM contacts WHERE icy_job=? AND icy_state='asked'", (job["job"],)):
+            _icy_settle(c, "error", "Icypeas's answer for this person couldn't be read (see Accounts → last answers).")
+        return
+    age = now - (job["created_at"] or now)
+    if not job["gave_up"] and age > cfg.ICYPEAS_WAIT_MINUTES * 60:
+        db.x("UPDATE icypeas_jobs SET gave_up=1 WHERE job=?", (job["job"],))
+    if age > max(1, cfg.ICYPEAS_LATE_DAYS) * 86400:
+        db.x("UPDATE icypeas_jobs SET done_at=? WHERE job=?", (now, job["job"]))
+        for c in db.q("SELECT * FROM contacts WHERE icy_job=? AND icy_state='asked'", (job["job"],)):
+            _icy_settle(c, "error", "Icypeas never answered for this person.")
 
 
-def _apply_prospeo(c, email, note):
-    """Use an email Prospeo verified for this person (unless it already belongs to someone else you have)."""
+def _apply_icy(c, email, note):
+    """Use an email Icypeas found for this person (unless it already belongs to someone else you have)."""
     em = db.norm_email(email)
     keys = db.person_keys(c["name"], c["company"], c["li_url"], c["row_email"])
     owner = db.q1("SELECT pull_id, source FROM memory WHERE key=?", ("em:" + em,))
     other = db.q1("SELECT id FROM contacts WHERE id!=? AND LOWER(email)=? AND state='done' AND dup_email=0 LIMIT 1",
                   (c["id"], em))
     if other or (owner and "em:" + em not in keys and owner["source"] in ("seamless", "pull")):
-        db.x("UPDATE contacts SET prospeo_state='dup', prospeo_note=? WHERE id=?",
-             ("Prospeo's email already belongs to someone else you have, so it wasn't used.", c["id"]))
+        _icy_settle(c, "dup", "Icypeas's email already belongs to someone else you have, so it wasn't used.")
         return
     old = c["email"] if c["email"] and db.norm_email(c["email"]) != em else None
-    msg = ((c["research_message"] + " · ") if c["research_message"] else "") + "Email found by Prospeo (verified)."
-    db.x("""UPDATE contacts SET state='done', email=?, email_status='valid', email_source='prospeo', dup_email=0,
-            email_2=COALESCE(?, email_2), prospeo_state='found', prospeo_note=?, research_message=?,
+    msg = ((c["research_message"] + " · ") if c["research_message"] else "") + "Email found by Icypeas."
+    db.x("""UPDATE contacts SET state='done', email=?, email_status='valid', email_source='icypeas', dup_email=0,
+            email_2=COALESCE(?, email_2), icy_state='found', icy_note=?, research_message=?,
             resolved_at=COALESCE(resolved_at, ?) WHERE id=?""", (em, old, note, msg[:500], NOW(), c["id"]))
     memory.remember(keys + ["em:" + em], "pull", c["pull_id"], None, "email")
     memory.set_outcome(keys, "email")
-    guess.learn(c["first_name"], c["last_name"], em, c["domain"], "prospeo")
+    guess.learn(c["first_name"], c["last_name"], em, c["domain"], "icypeas")
 
 
-def _prospeo_search_step(p, need):
-    """2.4, "People at my companies": Seamless has run out. One small step: either get emails for people Prospeo's
-    search found (one call, up to 50), or read the next search page (25 people, 1 Prospeo credit) for the companies
-    that still have fewer people than you asked for. Returns True if it did something."""
+def _icy_search_step(p, need):
+    """Company lists: Seamless has run out. One page of Icypeas's people search for the companies that still have fewer
+    people than you asked for (0.02 credits per person returned). Their emails are looked up next (_icy_tick)."""
     pid = p["id"]
-    if p.get("mode") != "companies" or not cfg.PROSPEO_SEARCH or p["stopping"] or need < 1:
+    if p.get("mode") != "companies" or not cfg.ICYPEAS_SEARCH or p["stopping"] or need < 1:
         return False
-    ok, _why = prospeo.ready()
-    if not ok:
+    if not icypeas.ready()[0]:
         return False
-    room = prospeo.room(pid)
+    room = icypeas.room(pid)
     if room is not None and room < 1:
-        db.x("UPDATE contacts SET state='no_email', prospeo_state='skipped', prospeo_note=?, resolved_at=? WHERE "
-             "pull_id=? AND state='pkept'", (f"Not asked: this pull reached PROSPEO_MAX_CREDITS_PER_PULL "
-                                              f"({cfg.PROSPEO_MAX_CREDITS_PER_PULL}).", NOW(), pid))
         return False
-    # 1) emails for people the search found
-    waiting = db.q("SELECT * FROM contacts WHERE pull_id=? AND state='pkept' ORDER BY id LIMIT ?",
-                   (pid, max(1, min(prospeo.batch_size(), need, room if room is not None else 50))))
-    if waiting:
-        res = prospeo.enrich(waiting, pid)
-        for c in waiting:
-            result, email, note = res.get(c["id"], ("error", None, "No answer from Prospeo."))
-            if result == "later":
-                continue                              # 2.4.1: Prospeo's request limit: asked again later
-            if result == "found" and email:
-                _apply_prospeo(c, email, "Found by Prospeo's search; email verified by Prospeo.")
-                c2 = db.q1("SELECT state FROM contacts WHERE id=?", (c["id"],))
-                if c2 and c2["state"] == "pkept":            # email already someone else's
-                    db.x("UPDATE contacts SET state='no_email', resolved_at=? WHERE id=?", (NOW(), c["id"]))
-            elif result == "error" and (c.get("prospeo_state") or "") != "retry":
-                db.x("UPDATE contacts SET prospeo_state='retry', prospeo_note=? WHERE id=?", (note, c["id"]))
-            else:
-                db.x("UPDATE contacts SET state='no_email', prospeo_state=?, prospeo_note=?, resolved_at=?, "
-                     "research_message=? WHERE id=?", (result, note, NOW(), "Found by Prospeo's search: " + note,
-                                                       c["id"]))
-                memory.remember(db.person_keys(c["name"], c["company"], c["li_url"]), "pull", pid, None, "no_email")
-        return True
-    # 2) the next search page
-    key = f"prospeo_search:{pid}"
+    key = f"icypeas_search:{pid}"
     st = db.get_meta(key) or {}
     if st.get("done"):
         return False
     cap = p["max_per_company"] or 0
     if "queue" not in st:
         short = [d for d in CO.ready_domains(pid) if not cap or _good_at(pid, d) < cap]
-        n = max(1, min(500, cfg.PROSPEO_SEARCH_BATCH))
-        st = {"queue": [short[i:i + n] for i in range(0, len(short), n)], "i": 0, "page": 1, "pages": 0}
+        st = {"queue": [short[i:i + 100] for i in range(0, len(short), 100)], "i": 0, "token": None, "pages": 0,
+              "page_in_batch": 0}
     if st["i"] >= len(st["queue"]):
         st["done"] = True
         db.set_meta(key, st)
         return False
     batch = [d for d in st["queue"][st["i"]] if not cap or _good_at(pid, d) < cap]
     if not batch:
-        st.update(i=st["i"] + 1, page=1)
+        st.update(i=st["i"] + 1, token=None, page_in_batch=0)
         db.set_meta(key, st)
         return True
     f = p["filters"]
     titles = list(((f.get("jobTitle") or {}).get("in")) or [])
-    sens = list(((f.get("seniority") or {}).get("in")) or [])
-    results, total_pages, cost, stop = prospeo.search_people(batch, titles, sens, st["page"], pid)
+    title_out = list(((f.get("jobTitle") or {}).get("out")) or [])
+    countries = list(((f.get("contactCountry") or {}).get("in")) or [])
+    leads, nxt, cost, stop = icypeas.find_people(batch, titles, title_out, countries, st.get("token"), pid)
     if stop == "later":
         db.set_meta(key, st)
-        return True                                   # 2.4.1: Prospeo's request limit: the same page next time
+        return True
     if stop:
-        st["done"] = True
-        st["stopped"] = stop
+        st.update(done=True, stopped=stop)
         db.set_meta(key, st)
-        db.update_pull(pid, error=f"Prospeo search stopped: {stop}")
+        db.update_pull(pid, error=f"Icypeas search stopped: {stop}")
         return False
-    added = _prospeo_take(p, results, cap)
+    _icy_take(p, leads, cap)
     st["pages"] = st.get("pages", 0) + 1
-    if not results or st["page"] >= total_pages or st["page"] >= max(1, cfg.PROSPEO_SEARCH_MAX_PAGES):
-        st.update(i=st["i"] + 1, page=1)
+    st["page_in_batch"] = st.get("page_in_batch", 0) + 1
+    if not nxt or st["page_in_batch"] >= max(1, cfg.ICYPEAS_SEARCH_MAX_PAGES):
+        st.update(i=st["i"] + 1, token=None, page_in_batch=0)
     else:
-        st["page"] += 1
+        st["token"] = nxt
     db.set_meta(key, st)
     return True
 
 
-def _prospeo_take(p, results, cap):
-    """People from a Prospeo search page who are worth an email lookup: at one of your companies that is still short,
-    with your countries, not excluded by your filters, not already pulled anywhere, not on do-not-pull. Most senior
-    first, never more per company than you asked for. Returns how many were kept."""
+def _icy_take(p, leads, cap):
+    """People from a search page worth an email lookup: at one of your companies that is still short, in your
+    countries, not excluded by your titles, not already pulled anywhere, not on do-not-pull. Most senior first, never
+    more per company than you asked for."""
     pid = p["id"]
     f = p["filters"]
     rules = F.tool_excludes(f)
-    countries = {x.lower() for x in ((f.get("contactCountry") or {}).get("in") or [])}
-    no_countries = {x.lower() for x in ((f.get("contactCountry") or {}).get("out") or [])}
+    wanted = list(((f.get("contactCountry") or {}).get("in")) or [])
+    unwanted = list(((f.get("contactCountry") or {}).get("out")) or [])
     block = memory.Blocklist()
     page_keys = _pull_keys(pid)
     cands = []
-    for r in results:
-        person, company = (r or {}).get("person") or {}, (r or {}).get("company") or {}
-        dom = CO.listed(pid, company.get("domain") or company.get("website") or "")
-        first, last = (person.get("first_name") or "").strip(), (person.get("last_name") or "").strip()
-        name = (person.get("full_name") or f"{first} {last}").strip()
-        if not dom or not person.get("person_id") or not name:
+    unreadable = 0
+    for lead in leads:
+        c = icypeas.read_lead(lead)
+        if not c:
+            unreadable += 1
             continue
-        loc = person.get("location") or {}
-        country = (loc.get("country") or "").strip()
-        if countries and country.lower() not in countries:
+        dom = CO.listed(pid, c["domain"])
+        if not dom or not icypeas.country_ok(c["country"], wanted, unwanted):
             continue
-        if country.lower() in no_countries:
-            continue
-        c = {"name": name, "first_name": first, "last_name": last, "title": person.get("current_job_title") or "",
-             "company": company.get("name") or "", "domain": db.norm_domain(company.get("domain") or dom),
-             "li_url": person.get("linkedin_url") or "", "country": country, "city": loc.get("city") or "",
-             "region": loc.get("state") or "", "row_email": "", "seniority": "", "department": "",
-             "industry": company.get("industry") or "", "size": company.get("employee_range") or "",
-             "prospeo_pid": str(person["person_id"]), "listed": dom}
+        c.update(row_email="", seniority="", department="", listed=dom)
+        if not c["company"]:
+            c["company"] = db.q1("SELECT name FROM pull_companies WHERE pull_id=? AND domain=?", (pid, dom))["name"] or dom
         keys = db.person_keys(c["name"], c["company"], c["li_url"])
         if not keys or page_keys & set(keys) or memory.find(keys):
             continue
@@ -1372,37 +1399,21 @@ def _prospeo_take(p, results, cap):
             continue
         page_keys.update(keys)
         cands.append(c)
+    if unreadable:
+        db.update_pull(pid, error=f"{unreadable} people from Icypeas's search couldn't be read (see Accounts → last "
+                                  f"answers); the others were used.")
     cands.sort(key=lambda c: guess.seniority_rank(c["seniority"], c["title"]))
     kept = 0
     now = NOW()
     for c in cands:
         if cap and _good_at(pid, c["listed"]) >= cap:
             continue
-        db.x("""INSERT INTO contacts(pull_id,state,name,first_name,last_name,title,company,domain,li_url,country,region,
-                city,industry,size,prospeo_pid,research_message,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        db.x("""INSERT INTO contacts(pull_id,state,name,first_name,last_name,title,company,domain,li_url,country,
+                icy_search,research_message,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)""",
              (pid, "pkept", c["name"], c["first_name"], c["last_name"], c["title"], c["company"], c["domain"],
-              c["li_url"], c["country"], c["region"], c["city"], c["industry"], c["size"], c["prospeo_pid"],
-              "Seamless didn't have this person; found by Prospeo's search.", now))
+              c["li_url"], c["country"], "Seamless didn't have this person; found by Icypeas's search.", now))
         kept += 1
     return kept
-
-
-def _prospeo_first(p, people):
-    """Prospeo-first (SOURCE_ORDER=prospeo,seamless): ask Prospeo before paying Seamless. Returns (found, rest)."""
-    ok, _why = prospeo.ready()
-    room = prospeo.room(p["id"])
-    if not ok or (room is not None and room < 1):
-        return 0, people
-    ask = [c for c in people if not (c.get("prospeo_state") or "") and prospeo.lookup_input(c)][:min(prospeo.batch_size(),
-                                                                                                    room or 50)]
-    if not ask:
-        return 0, people
-    screened = _prospeo_screen(p["id"], ask, len(ask))
-    res = prospeo.enrich(screened, p["id"]) if screened else {}
-    _prospeo_apply(screened, res)
-    found = {r["id"] for r in db.q(f"SELECT id FROM contacts WHERE id IN ({','.join('?' * len(ask))}) AND "
-                                   f"state='done'", [c["id"] for c in ask])}
-    return len(found), [c for c in people if c["id"] not in found]
 
 
 ENRICH_COLS = {
@@ -1477,7 +1488,7 @@ def enrich_check(header, rows, mapping=None):
     return {"columns": {k: (header[v] if v is not None and v < len(header) else None) for k, v in mapping.items()},
             "mapping": mapping, "rows": len(people), "counts": dict(st),
             "seamless_max": st["lookup"], "seamless_on": cfg.ENRICH_USE_SEAMLESS,
-            "prospeo_ready": prospeo.ready()[0], "prospeo_why": prospeo.ready()[1],
+            "icypeas_ready": icypeas.ready()[0], "icypeas_why": icypeas.ready()[1],
             "guessing_ready": verifier.ready()[0],
             "default_max_credits": math.ceil(st["lookup"] * cfg.ENRICH_DEFAULT_MAX_CREDITS) if st["lookup"] else 0,
             "sample": [{k: c[k] for k in ("name", "company", "domain", "li_url", "title")} for c in people[:5]]}
@@ -1590,11 +1601,11 @@ def enrich_rows(pid):
             src = next((by_key[k] for k in db.person_keys(c["name"], c["company"], c["li_url"]) if k in by_key), c)
         usable = src["state"] == "done" and src["email"] and (src["email_status"] or "").lower() != "invalid" \
             and not src["dup_email"]
-        note = src["skip_reason"] if src["state"] == "skipped" else (src["research_message"] or src["prospeo_note"] or "")
-        if src["state"] in ("no_email", "failed") and src["prospeo_note"] and src["prospeo_state"] not in ("found",):
-            note = ((src["research_message"] or "") + " · Prospeo: " + src["prospeo_note"]).strip(" ·")
+        note = src["skip_reason"] if src["state"] == "skipped" else (src["research_message"] or src["icy_note"] or "")
+        if src["state"] in ("no_email", "failed") and src["icy_note"] and src["icy_state"] not in ("found",):
+            note = ((src["research_message"] or "") + " · Icypeas: " + src["icy_note"]).strip(" ·")
         out.append({"input": json.loads(c["enrich_input"] or "[]"), "email": src["email"] if usable else "",
-                    "email_status": "valid" if usable and src["email_source"] in ("prospeo", "guessed", "already")
+                    "email_status": "valid" if usable and src["email_source"] in ("icypeas", "prospeo", "guessed", "already")
                     else (src["email_status"] or "" if usable else ""),
                     "source": SOURCE_LABEL.get(src["email_source"] or "", "") if usable else "",
                     "title": src["title"] or "", "linkedin": src["li_url"] or "", "company": src["company"] or "",
@@ -1602,7 +1613,8 @@ def enrich_rows(pid):
     return header, out
 
 
-SOURCE_LABEL = {"seamless": "seamless", "prospeo": "prospeo (verified)", "guessed": "guessed (MillionVerifier: valid)",
+SOURCE_LABEL = {"seamless": "seamless", "icypeas": "icypeas (verified)", "prospeo": "prospeo (verified, before 2.5)",
+                "guessed": "guessed (MillionVerifier: valid)",
                 "already": "already had"}
 
 
@@ -1797,23 +1809,24 @@ def _give_up(pid, message):
     db.x("UPDATE contacts SET state='timed_out', research_message=? WHERE pull_id=? AND state='queued'", (message, pid))
 
 
-def prospeo_late():
-    """2.4.1: people still waiting for Prospeo when their pull finished (Prospeo's daily limit, a pause) are asked
-    later by themselves, one small call per tick, for PROSPEO_LATE_DAYS. Never for pulls you stopped."""
-    if not cfg.PROSPEO_LATE_DAYS or not prospeo.ready()[0]:
+def icypeas_late():
+    """2.5: Icypeas answers that arrive after a pull finished are still filled in, and people still waiting for
+    Icypeas (a pause, a rate limit) are asked later by themselves, for ICYPEAS_LATE_DAYS. Never for pulls you stopped."""
+    if not cfg.ICYPEAS_LATE_DAYS or not icypeas.key():
         return False
-    since = NOW() - cfg.PROSPEO_LATE_DAYS * 86400
-    for r in db.q(f"""SELECT DISTINCT p.id FROM pulls p JOIN contacts c ON c.pull_id=p.id WHERE p.status='done' AND
-                      p.finished_at>=? AND COALESCE(p.stop_reason,'') NOT LIKE 'Stopped by you%' AND
-                      ((c.state='pkept') OR ({PROSPEO_ELIGIBLE.replace("state", "c.state").replace("email_status", "c.email_status").replace("dup_email", "c.dup_email").replace("(email IS NULL OR email='')", "(c.email IS NULL OR c.email='')")}
-                      AND COALESCE(c.prospeo_state,'') IN ('','retry'))) ORDER BY p.finished_at LIMIT 5""", (since,)):
+    since = NOW() - cfg.ICYPEAS_LATE_DAYS * 86400
+    for r in db.q("""SELECT p.id FROM pulls p WHERE p.status='done' AND p.finished_at>=? AND
+                     COALESCE(p.stop_reason,'') NOT LIKE 'Stopped by you%' AND (EXISTS (SELECT 1 FROM icypeas_jobs j
+                     WHERE j.pull_id=p.id AND j.done_at IS NULL) OR EXISTS (SELECT 1 FROM contacts c WHERE
+                     c.pull_id=p.id AND c.state IN ('pkept','no_email','failed','done') AND
+                     COALESCE(c.icy_state,'') IN ('','retry') AND (c.state!='done' OR c.email IS NULL OR c.email='' OR
+                     LOWER(COALESCE(c.email_status,''))='invalid' OR c.dup_email=1))) ORDER BY p.finished_at LIMIT 5""",
+                  (since,)):
         p = db.get_pull(r["id"])
         need = p["target"] - counts(p["id"])["emails"]
         if p.get("mode") == "enrich":
             need = max(need, 1)
-        if need < 1:
-            continue
-        if _prospeo_misses(p, need) or _prospeo_search_step(p, need):
+        if _icy_tick(p, need, late=True):
             return True
     return False
 

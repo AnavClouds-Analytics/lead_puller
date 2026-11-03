@@ -6,6 +6,9 @@ import re
 
 from . import db, guess, memory
 from .config import cfg
+import time
+
+NOW = time.time            # tests swap in a fake clock
 
 WEBSITE_COLS = ("website", "domain", "company_domain", "company_website", "website_url", "url", "company_url",
                 "homepage", "site", "web", "company_site")
@@ -69,9 +72,24 @@ def parse(text=None, csv_text=None):
     return rows
 
 
-def check(rows):
-    """Status per company: ready / no_website / dnp / duplicate / too_many. Nothing here costs anything."""
+def recently_pulled(days=None):
+    """2.5: websites already in a company-list pull made in the last COMPANY_SKIP_DAYS days -> when (first time)."""
+    days = cfg.COMPANY_SKIP_DAYS if days is None else days
+    if not days:
+        return {}
+    since = NOW() - days * 86400
+    out = {}
+    for r in db.q("""SELECT pc.domain, MIN(p.created_at) at FROM pull_companies pc JOIN pulls p ON p.id=pc.pull_id
+                     WHERE pc.status='ready' AND p.created_at>=? GROUP BY pc.domain""", (since,)):
+        out[r["domain"]] = r["at"]
+    return out
+
+
+def check(rows, skip_recent=True):
+    """Status per company: ready / no_website / dnp / duplicate / too_many / done_before. Nothing here costs anything.
+    skip_recent=False ("Run again" on a pull) keeps companies already pulled recently."""
     block = memory.Blocklist()
+    recent = recently_pulled() if skip_recent else {}
     seen = set()
     out = []
     ready = 0
@@ -85,6 +103,9 @@ def check(rows):
             item["status"] = "duplicate"
         elif block.reason(name, name, d, None, None):
             item["status"] = "dnp"
+        elif d in recent:
+            item["status"] = "done_before"
+            item["pulled_at"] = recent[d]
         elif ready >= cfg.COMPANY_LIST_MAX:
             item["status"] = "too_many"
         else:
@@ -104,6 +125,7 @@ def summary(items):
     catch = sum(1 for i in items if i["status"] == "ready" and guess.format_label(i["domain"]) == "catch_all")
     return {"ready": s.get("ready", 0), "no_website": s.get("no_website", 0), "dnp": s.get("dnp", 0),
             "duplicate": s.get("duplicate", 0), "too_many": s.get("too_many", 0), "known_format": known,
+            "done_before": s.get("done_before", 0), "skip_days": cfg.COMPANY_SKIP_DAYS,
             "catch_all": catch, "total": len(items)}
 
 

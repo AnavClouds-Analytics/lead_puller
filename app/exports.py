@@ -32,9 +32,9 @@ COLUMNS = [
     ("email_source", "How we got the email", lambda c: (
         "guessed: common format tried (MillionVerifier: valid)" if c.get("email_source") == "guessed"
         and c.get("guess_how") == "probe" else
-        "prospeo search (verified)" if c.get("email_source") == "prospeo" and c.get("prospeo_pid") else
-        {"guessed": "guessed (MillionVerifier: valid)", "seamless": "seamless", "prospeo": "prospeo (verified)",
-         "already": "already had"}.get(c.get("email_source") or "", ""))),
+        "icypeas search (verified)" if c.get("email_source") == "icypeas" and c.get("icy_search") else
+        {"guessed": "guessed (MillionVerifier: valid)", "seamless": "seamless", "icypeas": "icypeas (verified)",
+         "prospeo": "prospeo (verified, before 2.5)", "already": "already had"}.get(c.get("email_source") or "", ""))),
     ("signal", "Signal", lambda c: c.get("signal") or ""),
     ("result", "Seamless result", lambda c: c["research_status"]),
     ("note", "Note", lambda c: c["research_message"]),
@@ -96,7 +96,7 @@ def _signals(pid, rows):
 
 def all_rows(pid):
     return _signals(pid, db.q("SELECT * FROM contacts WHERE pull_id=? AND (submitted_at IS NOT NULL OR "
-                              "email_source IN ('guessed','prospeo','already')) ORDER BY id", (pid,)))
+                              "email_source IN ('guessed','prospeo','icypeas','already')) ORDER BY id", (pid,)))
 
 
 def no_email_rows(pid):
