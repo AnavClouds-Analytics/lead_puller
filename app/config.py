@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.6.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -61,6 +61,11 @@ SETTINGS = [
      "firstlast@, first_last@) with MillionVerifier before paying Seamless to learn it (0 = always pay for the first "
      "person, as in 2.1)"),
     ("GUESS_PROBE_FORMATS", "3", "int", "Email guessing", "How many of those formats to try for that first person (1-3)"),
+    ("GUESS_PROBE_LEARN_MIN", "20", "int", "Email guessing",
+     "2.6: once this many companies' formats are known, the common formats are tried in the order that's most often "
+     "right at your companies (the same formats are tried, only the order changes)"),
+    ("GUESS_PROBE_PEOPLE", "2", "int", "Email guessing",
+     "2.6: how many people at one company get the common formats tried before giving up on that company (1-3)"),
     ("GUESS_MAX_COMPANY_SIZE", "5000", "int", "Email guessing",
      "2.2: never guess at companies bigger than this many employees (more people share a name there); 0 = no limit"),
     ("GUESS_MAX_CHECKS_PER_PERSON", "2", "int", "Email guessing",

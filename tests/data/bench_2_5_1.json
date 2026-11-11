@@ -1,0 +1,107 @@
+{
+ "company_list/11": {
+  "emails": 198,
+  "guessed": 69,
+  "mv_checks": 227,
+  "research": 157,
+  "search": 48
+ },
+ "company_list/23": {
+  "emails": 202,
+  "guessed": 76,
+  "mv_checks": 235,
+  "research": 152,
+  "search": 48
+ },
+ "company_list/42": {
+  "emails": 199,
+  "guessed": 71,
+  "mv_checks": 182,
+  "research": 152,
+  "search": 44
+ },
+ "company_list/7": {
+  "emails": 198,
+  "guessed": 61,
+  "mv_checks": 210,
+  "research": 165,
+  "search": 50
+ },
+ "company_list/99": {
+  "emails": 204,
+  "guessed": 71,
+  "mv_checks": 246,
+  "research": 159,
+  "search": 46
+ },
+ "filter_pull/11": {
+  "emails": 152,
+  "guessed": 84,
+  "mv_checks": 203,
+  "research": 84,
+  "search": 20
+ },
+ "filter_pull/23": {
+  "emails": 151,
+  "guessed": 92,
+  "mv_checks": 200,
+  "research": 68,
+  "search": 21
+ },
+ "filter_pull/42": {
+  "emails": 151,
+  "guessed": 93,
+  "mv_checks": 206,
+  "research": 66,
+  "search": 20
+ },
+ "filter_pull/7": {
+  "emails": 150,
+  "guessed": 93,
+  "mv_checks": 223,
+  "research": 69,
+  "search": 20
+ },
+ "filter_pull/99": {
+  "emails": 151,
+  "guessed": 97,
+  "mv_checks": 203,
+  "research": 62,
+  "search": 19
+ },
+ "two_pulls/11": {
+  "emails": 183,
+  "guessed": 91,
+  "mv_checks": 274,
+  "research": 113,
+  "search": 24
+ },
+ "two_pulls/23": {
+  "emails": 182,
+  "guessed": 109,
+  "mv_checks": 262,
+  "research": 86,
+  "search": 23
+ },
+ "two_pulls/42": {
+  "emails": 183,
+  "guessed": 106,
+  "mv_checks": 249,
+  "research": 89,
+  "search": 23
+ },
+ "two_pulls/7": {
+  "emails": 182,
+  "guessed": 98,
+  "mv_checks": 280,
+  "research": 102,
+  "search": 24
+ },
+ "two_pulls/99": {
+  "emails": 182,
+  "guessed": 111,
+  "mv_checks": 234,
+  "research": 83,
+  "search": 23
+ }
+}

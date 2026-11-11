@@ -1,10 +1,48 @@
-# Lead Puller 2.5.1
+# Lead Puller 2.6.0
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## New in 2.6: fewer MillionVerifier checks, same Seamless credits
+
+Email guessing now spends fewer MillionVerifier checks. Seamless credits, emails found and guessed emails are
+unchanged: the same people are guessed, in the same way, only with fewer checks.
+
+- **The made-up address is checked only after a valid guess.** To spot a company whose server says "valid" to every
+  address, a made-up address (`zq...x@company`) was checked at every new company. Now it's checked only when a guess
+  there comes back valid. A company that rejects a guess can't be such a server, so the check isn't needed there.
+  Such a company is still never guessed (tested).
+- **The common formats are tried in your companies' order.** At a new company, first.last@, firstlast@ and first_last@
+  are tried in the order most often right at the companies you already know (same three formats, new order), once at
+  least `GUESS_PROBE_LEARN_MIN` (20) companies are known.
+- **`GUESS_PROBE_PEOPLE`** (2): how many people at one new company get the common formats tried (1 - 3; it was
+  fixed at 2).
+- **The pull page** shows "N MillionVerifier checks per Seamless credit saved" under Seamless credits saved.
+- **AnavClouds branding:** the AnavClouds logo in the side panel and on the login page, the browser tab icon, the
+  AnavClouds blue, and the version under the name ("Version 2.6.0").
+
+Measured on the same test data as 2.5.1 (5 data sets x 3 kinds of pull): Seamless research credits and emails
+identical, MillionVerifier checks 13 - 16% lower. Most of the checks left are guesses at companies with a format
+that can't be guessed; cutting those would mean paying Seamless for people a guess would have found, so they stay.
+
+### Upgrading to 2.6 (from 2.5 or 2.5.1)
+
+Replace the code, keep `data/` and `.env`. No database change; no `.env` change needed (the two new settings have
+defaults; add them to `.env` only to change them):
+
+```bash
+cd lead-puller-2 && docker compose down
+cp -r data ../lead-puller-2-data-backup            # backup first
+# unzip lead-puller-2.6.0.zip over this folder (it never contains data/ or .env)
+docker compose up -d --build
+curl -s http://127.0.0.1:8090/healthz      # {"ok":true,"version":"2.6.0"}
+```
+
+Tested by opening a 2.5.1 database with 2.6: every table is unchanged (only a new login is added), every pull opens,
+and a new pull reuses the email formats already learned.
 
 ## 2.5.1 fix
 

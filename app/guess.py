@@ -239,6 +239,24 @@ def try_person(c, addresses, pull_id):
 PROBE_ORDER = ("first.last", "firstlast", "first_last")
 
 
+def probe_order():
+    """2.6: the common full-name formats, most used first among the companies you already know (each company counted
+    once, by its main format). With fewer than GUESS_PROBE_LEARN_MIN known companies the usual order is kept.
+    Only the order changes: the same formats are tried, so nobody who would have been found is missed."""
+    counts = {p: 0 for p in PROBE_ORDER}
+    known = 0
+    for r in db.q("SELECT domain FROM email_examples GROUP BY domain"):
+        fm = formats(r["domain"])
+        if not fm:
+            continue
+        known += 1
+        if fm[0][1] in counts:
+            counts[fm[0][1]] += 1
+    if known < max(1, cfg.GUESS_PROBE_LEARN_MIN):
+        return PROBE_ORDER
+    return tuple(sorted(PROBE_ORDER, key=lambda p: (-counts[p], PROBE_ORDER.index(p))))
+
+
 def probe_plan(c, others_same_name):
     """For the first person at a company whose format isn't known: the common full-name addresses to try, best first.
     ([] = don't probe: pay Seamless as in 2.1), and why not."""
@@ -257,11 +275,13 @@ def probe_plan(c, others_same_name):
         return [], why
     if others_same_name:
         return [], "Someone else with the same name at this company: a guess could reach the wrong person."
-    if int(domain_state(d).get("probe_tries") or 0) >= 2:
-        return [], "The common formats were already tried twice at this company without luck."
+    most = max(1, min(3, cfg.GUESS_PROBE_PEOPLE))
+    if int(domain_state(d).get("probe_tries") or 0) >= most:
+        return [], (f"The common formats were already tried {'once' if most == 1 else f'{most} times'} at this company "
+                    "without luck.")
     n = max(1, min(len(PROBE_ORDER), cfg.GUESS_PROBE_FORMATS))
     out = []
-    for pat in PROBE_ORDER[:n]:
+    for pat in probe_order()[:n]:
         e = f"{PATTERNS[pat](*parts)}@{d}"
         if db.q1("SELECT 1 x FROM memory WHERE key=?", ("em:" + e,)) or \
                 db.q1("SELECT 1 x FROM email_examples WHERE email=?", (e,)):
@@ -292,18 +312,33 @@ def accepts_everything(domain, pull_id, contact_id):
     return True                                   # unknown / error: not sure, so don't guess this time
 
 
+def _mark_rejects(d):
+    """2.6: the company's server said an address doesn't exist, so it doesn't accept every address: the made-up
+    address check is not needed there any more."""
+    db.x("UPDATE domain_guess SET accept_all_checked=1, updated_at=? WHERE domain=? AND catch_all=0", (NOW(), d))
+
+
 def probe(c, addresses, pull_id):
     """Try the planned addresses for the first person at a new company. Returns (email or None, note).
-    A valid answer also teaches the company's format, so the next people there are guessed directly."""
+    A valid answer also teaches the company's format, so the next people there are guessed directly.
+
+    2.6: the made-up address is checked only when a guess comes back valid, to make sure the company's server doesn't
+    say "valid" to every address. Before, it was checked first at every new company, which cost one check even where
+    no guess was ever valid. Same protection, fewer checks: a server that says an address doesn't exist can't be one
+    that accepts everything."""
     d = db.norm_domain(c["domain"])
-    if accepts_everything(d, pull_id, c["id"]):
+    st = domain_state(d)
+    if st["catch_all"]:
         return None, "Company's server accepts every address, so a guess can't be checked."
+    db.x("INSERT OR IGNORE INTO domain_guess(domain, updated_at) VALUES(?,?)", (d, NOW()))
     db.x("UPDATE domain_guess SET probe_tries=probe_tries+1, updated_at=? WHERE domain=?", (NOW(), d))
     tried = []
     for e in addresses:
         res = verifier.check(e, pull_id, c["id"])
         tried.append(f"{e}: {res}")
         if res == "ok":
+            if accepts_everything(d, pull_id, c["id"]):
+                return None, "Company's server accepts every address, so a guess can't be checked: " + "; ".join(tried)
             _bump(d, valid=True)
             learn(c["first_name"], c["last_name"], e, d, "probe")
             return e, "Tried the common formats: " + "; ".join(tried)
@@ -311,6 +346,7 @@ def probe(c, addresses, pull_id):
             _bump(d, catch_all=True)
             return None, "; ".join(tried)
         if res in ("invalid", "disposable"):
+            _mark_rejects(d)
             continue
         return None, "; ".join(tried)          # unknown / error: stop, pay Seamless as usual
     return None, "None of the common formats exists: " + "; ".join(tried)

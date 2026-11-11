@@ -3,19 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" href="data:,">
+<link rel="icon" type="image/png" href="/favicon.png">
 <title>Lead Puller</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
   --bg:#F6F7F9; --panel:#FFFFFF; --ink:#15171C; --ink2:#4A505C; --ink3:#6B7280; --line:#E2E5EA; --line2:#EEF0F3;
-  --brand:#1F4FD8; --brand-ink:#FFFFFF; --brand-soft:#EAF0FF; --out:#9A4307; --out-soft:#FDF0E6;
+  --brand:#0277BD; --brand-ink:#FFFFFF; --brand-soft:#E1F6FD; --out:#9A4307; --out-soft:#FDF0E6;
   --ok:#14713D; --ok-soft:#E3F4EA; --warn:#8A5A00; --warn-soft:#FFF4DB; --bad:#B42318; --bad-soft:#FDECEC;
 }
 @media (prefers-color-scheme: dark){:root{
   --bg:#0F1115; --panel:#171A20; --ink:#E9ECF1; --ink2:#B4BAC6; --ink3:#8D94A3; --line:#2A2F38; --line2:#20242B;
-  --brand:#6B93FF; --brand-ink:#0B0D12; --brand-soft:#1B2540; --out:#F3A86B; --out-soft:#2E2014;
+  --brand:#3CCBF7; --brand-ink:#0B0D12; --brand-soft:#0F2A35; --out:#F3A86B; --out-soft:#2E2014;
   --ok:#4CC584; --ok-soft:#14291E; --warn:#F0B44A; --warn-soft:#2C2213; --bad:#FF7A7A; --bad-soft:#2D1717;}}
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}
@@ -25,7 +25,9 @@ input,select,textarea{background:var(--panel);border:1px solid var(--line);borde
 input:focus,select:focus,textarea:focus{outline:2px solid var(--brand-soft);border-color:var(--brand)}
 .app{display:flex;min-height:100vh}
 aside.sidebar{width:220px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:18px 12px;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;overflow-y:auto}
-.logo{font-weight:700;font-size:16px;letter-spacing:-.01em;padding:4px 10px 16px}
+.logo{display:block;padding:2px 6px 4px}.logo:hover{text-decoration:none}.logo-tile{display:inline-block;background:#fff;border-radius:8px;padding:6px 8px}.logo img{display:block;width:150px;height:auto}
+.brand-name{font-weight:700;font-size:16px;letter-spacing:-.01em;color:var(--ink);padding:2px 10px 0}.app-version{font-size:12px;color:var(--ink3);padding:0 10px 14px}
+.login-logo{display:block;width:100%;max-width:420px;height:auto;margin:0 auto 16px;background:#fff;border-radius:8px;padding:8px}
 nav.main{display:flex;flex-direction:column;gap:2px}
 nav.main a{padding:8px 10px;border-radius:8px;color:var(--ink2);font-weight:500}
 nav.main a:hover{background:var(--line2);text-decoration:none}
@@ -45,7 +47,7 @@ h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em} h2{font-size:16px;margin
 .grid{display:grid;gap:12px} .g2{grid-template-columns:repeat(2,minmax(0,1fr))} .g3{grid-template-columns:repeat(3,minmax(0,1fr))} .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
 @media (max-width:860px){.g3,.g4{grid-template-columns:repeat(2,minmax(0,1fr))} .g2{grid-template-columns:1fr} main{padding:18px 16px 60px}
   .app{flex-direction:column} aside.sidebar{width:auto;height:auto;position:static;padding:10px 16px;border-right:none;border-bottom:1px solid var(--line)}
-  .logo{padding:4px 0 8px} nav.main{flex-direction:row;flex-wrap:wrap;gap:4px}
+  .logo{padding:4px 0 4px} .logo img{width:110px} .brand-name{padding:2px 0 0} .app-version{padding:0 0 8px} nav.main{flex-direction:row;flex-wrap:wrap;gap:4px}
   .bal{flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px 16px;padding:10px 0 0} .bal .btn{margin-top:0}}
 .btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:9px 14px;border-radius:8px;font-weight:600;white-space:nowrap;cursor:pointer;display:inline-block}
 .btn:hover{border-color:var(--ink3);text-decoration:none}
@@ -57,7 +59,7 @@ h1{font-size:24px;margin:0 0 4px;letter-spacing:-.02em} h2{font-size:16px;margin
 .stat{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel);min-width:0;overflow-wrap:anywhere}
 .stat .k{font-size:12px;color:var(--ink2);font-weight:500} .stat .v{font-size:22px;font-weight:700;letter-spacing:-.01em} .stat .h{font-size:12px;color:var(--ink2)}
 .big-num{font-size:34px;font-weight:700;letter-spacing:-.02em}
-.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--line2);color:var(--ink2)}
+.badge{display:inline-block;white-space:nowrap;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;background:var(--line2);color:var(--ink2)}
 .b-ok{background:var(--ok-soft);color:var(--ok)} .b-warn{background:var(--warn-soft);color:var(--warn)} .b-bad{background:var(--bad-soft);color:var(--bad)} .b-brand{background:var(--brand-soft);color:var(--brand)}
 .notice{border-radius:10px;padding:10px 14px;margin-bottom:14px}
 .notice.info{background:var(--brand-soft)} .notice.warn{background:var(--warn-soft)} .notice.bad{background:var(--bad-soft)} .notice.ok{background:var(--ok-soft)}
@@ -206,7 +208,7 @@ function alerts(ov) {
 }
 function shell(content, narrow) {
   const h = location.hash || "#/new";
-  return `<div class="app"><aside class="sidebar"><div class="logo">Lead Puller</div>
+  return `<div class="app"><aside class="sidebar"><a class="logo" href="#/new" aria-label="Lead Puller: new pull"><span class="logo-tile"><img src="/logo.png" alt="AnavClouds Software"></span></a><div class="brand-name">Lead Puller</div><div class="app-version" id="app-version" title="The Lead Puller version installed on the server">Version ${esc(META.version||"")}</div>
     <nav class="main" aria-label="Main">${NAV.map(([href,l])=>`<a href="${href}" class="${h.startsWith(href)||(href==="#/history"&&h.startsWith("#/pull/"))?"on":""}">${l}</a>`).join("")}</nav>
     <div class="bal" id="bal">${balHtml(META.overview)}</div></aside>
     <div class="content"><div id="alerts">${alerts(META.overview)}</div><main id="main" class="${narrow?"narrow":""}">${content}</main></div></div>`;
@@ -237,7 +239,7 @@ document.addEventListener("click", e => {
 });
 
 function renderLogin(noPassword) {
-  $("#app").innerHTML = `<div class="center-box"><div class="card"><h1>Lead Puller</h1>${noPassword ?
+  $("#app").innerHTML = `<div class="center-box"><div class="card"><img class="login-logo" src="/logo-full.png" alt="AnavClouds Software · Salesforce silver consulting partner · AnavClouds Analytics.ai"><h1 style="text-align:center">Lead Puller</h1>${noPassword ?
     `<div class="notice warn">No password is set. Ask your developer to add <b>APP_PASSWORD</b> to .env and run <code>docker compose up -d</code>.</div>` :
     `<p class="sub">Log in to continue.</p><form id="lf"><label for="pw" class="small"><b>Password</b></label><input type="password" id="pw" autocomplete="current-password" autofocus style="margin:6px 0 12px">
      <button class="btn primary big">Log in</button></form>`}</div></div>`;
@@ -567,9 +569,9 @@ function guessCard(p) {
   return `<section class="card" aria-label="How the emails were found"><h2>How the emails were found</h2>
     <div class="grid g4"><div class="stat"><div class="k">Paid in Seamless</div><div class="v">${fmt(g.paid)}</div><div class="h">${fmt(g.paid_email)} got an email · 1 credit each</div></div>
       <div class="stat"><div class="k">Guessed, verified valid</div><div class="v" style="color:var(--ok)">${fmt(g.guessed)}</div><div class="h">0 Seamless credits${g.probed ? ` · ${fmt(g.probed)} by trying the common formats at a new company` : ""}</div></div>
-      <div class="stat"><div class="k">Seamless credits saved</div><div class="v" style="color:var(--ok)">${fmt(g.saved)}</div><div class="h">in this pull</div></div>
+      <div class="stat"><div class="k">Seamless credits saved</div><div class="v" style="color:var(--ok)">${fmt(g.saved)}</div><div class="h">in this pull${g.checks_per_saved ? ` · ${g.checks_per_saved} MillionVerifier checks per Seamless credit saved` : ""}</div></div>
       <div class="stat"><div class="k">MillionVerifier checks</div><div class="v">${fmt(g.checks)}</div><div class="h">${fmt(g.valid)} valid · ${fmt(g.catch_all)} catch-all · ${fmt(g.not_valid)} not valid</div></div></div>
-    <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else. At a new company the common formats are tried first, after checking that the company doesn't accept every address.
+    <div class="small muted" style="margin-top:10px">${g.checks - g.valid > 0 ? `The ${fmt(g.checks - g.valid)} checks that didn't come back valid were paid for in Seamless as usual, so nobody was lost. ` : ""}Only formats with the full first and last name are guessed (john.smith@), because john@ or jsmith@ could belong to someone else. At a new company the common formats are tried first; when one comes back valid, a made-up address is checked too, so a company that accepts every address is never guessed.
       ${!g.ready && g.why_not ? `<div style="color:var(--warn);margin-top:4px">Guessing is paused right now: ${esc(g.why_not)}</div>` : ""}</div></section>`;
 }
 function icyCard(p) {

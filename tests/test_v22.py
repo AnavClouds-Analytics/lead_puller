@@ -119,7 +119,8 @@ def test_made_up_address_is_checked_once_and_accept_all_servers_are_never_guesse
     for d in trap:
         assert not db.q1("SELECT 1 x FROM contacts WHERE domain=? AND email_source='guessed'", (d,)), d
         assert guess.domain_state(d)["catch_all"]
-        assert sum(1 for e in fake.mv.checks if e.endswith("@" + d)) <= 1   # only the made-up address
+        # 2.6: the made-up address is checked only after a guess there comes back valid: one guess + one made-up
+        assert sum(1 for e in fake.mv.checks if e.endswith("@" + d)) <= 2
     check_books(fake)
     check_people(fake)
 

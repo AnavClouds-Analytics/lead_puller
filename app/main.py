@@ -228,6 +228,8 @@ def _pull_out(pid):
                 "checks": sum(vl.values()), "valid": vl.get("ok", 0), "catch_all": vl.get("catch_all", 0),
                 "not_valid": sum(n for k, n in vl.items() if k not in ("ok", "catch_all")),
                 "ready": verifier.ready()[0], "why_not": verifier.ready()[1]}
+    # 2.6: what the guessing costs in MillionVerifier checks for each Seamless credit it saves
+    guessing["checks_per_saved"] = round(guessing["checks"] / g, 1) if g else None
     il = {r["result"]: (r["n"], r["c"]) for r in db.q("SELECT result, COUNT(*) n, COALESCE(SUM(cost),0) c FROM "
                                                      "icypeas_log WHERE pull_id=? GROUP BY result", (pid,))}
     p["icypeas"] = {"found": db.q1(f"SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND email_source='icypeas' AND "
@@ -772,6 +774,27 @@ def ledger(offset: int = 0, limit: int = 0, account: int = 0):
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC, "index.html"), headers={"Cache-Control": "no-store"})
+
+
+# 2.6: the AnavClouds logo (side panel, login page) and the browser tab icon; no login needed
+def _img(name):
+    return FileResponse(os.path.join(STATIC, name), media_type="image/png", headers={"Cache-Control": "max-age=86400"})
+
+
+@app.get("/logo.png", include_in_schema=False)
+def logo_png():
+    return _img("logo-anavclouds.png")
+
+
+@app.get("/logo-full.png", include_in_schema=False)
+def logo_full_png():
+    return _img("logo-full.png")
+
+
+@app.get("/favicon.png", include_in_schema=False)
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return _img("favicon.png")
 
 
 @app.get("/healthz")
