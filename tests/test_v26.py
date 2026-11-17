@@ -215,9 +215,9 @@ def test_branding_and_version(env):
     for path in ("/logo.png", "/logo-full.png", "/favicon.png", "/favicon.ico"):
         r = anon.get(path)
         assert r.status_code == 200 and r.headers["content-type"] == "image/png" and r.content[:4] == b"\x89PNG", path
-    assert APP_VERSION == "2.6.0"
-    assert anon.get("/healthz").json()["version"] == "2.6.0"
-    assert client.get("/api/meta").json()["version"] == "2.6.0"
+    assert tuple(int(x) for x in APP_VERSION.split(".")) >= (2, 6, 0)
+    assert anon.get("/healthz").json()["version"] == APP_VERSION
+    assert client.get("/api/meta").json()["version"] == APP_VERSION
     assert anon.get("/api/meta").status_code == 401               # the data still needs the login
     html = client.get("/").text
     assert 'href="/favicon.png"' in html and 'src="/logo.png"' in html and 'src="/logo-full.png"' in html

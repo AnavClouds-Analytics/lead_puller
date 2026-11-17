@@ -43,13 +43,17 @@ DELIVERABLE = "state='done' AND email IS NOT NULL AND email!='' AND LOWER(COALES
 # People actually researched in Seamless (guesses, Icypeas finds and enrichment rows filled from what you
 # already had are never counted in Seamless's email rate). 2.3: "submitted_at IS NOT NULL" added.
 NOT_GUESSED = "COALESCE(email_source,'')!='guessed' AND submitted_at IS NOT NULL"
+C_DELIVERABLE = ("c.state='done' AND c.email IS NOT NULL AND c.email!='' AND LOWER(COALESCE(c.email_status,''))!='invalid' "
+                 "AND c.dup_email=0")                       # DELIVERABLE for "contacts c" joined to another table
 OPEN_STATES = ("kept", "queued", "done", "unconfirmed", "timed_out", "no_email", "failed")
 
 
 # ================================================================ creating and controlling pulls
 def create_pull(name, prompt, filters, target, max_credits=None, account_choice="auto", max_per_company=None,
-                rerun_of=None, company_list=None, include_recent=False):
+                rerun_of=None, company_list=None, include_recent=False, split_sizes="", split_countries=""):
     f = F.clean(filters)
+    split_sizes = "even" if str(split_sizes or "").lower() == "even" else ""
+    split_countries = "even" if str(split_countries or "").lower() == "even" else ""
     items = None
     if company_list is not None:
         items = CO.check(company_list, skip_recent=rerun_of is None and not include_recent)
@@ -82,10 +86,13 @@ def create_pull(name, prompt, filters, target, max_credits=None, account_choice=
     now = NOW()
     default_name = F.summary(f) if items is None else f"{sum(1 for i in items if i['status'] == 'ready')} companies" + (
         f" · {F.summary(f)}" if F.summary(f) != "No filters" else "")
+    if items is not None:
+        split_sizes = split_countries = ""                 # 2.7: company lists are searched by company, not split
     pid = db.x("""INSERT INTO pulls(name,prompt,filters_json,target,max_credits,max_per_company,account_choice,status,
-                  created_at,updated_at,rerun_of,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  created_at,updated_at,rerun_of,mode,split_sizes,split_countries) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                ((name or default_name)[:90], prompt or "", json.dumps(f), target, max_credits, cap,
-                str(account_choice or "auto"), "queued", now, now, rerun_of, "companies" if items is not None else "filters"))
+                str(account_choice or "auto"), "queued", now, now, rerun_of, "companies" if items is not None else "filters",
+                split_sizes, split_countries))
     if items is not None:
         CO.save_for_pull(pid, items)
     return pid
@@ -231,6 +238,8 @@ def _plan(p):
     f = p["filters"]
     base = F.search_body(f)
     base.pop("companySize", None)
+    if _split_axes(p) != ([None], [None]):
+        return _plan_groups(p, base)
     plan = []
     if cfg.SLICE_BY_COMPANY_SIZE:
         sizes, chosen = F.size_slices(f)
@@ -265,6 +274,161 @@ def _plan(p):
                       (p["id"], i, label, size, skey))
 
 
+# ---------------------------------------------------------------- 2.7: even split across sizes / countries
+MIN_PER_GROUP = 10        # 2.7: an even split needs at least this many emails per size / country
+
+
+def _split_axes(p):
+    """The groups a pull is split into: (sizes, countries). [None] on an axis = not split that way."""
+    if p.get("mode") not in (None, "", "filters"):
+        return [None], [None]
+    f = p["filters"]
+    sizes, countries = [None], [None]
+    if p.get("split_sizes") == "even":
+        chosen = F.size_slices(f)
+        if chosen[1] and len(chosen[0]) >= 2:
+            sizes = list(chosen[0])
+    if p.get("split_countries") == "even":
+        cs = [c for c in F._ins(f, "contactCountry") if c and not str(c).startswith("-")]
+        if len(cs) >= 2:
+            countries = cs
+    # Each group's first search page costs at least 1 credit, so a group must be worth at least MIN_PER_GROUP emails:
+    # too many groups for the target -> split one way only, else not at all (in order)
+    fits = lambda s_, c_: (p.get("target") or 0) >= MIN_PER_GROUP * len(s_) * len(c_)
+    for s_, c_ in ((sizes, countries), (sizes, [None]), ([None], countries)):
+        if fits(s_, c_):
+            return s_, c_
+    return [None], [None]
+
+
+def _country_body(body, country):
+    if country is None:
+        return body
+    keep = [v for v in (body.get("contactCountry") or []) if str(v).startswith("-")]
+    return dict(body, contactCountry=[country] + keep)
+
+
+def _group_label(size, country):
+    return " · ".join(x for x in (size, country) if x)
+
+
+def _plan_groups(p, base):
+    """One group per size and/or country you picked; each group is scanned through its own slices (a group with no
+    fixed size is split by size exactly like a normal pull, cheapest first)."""
+    sizes, countries = _split_axes(p)
+    rows, idx = [], 0
+    for size in sizes:
+        for country in countries:
+            gbase = _country_body(base, country)
+            if size is not None:
+                plan = [(size, size)]
+            elif cfg.SLICE_BY_COMPANY_SIZE:
+                ss, chosen = F.size_slices(p["filters"])
+                plan = [(s_, s_) for s_ in ss] + ([] if chosen else [("Company size not on record", None)])
+            else:
+                inc = F.search_body(p["filters"]).get("companySize")
+                plan = [("Whole search", json.dumps(inc) if inc else None)]
+            grp = _group_label(size, country)
+            part = []
+            for label, sz in plan:
+                body = dict(gbase)
+                if sz is not None:
+                    body["companySize"] = json.loads(sz) if sz.startswith("[") else [sz]
+                elif cfg.SLICE_BY_COMPANY_SIZE:
+                    body["_slice"] = "rest"
+                skey = _hash(body)
+                hist = db.q("SELECT * FROM scan_state WHERE skey=?", (skey,))
+                live = any(h["next_token"] for h in hist)
+                done = any(h["exhausted_at"] for h in hist)
+                seen = sum(h["rows"] for h in hist)
+                rate = sum(h["kept"] for h in hist) / seen if seen else 1.0
+                order = 0 if live else (1 if not done else 2)
+                if sz is None and cfg.SLICE_BY_COMPANY_SIZE:
+                    order = 9
+                lab = label if size is None and country is None else (
+                    grp if size is not None else f"{country} · {label}")
+                part.append((order, -rate, lab, sz, skey, grp, country))
+            part.sort(key=lambda r: (r[0], r[1]))
+            rows += part
+    with db.tx() as c:
+        for i, (_, _, label, sz, skey, grp, country) in enumerate(rows):
+            c.execute("INSERT INTO pull_slices(pull_id,idx,label,size_value,skey,grp,country_value) VALUES(?,?,?,?,?,?,?)",
+                      (p["id"], i, label, sz, skey, grp, country))
+
+
+def group_stats(p, hit=None):
+    """2.7: per group: emails so far, people on their way, its share of the target and whether it can still search.
+    A group that has run out of people (or got too expensive) keeps what it has; its unused share goes to the others."""
+    pid = p["id"]
+    groups = [r["grp"] for r in db.q("SELECT grp FROM pull_slices WHERE pull_id=? AND grp IS NOT NULL "
+                                       "GROUP BY grp ORDER BY MIN(idx)", (pid,))]
+    if not groups:
+        return []
+    hit = hit_rate(pid) if hit is None else hit
+    rows = {r["grp"]: r for r in db.q(f"""SELECT s.grp, SUM(CASE WHEN {C_DELIVERABLE} THEN 1 ELSE 0 END) emails,
+              SUM(CASE WHEN c.state='kept' THEN 1 ELSE 0 END) kept,
+              SUM(CASE WHEN c.state IN ('queued','unconfirmed','timed_out') THEN 1 ELSE 0 END) waiting
+              FROM contacts c JOIN pull_slices s ON s.id=c.slice_id WHERE c.pull_id=? AND s.grp IS NOT NULL
+              GROUP BY s.grp""", (pid,))}
+    open_ = {r["grp"] for r in db.q("SELECT DISTINCT grp FROM pull_slices WHERE pull_id=? AND grp IS NOT NULL "
+                                     "AND state IN ('todo','scanning')", (pid,))}
+    ended = {r["grp"] for r in db.q("SELECT DISTINCT grp FROM pull_slices WHERE pull_id=? AND grp IS NOT NULL "
+                                     "AND state='left'", (pid,))}            # the pull finished before it ran out
+    out = []
+    for g in groups:
+        r = rows.get(g) or {}
+        e, k, w = int(r.get("emails") or 0), int(r.get("kept") or 0), int(r.get("waiting") or 0)
+        out.append({"group": g, "emails": e, "kept": k, "waiting": w, "expected": e + (k + w) * hit, "open": g in open_,
+                    "state": "open" if g in open_ else ("ended" if g in ended else "ran_out")})
+    target = p["target"]
+    closed = sum(x["expected"] for x in out if not x["open"])
+    n_open = sum(1 for x in out if x["open"])
+    even = target / len(out)
+    share = max(0.0, target - closed) / n_open if n_open else 0.0
+    for x in out:
+        x["share"] = share if x["open"] else x["expected"]
+        x["planned"] = round(even)
+    return out
+
+
+def _pick_slice(p, hit):
+    """2.7: with an even split, search the group that is furthest behind its share; else the first slice as before.
+    Returns (slice, most people to collect for it, hold). hold=True: every group has enough found or on its way, so
+    nothing more is searched for now. The limit is None when the pull isn't split."""
+    pid = p["id"]
+    gs = group_stats(p, hit)
+    if not gs:
+        return _current_slice(pid), None, False
+    cands = [g for g in gs if g["open"]]
+    if not cands:
+        return None, None, False
+    short = [g for g in cands if g["expected"] < g["share"] - 1e-9]
+    if not short:
+        return None, None, True
+    pick = min(short, key=lambda g: (g["expected"] / g["share"] if g["share"] else 1e9, g["expected"]))
+    sl = db.q1("SELECT * FROM pull_slices WHERE pull_id=? AND grp=? AND state IN ('todo','scanning') ORDER BY idx LIMIT 1",
+               (pid, pick["group"]))
+    return sl, max(1, math.ceil((pick["share"] - pick["expected"]) / hit)), False
+
+
+def _research_allowance(p, hit):
+    """2.7: how many kept people an even split may pay for now, per group: only as many as its share still needs
+    (a group that has run out may use everyone it found). None = the pull isn't split."""
+    gs = group_stats(p, hit)
+    if not gs:
+        return None
+    caps = {}
+    for g in gs:
+        need = g["share"] - (g["emails"] + g["waiting"] * hit)
+        if need <= 1e-9 or not g["kept"]:
+            continue
+        cap = max(1, math.ceil(need / hit - 1e-9))
+        if need <= 10:
+            cap = min(cap, math.ceil(need) + 1)     # the last few: a small batch, so one group can't overshoot its share
+        caps[g["group"]] = min(cap, g["kept"])
+    return caps
+
+
 def _slice_body(p, sl):
     body = F.search_body(p["filters"])
     doms = _slice_domains(sl)
@@ -272,6 +436,8 @@ def _slice_body(p, sl):
         body["companyDomain"] = doms
         return body
     body.pop("companySize", None)
+    if sl.get("country_value"):
+        body = _country_body(body, sl["country_value"])          # 2.7: one country of an even split
     if sl["size_value"] is not None:
         sv = sl["size_value"]
         body["companySize"] = json.loads(sv) if sv.startswith("[") else [sv]
@@ -402,16 +568,26 @@ def step(p):
         if icy_busy:
             return
         return _finish(p, f"Done: {st['emails']:,} of the {p['target']:,} people in your file have an email.")
-    sl = _current_slice(pid)
+    sl, group_want, hold = _pick_slice(p, hit)
     # 2.2: reopen companies only once every answer is back, so they're searched together in one go (one search
     # for many companies costs far less than one per company)
     if not sl and p.get("mode") == "companies" and not st["kept"] and not st["pending"] and _reopen_companies(p):
         sl = _current_slice(pid)
-    if st["kept"] >= batch or (st["kept"] and not sl):
-        if _research(p, min(batch, st["kept"])) or not sl:
+    kept, allow = st["kept"], None
+    if p.get("mode") in (None, "", "filters"):
+        allow = _research_allowance(p, hit)              # 2.7: an even split pays only for each group's share
+        if allow is not None:
+            kept = sum(allow.values())
+    if kept >= batch or (kept and not sl):
+        if _research(p, min(batch, kept), allow) or not sl:
             return
+    if hold:
+        return                                           # 2.7: every group has enough found or on its way
     if sl:
-        return _search(p, sl, need_people - st["kept"], hit)
+        want = need_people - kept
+        if group_want is not None:
+            want = min(want, group_want)                    # 2.7: only this group's share
+        return _search(p, sl, want, hit)
     if st["pending"]:
         return _wait(p, st)
     if icy_busy:
@@ -899,12 +1075,21 @@ def _pull_keys(pid):
 
 
 # ================================================================ researching
-def _research(p, n):
+def _research(p, n, allow=None):
     """Get emails for up to n kept people: a verified guess where the company's format is known (free in Seamless),
-    otherwise Seamless research (1 credit). Returns how many people were handled (0 = nothing could move yet)."""
+    otherwise Seamless research (1 credit). Returns how many people were handled (0 = nothing could move yet).
+    2.7: `allow` = the only kept people that may be paid for (an even split: each group only up to its share)."""
     pid = p["id"]
-    by_acct = db.q("SELECT account_id, COUNT(*) n FROM contacts WHERE pull_id=? AND state='kept' GROUP BY account_id",
-                   (pid,))
+    only, sgrp, used = "", {}, collections.Counter()
+    if allow is not None:
+        if not allow:
+            return 0
+        for r in db.q("SELECT id, grp FROM pull_slices WHERE pull_id=?", (pid,)):
+            if r["grp"] in allow:
+                sgrp[r["id"]] = r["grp"]
+        only = f" AND slice_id IN ({','.join(str(int(i)) for i in sgrp)})" if sgrp else " AND 0"
+    by_acct = db.q("SELECT account_id, COUNT(*) n FROM contacts WHERE pull_id=? AND state='kept'" + only +
+                   " GROUP BY account_id", (pid,))
     order = [a["id"] for a in accounts.ordered_for(p["account_choice"])]
     by_acct.sort(key=lambda r: (r["account_id"] != p["current_account_id"],
                                 order.index(r["account_id"]) if r["account_id"] in order else 99))
@@ -926,7 +1111,7 @@ def _research(p, n):
                  (NOW(), pid, grp["account_id"]))
             continue
         k = min(n, grp["n"])
-        cands = db.q("SELECT * FROM contacts WHERE pull_id=? AND state='kept' AND account_id=? ORDER BY id LIMIT ?",
+        cands = db.q("SELECT * FROM contacts WHERE pull_id=? AND state='kept' AND account_id=?" + only + " ORDER BY id LIMIT ?",
                      (pid, acct["id"], max(k * 3, 60)))
         cands.sort(key=lambda c: (guess.seniority_rank(c["seniority"], c["title"]), c["id"]))
         guessing, _why = verifier.ready()
@@ -936,6 +1121,11 @@ def _research(p, n):
         for c in cands:
             if done + len(to_pay) >= k or len(to_pay) >= room:
                 break
+            if allow is not None:                         # 2.7: each group only up to its share
+                g = sgrp.get(c["slice_id"])
+                if g is None or used[g] >= allow[g]:
+                    continue
+                used[g] += 1
             reason = _recheck(c, block)
             if reason:
                 db.x("UPDATE contacts SET state='skipped', skip_reason=?, skip_kind='recheck' WHERE id=?",

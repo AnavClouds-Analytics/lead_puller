@@ -110,6 +110,9 @@ MIGRATIONS["contacts"] += [("prospeo_pid", "TEXT")]          # 2.4: a person fou
 # 2.5: Icypeas (second source); the old Prospeo columns/tables are kept, unused, so nothing you had is deleted
 MIGRATIONS["contacts"] += [("icy_state", "TEXT"), ("icy_note", "TEXT"), ("icy_job", "TEXT"), ("icy_asked_at", "REAL"),
                            ("icy_search", "INTEGER DEFAULT 0")]
+# 2.7: split a pull evenly across the company sizes / countries you pick ('even'), or cheapest first ('' or 'order')
+MIGRATIONS["pulls"] += [("split_sizes", "TEXT DEFAULT ''"), ("split_countries", "TEXT DEFAULT ''")]
+MIGRATIONS["pull_slices"] = [("grp", "TEXT"), ("country_value", "TEXT")]
 # 2.4.1: Prospeo's own request limits (per plan), read from its answers, and why it is paused
 MIGRATIONS["prospeo"] = [("pause_reason", "TEXT"), ("limits_json", "TEXT"), ("last_call_at", "REAL DEFAULT 0")]
 

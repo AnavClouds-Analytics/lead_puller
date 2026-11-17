@@ -256,9 +256,10 @@ async function renderNew(fromId) {
   const d = META.defaults;
   NP = {filters: JSON.parse(JSON.stringify(d.filters)), target: d.target, max: null, maxEdited: false, account: "auto",
         cap: d.max_per_company, name: "", prompt: "", count: null, who: "filters", list: null, perCo: d.per_company, targetEdited: false,
-        includeRecent: !!fromId};   // 2.5.1: "Change filters" on a pull = the same companies again, with other filters
+        includeRecent: !!fromId, split: {sizes: "even", countries: "even"}};   // 2.7: Evenly is the default   // 2.5.1: "Change filters" on a pull = the same companies again, with other filters
   if (fromId) { try { const p = await api("/api/pulls/" + fromId);
-    Object.assign(NP, {filters: p.filters, target: p.target, max: p.max_credits, maxEdited: true, account: p.account_choice, cap: p.max_per_company, name: p.name, prompt: p.prompt});
+    Object.assign(NP, {filters: p.filters, target: p.target, max: p.max_credits, maxEdited: true, account: p.account_choice, cap: p.max_per_company, name: p.name, prompt: p.prompt,
+      split: {sizes: p.split_sizes === "even" ? "even" : "order", countries: p.split_countries === "even" ? "even" : "order"}});
     if (p.mode === "companies") { const c = await api(`/api/pulls/${fromId}/companies?all=1`);
       NP.who = "companies"; NP.perCo = p.max_per_company || d.per_company; NP.targetEdited = true;
       NP.list = await api("/api/companies/check", {body:{items:c.rows.map(r=>({name:r.name, domain:r.domain, signal:r.signal})), per_company:NP.perCo, target:NP.target, include_recent:NP.includeRecent}}); NP.list.file = `the list from pull #${fromId}`; } } catch(e) {} }
@@ -334,7 +335,8 @@ async function renderNew(fromId) {
     const filters = co ? Object.fromEntries(Object.entries(NP.filters).filter(([k]) => !META.defaults.company_only.includes(k))) : NP.filters;
     busy(e.currentTarget, async () => { const p = await api("/api/pulls", {body:{filters, target:NP.target, max_credits:NP.max, account:NP.account,
         max_per_company: co ? NP.perCo : NP.cap, name:$("#pname").value.trim(), prompt:$("#desc")?.value.trim()||"",
-        companies: co ? NP.list.items.filter(i=>i.status==="ready") : undefined, include_recent: co && NP.includeRecent}});
+        companies: co ? NP.list.items.filter(i=>i.status==="ready") : undefined, include_recent: co && NP.includeRecent,
+        split_sizes: co ? "" : NP.split.sizes, split_countries: co ? "" : NP.split.countries}});
       location.hash = "#/pull/" + p.id; }); };
   $("#fill") && ($("#fill").onclick = e => busy(e.currentTarget, async () => {
     const r = await api("/api/describe", {body:{text:$("#desc").value}});
@@ -428,7 +430,23 @@ function fieldHtml(f) {
   else adder = `<input data-text="${f.key}" ${f.lookup?`data-lookup="${esc(f.lookup)}"`:""} ${f.suggest?`data-suggest="${f.suggest}"`:""} autocomplete="off" placeholder="${f.lookup?"Start typing, then pick from Seamless's place list":f.suggest?"Start typing a technology":"Type and press Enter (comma for several)"}" aria-label="Add ${esc(f.label)}">`;
   const bundles = f.suggest === "tech" ? `<div class="small" style="margin-top:6px">Bundles: ${Object.keys(META.tech_bundles).map(b=>`<button type="button" class="linkbtn" data-bundle="${esc(b)}">${esc(b)}</button>`).join(" · ")}</div>` : "";
   return `<div class="field" data-key="${f.key}"><div class="flabel"><b>${esc(f.label)}</b><span class="fnote">${esc(EXNOTE[f.exclude||"none"])}</span></div>
-    ${chips?`<div class="chips">${chips}</div>`:""}<div class="adder">${adder}${seg}</div>${bundles}${f.help?`<div class="fnote" style="margin-top:4px">${esc(f.help)}</div>`:""}</div>`;
+    ${chips?`<div class="chips">${chips}</div>`:""}${splitHtml(f.key, ins)}<div class="adder">${adder}${seg}</div>${bundles}${f.help?`<div class="fnote" style="margin-top:4px">${esc(f.help)}</div>`:""}</div>`;
+}
+// 2.7: with 2 or more sizes (or countries) picked: share the target evenly between them, or cheapest first
+const SPLIT_AXIS = {companySize: "sizes", contactCountry: "countries"};
+function splitHtml(key, ins) {
+  const ax = SPLIT_AXIS[key];
+  if (!ax || NP.who !== "filters" || ins.length < 2) return "";
+  const v = NP.split[ax] === "order" ? "order" : "even", one = ax === "sizes" ? "size" : "country";
+  const nOf = k => { const x = ((NP.filters[k] || {}).in || []).filter(y => !String(y).startsWith("-")); return x.length >= 2 ? x.length : 1; };
+  const groups = (NP.split.sizes !== "order" ? nOf("companySize") : 1) * (NP.split.countries !== "order" ? nOf("contactCountry") : 1);
+  const share = Math.floor((NP.target || 0) / Math.max(1, v === "even" ? groups : ins.length));
+  if (v === "even" && NP.target && share < 10) return `<div class="split row" style="gap:10px;margin:2px 0 8px;flex-wrap:wrap"><span class="seg" role="group" aria-label="Split the target across ${ax}">
+      <button type="button" class="on" data-split="${ax}|even" aria-pressed="true">Evenly</button><button type="button" data-split="${ax}|order" aria-pressed="false">In order</button></span>
+    <span class="small" style="flex:1 1 200px;color:var(--warn,#b45309)">About ${fmt(share)} each is too few to split (each needs at least 10, or searching costs more). Raise the target or pick fewer; otherwise this pull runs In order${groups > ins.length ? " or splits one way only" : ""}.</span></div>`;
+  return `<div class="split row" style="gap:10px;margin:2px 0 8px;flex-wrap:wrap"><span class="seg" role="group" aria-label="Split the target across ${ax}">
+      <button type="button" class="${v==="even"?"on":""}" data-split="${ax}|even" aria-pressed="${v==="even"}">Evenly</button><button type="button" class="${v==="order"?"on":""}" data-split="${ax}|order" aria-pressed="${v==="order"}">In order</button></span>
+    <span class="small muted" style="flex:1 1 200px">${v === "even" ? `Each ${one} gets an equal share of the target${share ? ` (about ${fmt(share)} each)` : ""}. A ${one} that runs out passes its share to the others.` : `Cheapest ${one} first; the next ${one} only if the first runs out (how pulls worked before).`}</span></div>`;
 }
 function addVal(key, side, val) {
   const f = META.fields.find(x=>x.key===key); val = String(val||"").trim(); if (!val) return;
@@ -444,6 +462,7 @@ function wireFilters() {
   root.onclick = e => {
     const gh = e.target.closest("[data-g]"); if (gh) { GROUPS_OPEN[gh.dataset.g] = gh.nextElementSibling.classList.contains("hide"); drawFilters(); return; }
     const rm = e.target.closest("[data-rm]"); if (rm) { const [k,s,...v] = rm.dataset.rm.split("|"); rmVal(k,s,v.join("|")); drawFilters(); return; }
+    const sp = e.target.closest("[data-split]"); if (sp) { const [ax, v] = sp.dataset.split.split("|"); NP.split[ax] = v === "order" ? "order" : "even"; drawFilters(); return; }
     const md = e.target.closest("[data-mode]"); if (md) { const [k,s] = md.dataset.mode.split("|"); NP.mode = NP.mode||{}; NP.mode[k] = s; drawFilters(); return; }
     const pk = e.target.closest("[data-pick]"); if (pk) { const [k,s] = pk.dataset.side.split("|"); addVal(k, s, pk.dataset.pick); drawFilters(); setTimeout(()=>$(`[data-text="${k}"]`)?.focus(),0); return; }
     const bd = e.target.closest("[data-bundle]"); if (bd) { (META.tech_bundles[bd.dataset.bundle]||[]).forEach(t => addVal("technologies","in",t)); drawFilters(); return; }
@@ -553,6 +572,7 @@ function drawLive(p) {
         ${s.skips.map(r=>`<div class="skiprow small"><button type="button" class="linkbtn" data-skip="${esc(r.kind)}">${esc(SKIP[r.kind]||r.example||r.kind)}</button><b>${fmt(r.n)}</b></div>`).join("")}</div>` : ""}
       <div class="small muted" style="margin-top:10px">Memory holds ${fmt(p.overview.people_pulled)} people pulled with this tool and ${fmt(p.overview.seamless_saved)} contacts already in your Seamless accounts (${fmt(p.overview.emails_in_memory)} emails), on every account.</div></section>
     ${guessCard(p)}
+    ${groupsCard(p)}
     ${icyCard(p)}
 
     ${p.slices.length ? `<section class="card" aria-label="Smart scanning"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Smart scanning</h2><span class="small muted">${p.mode==="companies"?"One search per 100 companies. Companies that already have enough people are left out of later searches.":"Search split by company size, freshest first. A slice is left for later when new people get too expensive to find."}</span></div>
@@ -561,6 +581,21 @@ function drawLive(p) {
       <div class="small muted" style="margin-top:10px">Old people never stop a pull: they're skipped and never researched. It ends at ${fmt(p.target)} emails or ${fmt(p.max_credits)} credits; a slice where finding a new email costs more than ${META.defaults.move_on} extra search credits is left for later.</div></section>` : ""}`;
   $$("#live [data-skip]").forEach(b => b.onclick = () => { PV.view = "skipped"; PV.kind = b.dataset.skip; drawResults(p, true); $("#results").scrollIntoView({behavior:"smooth"}); });
   if (p.mode === "companies" && $("#coTable")) drawCompanies(p);
+}
+// 2.7: an even split: each size / country's share of the target and how far it has got
+function groupsCard(p) {
+  const gs = p.groups || [];
+  if (!gs.length) return "";
+  const axes = [p.split_sizes === "even" ? "company size" : "", p.split_countries === "even" ? "country" : ""].filter(Boolean).join(" and ");
+  return `<section class="card" aria-label="Shares of the target"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Shares of the target</h2>
+      <span class="small muted">Split evenly by ${esc(axes)}. One that runs out keeps what it found; the others make up the difference. Never more than ${fmt(p.target)} in total.</span></div>
+    ${gs.map(g => { const goal = Math.max(1, g.open ? Math.max(g.share, g.emails) : Math.max(g.emails, g.planned, 1)), pct = Math.min(100, 100 * g.emails / goal);
+      const txt = g.state === "open" ? `${fmt(g.emails)} of ${fmt(Math.max(g.share, g.emails))}`
+        : g.state === "ran_out" ? (g.emails >= g.planned ? `${fmt(g.emails)} <span class="muted">(planned ${fmt(g.planned)}, made up for the others; no more people left)</span>`
+                                                         : `${fmt(g.emails)} <span class="muted">· ran out of people (planned ${fmt(g.planned)})</span>`)
+        : `${fmt(g.emails)} <span class="muted">(planned ${fmt(g.planned)}${g.emails > g.planned ? ", made up for the others" : ""})</span>`;
+      return `<div style="margin:8px 0"><div class="row between small"><b>${esc(g.group)}</b><span>${txt}${g.waiting ? ` <span class="muted">· ${fmt(g.waiting)} on the way</span>` : ""}</span></div>
+        <div class="bar thin" role="progressbar" aria-label="${esc(g.group)}" aria-valuemin="0" aria-valuemax="${goal}" aria-valuenow="${g.emails}"><i style="width:${pct.toFixed(1)}%;background:var(--brand)"></i></div></div>`; }).join("")}</section>`;
 }
 function guessCard(p) {
   const g = p.guessing || {}, mv = (p.overview||{}).verifier || {};

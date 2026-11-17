@@ -1,10 +1,36 @@
-# Lead Puller 2.6.0
+# Lead Puller 2.7.0
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## New in 2.7: split a pull evenly across sizes and countries
+
+When you pick 2 or more company sizes (or countries), an **Evenly / In order** switch appears under that filter.
+
+- **Evenly (the default)**: each size (or country, or size and country pair) gets an equal share of the target. Two
+  sizes and two countries with a target of 1,200 = four groups of 300.
+- A group that runs out of people (or where new people get too expensive) keeps what it found, and its unused share
+  goes to the others. **Never more than the target in total** (a few extra can land at the very end, as with any pull).
+- Each group only pays for its own share: people found beyond it are kept for your next pull (no research credit).
+- **In order**: cheapest first, exactly how pulls worked before 2.7. Pulls made before 2.7 keep running this way.
+- Each group needs at least 10 emails (its first search page costs a credit): with too many groups for the target the
+  pull splits one way only, or runs in order. The form warns you.
+- The pull page shows **Shares of the target**: each group's progress, which ones ran out and who made up for them.
+- Company lists (People at my companies) are searched by company and are never split.
+- The switch is on the screen only; nothing to set in .env. No database work for you: two columns are added
+  automatically on start; nothing is deleted or changed.
+
+Measured on the test data: the split comes out even (within the last few answers), research credits are the same or
+lower than In order, and search credits a few higher (each group searches its own pages).
+
+### Upgrading to 2.7 (from 2.5, 2.5.1 or 2.6)
+
+Same as 2.6 below: back up `data/`, unzip over the folder (the zip never contains data/ or .env), `docker compose up -d
+--build`, and check `/healthz` shows 2.7.0. Tested by opening a 2.6.0 database with 2.7: every table unchanged (only a
+new login added), old pulls run In order.
 
 ## New in 2.6: fewer MillionVerifier checks, same Seamless credits
 

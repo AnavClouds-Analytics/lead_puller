@@ -265,7 +265,9 @@ def _pull_out(pid):
                             "SELECT COUNT(*) n FROM research_requests WHERE pull_id=? AND gave_up=1", (pid,))["n"],
                         "oldest_pending_at": oldest, "skips": skips,
                         "downloadable": len(exports.anavmail_rows(pid)) if p["status"] == "done" else emails},
-              "slices": slices, "account": acct["name"] if acct else None, "summary": "Enrich contacts from your file" if p.get("mode") == "enrich" else F.summary(p["filters"]),
+              "slices": slices, "groups": [{**g, "expected": round(g["expected"]), "share": round(g["share"])}
+                                           for g in engine.group_stats(p, hit)],
+              "account": acct["name"] if acct else None, "summary": "Enrich contacts from your file" if p.get("mode") == "enrich" else F.summary(p["filters"]),
               "overview": _overview()})
     return p
 
@@ -279,7 +281,8 @@ async def new_pull(request: Request):
                  for c in clist if isinstance(c, dict)]
     pid = engine.create_pull(b.get("name"), b.get("prompt"), b.get("filters") or {}, b.get("target"),
                              b.get("max_credits"), str(b.get("account") or "auto"), b.get("max_per_company"),
-                             company_list=clist, include_recent=bool(b.get("include_recent")))
+                             company_list=clist, include_recent=bool(b.get("include_recent")),
+                             split_sizes=b.get("split_sizes") or "", split_countries=b.get("split_countries") or "")
     return _pull_out(pid)
 
 
@@ -373,7 +376,8 @@ def pull_action(pid: int, action: str):
             clist = [{"name": r["name"], "domain_raw": r["domain"], "signal": r["signal"]} for r in
                      db.q("SELECT * FROM pull_companies WHERE pull_id=? ORDER BY idx", (pid,)) if r["domain"]]
         new = engine.create_pull(p["name"], p["prompt"], p["filters"], p["target"], p["max_credits"],
-                                 p["account_choice"], p["max_per_company"], rerun_of=pid, company_list=clist)
+                                 p["account_choice"], p["max_per_company"], rerun_of=pid, company_list=clist,
+                                 split_sizes=p.get("split_sizes") or "", split_countries=p.get("split_countries") or "")
         return _pull_out(new)
     else:
         raise HTTPException(404)
