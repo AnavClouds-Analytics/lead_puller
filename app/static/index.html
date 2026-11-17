@@ -509,7 +509,7 @@ function wireFilters() {
 const STATUS = {queued:["Waiting its turn","b-brand"], running:["Running","b-warn"], paused:["Paused","b-bad"], done:["Done","b-ok"], failed:["Failed","b-bad"]};
 const SKIP = {dup:"Same person twice in Seamless's results", mem_email:"Already pulled · email Seamless showed is in memory", mem_other:"Already pulled · same LinkedIn or name + company",
   seamless:"Already researched in your Seamless account", dnp:"On your do-not-pull list", exclude:"Excluded by your filters", no_li:"No LinkedIn profile",
-  no_site:"No company website", cap:"More than your limit per company", not_listed:"Not one of your companies", no_mx:"Company can't receive email", recheck:"Taken just before paying (already pulled)", expired:"Search result expired at Seamless", other:"Other"};
+  no_site:"No company website", cap:"More than your limit per company", not_listed:"Not one of your companies", no_mx:"Company can't receive email", recheck:"Taken just before paying (already pulled)", other_pull:"Already in another pull running at the same time", expired:"Search result expired at Seamless", other:"Other"};
 const SLICE = {todo:["Next",""], scanning:["Scanning now","b-warn"], done:["Done: scanned to the end","b-ok"], expensive:["Left for later","b-bad"], left:["Not needed","" ]};
 let PV = null;
 async function renderPull(id) {
@@ -555,7 +555,7 @@ function drawLive(p) {
   const skipTotal = (s.skips||[]).reduce((a,r)=>a+r.n, 0);
   $("#live").innerHTML = `${p.error ? `<div class="notice ${p.status==="paused"?"bad":"warn"}">${esc(p.error)}</div>` : ""}
     ${p.status==="done" && p.stop_reason ? `<div class="notice ${s.emails>=p.target?"ok":"info"}">${esc(p.stop_reason)}</div>` : ""}
-    ${p.status==="queued" ? `<div class="notice info">Waiting for the pull before it to finish. Pulls run one at a time, so two pulls never pay for the same person.</div>` : ""}
+    ${p.status==="queued" ? `<div class="notice info">Waiting for a free slot: up to ${fmt(META.max_pulls || 3)} pulls run at the same time (MAX_PULLS_AT_ONCE in .env). Every person is reserved for one pull, so two pulls never pay for the same person.</div>` : ""}
     <section class="card" aria-label="Progress"><div class="row between" style="align-items:baseline"><div><span class="big-num">${fmt(s.emails)}</span> <span class="muted" style="font-size:16px">of ${fmt(p.target)} emails</span></div>
       ${s.pending?`<span class="small muted">${fmt(s.pending)} waiting on Seamless${wait!=null&&onlyWaiting?` · stops waiting in about ${wait} min`:""}</span>`:""}</div>
       <div class="bar" role="progressbar" aria-label="Emails found" aria-valuemin="0" aria-valuemax="${p.target}" aria-valuenow="${s.emails}" style="margin:12px 0 18px"><i style="width:${pctE.toFixed(1)}%"></i></div>
@@ -573,6 +573,7 @@ function drawLive(p) {
       <div class="small muted" style="margin-top:10px">Memory holds ${fmt(p.overview.people_pulled)} people pulled with this tool and ${fmt(p.overview.seamless_saved)} contacts already in your Seamless accounts (${fmt(p.overview.emails_in_memory)} emails), on every account.</div></section>
     ${guessCard(p)}
     ${groupsCard(p)}
+    ${timeCard(p)}
     ${icyCard(p)}
 
     ${p.slices.length ? `<section class="card" aria-label="Smart scanning"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Smart scanning</h2><span class="small muted">${p.mode==="companies"?"One search per 100 companies. Companies that already have enough people are left out of later searches.":"Search split by company size, freshest first. A slice is left for later when new people get too expensive to find."}</span></div>
@@ -581,6 +582,20 @@ function drawLive(p) {
       <div class="small muted" style="margin-top:10px">Old people never stop a pull: they're skipped and never researched. It ends at ${fmt(p.target)} emails or ${fmt(p.max_credits)} credits; a slice where finding a new email costs more than ${META.defaults.move_on} extra search credits is left for later.</div></section>` : ""}`;
   $$("#live [data-skip]").forEach(b => b.onclick = () => { PV.view = "skipped"; PV.kind = b.dataset.skip; drawResults(p, true); $("#results").scrollIntoView({behavior:"smooth"}); });
   if (p.mode === "companies" && $("#coTable")) drawCompanies(p);
+}
+// 2.8: where the pull's time went, biggest first
+function hm(sec) { sec = Math.round(sec || 0); const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60);
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : m ? `${m}m` : `${sec}s`; }
+function timeCard(p) {
+  const t = p.time || [];
+  if (!t.length) return "";
+  const total = t.reduce((a, x) => a + x.seconds, 0);
+  if (total < 60) return "";                       // nothing worth showing yet
+  const live = ["running", "queued", "paused"].includes(p.status);
+  return `<section class="card" aria-label="Where the time went"><div class="row between" style="margin-bottom:10px"><h2 style="margin:0">Where the time went</h2>
+      <span class="small muted">${hm(total)} ${live ? "so far" : "in total"}</span></div>
+    ${t.map(x => `<div style="margin:6px 0"><div class="row between small"><span>${esc(x.label)}</span><span>${hm(x.seconds)} · ${x.pct}%</span></div>
+      <div class="bar thin" role="progressbar" aria-label="${esc(x.label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${x.pct}"><i style="width:${x.pct}%;background:var(--brand)"></i></div></div>`).join("")}</section>`;
 }
 // 2.7: an even split: each size / country's share of the target and how far it has got
 function groupsCard(p) {

@@ -112,6 +112,8 @@ MIGRATIONS["contacts"] += [("icy_state", "TEXT"), ("icy_note", "TEXT"), ("icy_jo
                            ("icy_search", "INTEGER DEFAULT 0")]
 # 2.7: split a pull evenly across the company sizes / countries you pick ('even'), or cheapest first ('' or 'order')
 MIGRATIONS["pulls"] += [("split_sizes", "TEXT DEFAULT ''"), ("split_countries", "TEXT DEFAULT ''")]
+# 2.8: where a pull's time went (seconds per kind of work)
+MIGRATIONS["pulls"] += [("time_json", "TEXT")]
 MIGRATIONS["pull_slices"] = [("grp", "TEXT"), ("country_value", "TEXT")]
 # 2.4.1: Prospeo's own request limits (per plan), read from its answers, and why it is paused
 MIGRATIONS["prospeo"] = [("pause_reason", "TEXT"), ("limits_json", "TEXT"), ("last_call_at", "REAL DEFAULT 0")]

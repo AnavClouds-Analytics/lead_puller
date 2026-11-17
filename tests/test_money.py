@@ -447,11 +447,15 @@ def test_people_are_checked_again_right_before_paying(env):
     held = db.q("SELECT name FROM contacts WHERE pull_id=? AND state='kept'", (pa,))
     assert held and not db.q1("SELECT COUNT(*) n FROM contacts WHERE submitted_at IS NOT NULL")["n"]
     client.post(f"/api/pulls/{pa}/pause")
-    run(client, start(client, US, target=60, max_credits=400, account=b["id"]))   # B pays for the same people
+    pb = start(client, US, target=60, max_credits=400, account=b["id"])
+    run(client, pb)                                        # B meets the same people
     client.post(f"/api/pulls/{pa}/resume")
     run(client, pa)
     rechecked = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_kind='recheck'", (pa,))["n"]
-    assert rechecked > 0
+    # 2.8: A's people are reserved for A while A is open (even paused), so B skips them instead of paying; before
+    # 2.8 B paid for them and A dropped them right before paying. Either way nobody is paid for twice.
+    reserved = db.q1("SELECT COUNT(*) n FROM contacts WHERE pull_id=? AND skip_kind='other_pull'", (pb,))["n"]
+    assert rechecked > 0 or reserved > 0
     check_people(fake)                                     # nobody paid for on both accounts
     check_books(fake)
 

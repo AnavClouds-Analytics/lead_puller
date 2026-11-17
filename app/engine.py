@@ -110,7 +110,10 @@ def resume(pid):
         return
     if not cfg.SPENDING_ENABLED:
         raise PullError("Spending is switched off (SPENDING_ENABLED=0 in .env).")
-    db.update_pull(pid, status="running" if p["started_at"] else "queued", pause_kind=None, error=None, errors_in_row=0,
+    slots = max(1, cfg.MAX_PULLS_AT_ONCE)
+    busy = db.q1("SELECT COUNT(*) n FROM pulls WHERE status='running' AND id!=?", (pid,))["n"]
+    db.update_pull(pid, status="running" if p["started_at"] and busy < slots else "queued", pause_kind=None, error=None,
+                   errors_in_row=0,
                    rate_ack=1 if p["pause_kind"] == "low_rate" else p["rate_ack"])
 
 
@@ -472,14 +475,64 @@ def tick():
         icypeas_late()
     except Exception:                                    # never let a late Icypeas lookup stop the pulls
         pass
-    running = db.q1("SELECT id FROM pulls WHERE status='running' ORDER BY id LIMIT 1")
-    if not running:
+    # 2.8: up to MAX_PULLS_AT_ONCE pulls run side by side (same Seamless account); they take turns, a step each
+    slots = max(1, cfg.MAX_PULLS_AT_ONCE)
+    ids = [r["id"] for r in db.q("SELECT id FROM pulls WHERE status='running' ORDER BY id")]
+    while len(ids) < slots:
         nxt = db.q1("SELECT id FROM pulls WHERE status='queued' ORDER BY id LIMIT 1")
         if not nxt:
-            return False
-        running = nxt
+            break
         db.update_pull(nxt["id"], status="running")
-    p = db.get_pull(running["id"])
+        ids.append(nxt["id"])
+    if not ids:
+        return False
+    _RUNNING[0] = len(ids[:slots])
+    for pid in ids[:slots]:
+        p = db.get_pull(pid)
+        if p and p["status"] == "running":
+            _timed_step(p)
+    return True
+
+
+# ---------------------------------------------------------------- 2.8: where the time went
+_TIMES = {}                     # pull id -> {"last": end of its last step, "phase": what it was doing, "acc": {...}}
+_RUNNING = [1]                  # how many pulls took a turn in the last round
+PHASES = {"search": "Searching Seamless", "guess": "Checking guesses (MillionVerifier)",
+          "pay": "Sending people to Seamless", "wait": "Waiting for Seamless's answers",
+          "icypeas": "Icypeas (second source)", "turns": "Taking turns with your other pulls", "other": "Other work"}
+
+
+def _phase(pid, name):
+    t = _TIMES.setdefault(pid, {"last": None, "phase": "other", "acc": {}, "saved": 0, "now": "other"})
+    t["now"] = name
+
+
+def _timed_step(p):
+    """One step of a pull, timed: the step's own time goes to what it did, the gap since its last step to what it was
+    waiting on. Saved with the pull every half minute."""
+    pid = p["id"]
+    t = _TIMES.get(pid)
+    if t is None:
+        old = json.loads(p.get("time_json") or "{}") or {}
+        t = _TIMES[pid] = {"last": None, "phase": "other", "acc": dict(old), "saved": time.time(), "now": "other"}
+    start = time.time()
+    if t["last"] is not None:
+        gap = max(0.0, start - t["last"])
+        t["acc"][t["phase"]] = t["acc"].get(t["phase"], 0.0) + min(gap, 600.0)
+    t["now"] = "other"
+    try:
+        _guarded_step(p)
+    finally:
+        end = time.time()
+        ph = t["now"]
+        t["acc"][ph] = t["acc"].get(ph, 0.0) + (end - start)
+        t["last"], t["phase"] = end, (ph if ph in ("wait", "icypeas") else ("turns" if _RUNNING[0] > 1 else "wait"))
+        if end - t["saved"] >= 30 or (db.get_pull(pid) or {}).get("status") in ("done", "failed"):
+            t["saved"] = end
+            db.update_pull(pid, time_json=json.dumps({k: round(v, 1) for k, v in t["acc"].items()}))
+
+
+def _guarded_step(p):
     try:
         step(p)
         if p["errors_in_row"]:
@@ -491,6 +544,11 @@ def tick():
             db.update_pull(p["id"], status="paused", pause_kind="errors", error=f"Paused: {e}")
     except PullError as e:
         db.update_pull(p["id"], status="paused", pause_kind="error", error=f"Paused: {e}")
+    except Exception:                                    # noqa: BLE001 - 2.8: one pull's problem never stops the others
+        import logging
+        logging.exception("pull %s step failed", p["id"])
+        if cfg.MAX_PULLS_AT_ONCE <= 1:
+            raise
     return True
 
 
@@ -523,6 +581,8 @@ def step(p):
         return
     # 2.5: Icypeas fills in people Seamless had no usable email for, in the background (charged only when found)
     icy_busy = _icy_tick(p, math.ceil(p["target"] - expected))
+    if icy_busy:
+        _phase(pid, "icypeas")
     enrich = p.get("mode") == "enrich"
     if credits_left(p) < 1:
         if enrich and st["kept"]:
@@ -626,6 +686,7 @@ def _start(p):
 
 def _wait(p, st):
     """Only answers are outstanding. Give up on slow ones after RESEARCH_WAIT_MINUTES (late answers still count)."""
+    _phase(p["id"], "wait")
     oldest = db.q1("SELECT MIN(created_at) t FROM research_requests WHERE pull_id=? AND resolved_at IS NULL",
                    (p["id"],))["t"]
     if oldest and NOW() - oldest > cfg.RESEARCH_WAIT_MINUTES * 60:
@@ -745,6 +806,22 @@ def _search(p, sl, want_people, hit):
         return
     body = _slice_body(p, sl)
     scan = db.q1("SELECT * FROM scan_state WHERE account_id=? AND skey=?", (acct["id"], sl["skey"]))
+    if scan and scan["exhausted_at"] and not scan["next_token"] and scan["exhausted_at"] >= (p.get("created_at") or 0):
+        # 2.8: another pull with the same filters, running at the same time, has just reached the end of this list:
+        # don't search it again from the top (that would only show people already taken)
+        db.x("UPDATE pull_slices SET state='done', note=? WHERE id=?",
+             ("scanned to the end by a pull with the same filters running at the same time", sl["id"]))
+        return
+    twin = db.q1("""SELECT s.note FROM pull_slices s JOIN pulls p ON p.id=s.pull_id WHERE s.skey=? AND s.pull_id!=?
+                    AND s.state='expensive' AND p.status IN ('running','paused','queued') AND p.current_account_id=?
+                    LIMIT 1""", (sl["skey"], pid, acct["id"]))
+    if twin:
+        # 2.8: a pull with the same filters running now found new people here too costly: so would this one
+        db.x("UPDATE pull_slices SET state='expensive', note=? WHERE id=?",
+             ("left for later: a pull with the same filters running at the same time found it too costly here",
+              sl["id"]))
+        return
+    _phase(pid, "search")
     fresh_note = None
     if cfg.FRESH_RESCAN and scan and scan["exhausted_at"] and not scan["next_token"]:
         since = _iso(scan["exhausted_at"] - 86400)
@@ -1011,6 +1088,7 @@ def _store_rows(p, acct, sl, rows):
     kept = 0
     now = NOW()
     page_keys = _pull_keys(pid)
+    others = _other_pull_keys(pid)              # 2.8: people another pull running now has already reserved
     listed_mode = p.get("mode") == "companies"
     parsed = [_parse_row(r) for r in rows]
     if listed_mode:
@@ -1022,6 +1100,10 @@ def _store_rows(p, acct, sl, rows):
         reason = kind = None
         if keys and page_keys & set(keys):
             reason, kind = "Same person twice in Seamless's results", "dup"
+        if not reason and keys and others:
+            hit_pull = next((others[k] for k in keys if k in others), None)
+            if hit_pull:
+                reason, kind = f"Already in pull #{hit_pull}, running at the same time", "other_pull"
         listed_dom = CO.listed(pid, c["domain"]) if listed_mode else None
         if not reason and listed_mode and not listed_dom:
             reason, kind = "Not one of your companies", "not_listed"
@@ -1063,6 +1145,19 @@ def _store_rows(p, acct, sl, rows):
               c["last_name"], c["title"], c["seniority"], c["department"], c["company"], c["domain"], c["li_url"],
               c["country"], c["region"], c["city"], c["industry"], c["size"], c["row_email"], now))
     return kept
+
+
+def _other_pull_keys(pid):
+    """2.8: {memory key: pull id} for the people other pulls running now have kept or are paying for. Whoever keeps a
+    person first has them; the other pulls skip them, so two pulls never pay for the same person (people already paid
+    for are in memory anyway)."""
+    out = {}
+    for r in db.q("""SELECT c.pull_id, c.name, c.company, c.li_url, c.row_email FROM contacts c JOIN pulls p ON p.id=c.pull_id
+                     WHERE c.pull_id!=? AND p.status IN ('running','paused','queued')
+                     AND c.state IN ('kept','queued','unconfirmed','timed_out')""", (pid,)):
+        for k in db.person_keys(r["name"], r["company"], r["li_url"], r["row_email"]):
+            out.setdefault(k, r["pull_id"])
+    return out
 
 
 def _pull_keys(pid):
@@ -1117,78 +1212,178 @@ def _research(p, n, allow=None):
         guessing, _why = verifier.ready()
         inflight = _domains_in_flight(pid) if guessing else set()
         block = memory.Blocklist()
-        to_pay, done, checks, learners = [], 0, 0, set()
-        for c in cands:
-            if done + len(to_pay) >= k or len(to_pay) >= room:
-                break
-            if allow is not None:                         # 2.7: each group only up to its share
-                g = sgrp.get(c["slice_id"])
-                if g is None or used[g] >= allow[g]:
-                    continue
-                used[g] += 1
-            reason = _recheck(c, block)
-            if reason:
-                db.x("UPDATE contacts SET state='skipped', skip_reason=?, skip_kind='recheck' WHERE id=?",
-                     (reason, c["id"]))
-                continue
-            d = db.norm_domain(c["domain"])
-            if not guessing or c["guess_done"] or not d:
-                to_pay.append(c)
-                continue
-            addrs, why_not = guess.plan(c, _namesakes(pid, c))
-            if addrs:
-                if checks >= max(1, cfg.GUESS_PER_STEP):
-                    continue                              # checked next step, so Pause/Stop answer quickly
-                checks += len(addrs)
-                email, note = guess.try_person(c, addrs, pid)
-                if email and _recheck(c, memory.Blocklist()) is None:
-                    _apply_guess(c, email, note, how="format")
-                    done += 1
-                    continue
-                db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (note, c["id"]))
-                to_pay.append(c)
-                guessing, _why = verifier.ready()        # e.g. MillionVerifier just ran out: stop guessing
-            elif why_not == "Company's email format not known yet.":
-                if d in inflight or d in learners:
-                    continue                              # wait for the person already paid for at this company
-                learners.add(d)
-                # 2.2: try the common full-name formats first (MillionVerifier); pay Seamless only if none exists
-                paddrs, _pwhy = guess.probe_plan(c, _namesakes(pid, c))
-                if paddrs:
-                    if checks >= max(1, cfg.GUESS_PER_STEP):
-                        learners.discard(d)
-                        continue                          # checked next step, so Pause/Stop answer quickly
-                    checks += len(paddrs) + 1
-                    email, note = guess.probe(c, paddrs, pid)
-                    if email and _recheck(c, memory.Blocklist()) is None:
-                        _apply_guess(c, email, note, how="probe")
-                        done += 1
-                        continue
-                    db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?",
-                         (f"Paid for in Seamless to learn this company's email format ({note}).", c["id"]))
-                    to_pay.append(c)
-                    guessing, _why = verifier.ready()
-                    continue
-                db.x("UPDATE contacts SET guess_note=? WHERE id=?",
-                     ("Paid for in Seamless to learn this company's email format.", c["id"]))
-                to_pay.append(c)
-            else:
-                db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (why_not, c["id"]))
-                to_pay.append(c)
+        if max(1, cfg.GUESS_PARALLEL) > 1 and guessing:
+            to_pay, done = _decide_parallel(p, cands, k, room, allow, sgrp, used, inflight, block)
+        else:
+            to_pay, done = _decide_one_by_one(p, cands, k, room, allow, sgrp, used, guessing, inflight, block)
         if to_pay:
+            _phase(pid, "pay")
             _send(p, acct, to_pay[:max(0, min(k - done, room))])
         return done + len(to_pay)
     return 0
 
 
+def _decide_one_by_one(p, cands, k, room, allow, sgrp, used, guessing, inflight, block):
+    """Before 2.8 (and GUESS_PARALLEL=1): each person in turn. Returns (people to pay for, emails found by guessing)."""
+    pid = p["id"]
+    to_pay, done, checks, learners = [], 0, 0, set()
+    for c in cands:
+        if done + len(to_pay) >= k or len(to_pay) >= room:
+            break
+        if allow is not None:                         # 2.7: each group only up to its share
+            g = sgrp.get(c["slice_id"])
+            if g is None or used[g] >= allow[g]:
+                continue
+            used[g] += 1
+        reason = _recheck(c, block)
+        if reason:
+            db.x("UPDATE contacts SET state='skipped', skip_reason=?, skip_kind='recheck' WHERE id=?",
+                 (reason, c["id"]))
+            continue
+        d = db.norm_domain(c["domain"])
+        if not guessing or c["guess_done"] or not d:
+            to_pay.append(c)
+            continue
+        r = _guess_one(p, c, d, inflight, learners, lambda n: checks < max(1, cfg.GUESS_PER_STEP))
+        if r[0] == "defer":
+            continue
+        checks += r[2]
+        if r[0] == "done":
+            done += 1
+        else:
+            to_pay.append(c)
+            if r[2]:
+                guessing, _why = verifier.ready()    # e.g. MillionVerifier just ran out: stop guessing
+    return to_pay, done
+
+
+def _guess_one(p, c, d, inflight, learners, may_spend):
+    """Try to find one person's email by guessing. Returns (outcome, contact, checks used): outcome 'done' (found,
+    no Seamless credit), 'pay' (pay Seamless as usual) or 'defer' (try again next step)."""
+    pid = p["id"]
+    addrs, why_not = guess.plan(c, _namesakes(pid, c))
+    if addrs:
+        if not may_spend(len(addrs)):
+            return "defer", c, 0                      # checked next step, so Pause/Stop answer quickly
+        email, note = guess.try_person(c, addrs, pid)
+        if email and _recheck(c, memory.Blocklist()) is None:
+            _apply_guess(c, email, note, how="format")
+            return "done", c, len(addrs)
+        db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (note, c["id"]))
+        return "pay", c, len(addrs)
+    if why_not == "Company's email format not known yet.":
+        if d in inflight or d in learners:
+            return "defer", c, 0                      # wait for the person already paid for at this company
+        learners.add(d)
+        # 2.2: try the common full-name formats first (MillionVerifier); pay Seamless only if none exists
+        paddrs, _pwhy = guess.probe_plan(c, _namesakes(pid, c))
+        if paddrs:
+            if not may_spend(len(paddrs) + 1):
+                learners.discard(d)
+                return "defer", c, 0
+            email, note = guess.probe(c, paddrs, pid)
+            if email and _recheck(c, memory.Blocklist()) is None:
+                _apply_guess(c, email, note, how="probe")
+                return "done", c, len(paddrs) + 1
+            db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?",
+                 (f"Paid for in Seamless to learn this company's email format ({note}).", c["id"]))
+            return "pay", c, len(paddrs) + 1
+        db.x("UPDATE contacts SET guess_note=? WHERE id=?",
+             ("Paid for in Seamless to learn this company's email format.", c["id"]))
+        return "pay", c, 0
+    db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?", (why_not, c["id"]))
+    return "pay", c, 0
+
+
+def _decide_parallel(p, cands, k, room, allow, sgrp, used, inflight, block):
+    """2.8: the same decisions as one by one, but the companies are worked on side by side (GUESS_PARALLEL at a
+    time). Within one company people still go one after another, in the same order, so what is learned about the
+    company (its format, a server that accepts everything, guesses that keep failing) is used exactly as before."""
+    pid = p["id"]
+    to_pay, lanes, order, taken = [], {}, [], 0
+    for c in cands:
+        if taken + len(to_pay) >= k or len(to_pay) >= room:
+            break
+        if allow is not None:
+            g = sgrp.get(c["slice_id"])
+            if g is None or used[g] >= allow[g]:
+                continue
+            used[g] += 1
+        reason = _recheck(c, block)
+        if reason:
+            db.x("UPDATE contacts SET state='skipped', skip_reason=?, skip_kind='recheck' WHERE id=?",
+                 (reason, c["id"]))
+            continue
+        d = db.norm_domain(c["domain"])
+        if c["guess_done"] or not d:
+            to_pay.append(c)
+            continue
+        if d in lanes or len(lanes) >= max(1, cfg.GUESS_PARALLEL):
+            continue                                   # one person per company per step; the rest next step
+        lanes[d] = [c]
+        order.append(d)
+        taken += 1
+    if not lanes:
+        return to_pay, 0
+    _phase(pid, "guess")
+    lock = threading.Lock()
+    spent = [0]
+    budget = max(1, cfg.GUESS_PER_STEP) * max(1, cfg.GUESS_PARALLEL)
+
+    def may_spend(n):
+        with lock:
+            if spent[0] >= budget:
+                return False
+            spent[0] += n
+            return True
+
+    def lane(d):
+        out, learners = [], set()
+        for c in lanes[d]:
+            ok, _why = verifier.ready()
+            if not ok:                                 # MillionVerifier stopped (no credits, errors): pay as usual
+                out.append(("pay", c, 0))
+                continue
+            try:
+                out.append(_guess_one(p, c, d, inflight, learners, may_spend))
+            except Exception as e:                     # noqa: BLE001 - a failed check = pay Seamless as usual
+                db.x("UPDATE contacts SET guess_done=1, guess_note=? WHERE id=?",
+                     (f"Couldn't check the guess ({type(e).__name__}).", c["id"]))
+                out.append(("pay", c, 0))
+        return out
+
+    results = {}
+    first, rest = order[0], order[1:]
+    results[first] = lane(first)                       # one company first: if MillionVerifier is failing, stop early
+    if rest and (verifier._row() or {}).get("errors_in_row", 0) == 0 and verifier.ready()[0]:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(max(1, cfg.GUESS_PARALLEL), len(rest)), thread_name_prefix="guess") as ex:
+            for d, out in zip(rest, ex.map(lane, rest)):
+                results[d] = out
+    else:
+        for d in rest:
+            results[d] = lane(d)
+    done = 0
+    for d in order:
+        for outcome, c, _n in results[d]:
+            if outcome == "done":
+                done += 1
+            elif outcome == "pay":
+                to_pay.append(c)
+    return to_pay, done
+
+
 def _domains_in_flight(pid):
     """Companies where someone in this pull is paid for and their answer (with the email format) is on its way."""
-    if not db.q1("SELECT 1 x FROM research_requests WHERE pull_id=? AND resolved_at IS NULL LIMIT 1", (pid,)):
+    # 2.8: across every pull running at the same time, so two pulls never learn the same company twice
+    if not db.q1("SELECT 1 x FROM research_requests WHERE resolved_at IS NULL AND pull_id IN "
+                 "(SELECT id FROM pulls WHERE status IN ('running','paused')) LIMIT 1"):
         return set()                     # nothing is on its way, so nobody should wait
     return {db.norm_domain(r["domain"]) for r in db.q(
-        """SELECT DISTINCT c.domain FROM contacts c WHERE c.pull_id=? AND c.state='queued' AND c.domain IS NOT NULL
+        """SELECT DISTINCT c.domain FROM contacts c WHERE c.pull_id IN (SELECT id FROM pulls WHERE status IN
+           ('running','paused')) AND c.state='queued' AND c.domain IS NOT NULL
            AND c.domain!='' AND (c.request_id IS NULL OR EXISTS (SELECT 1 FROM research_requests r WHERE
-           r.request_id=c.request_id AND r.resolved_at IS NULL))""", (pid,))}
+           r.request_id=c.request_id AND r.resolved_at IS NULL))""")}
 
 
 def _namesakes(pid, c):

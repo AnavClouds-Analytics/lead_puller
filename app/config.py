@@ -2,7 +2,7 @@
 .env and running `docker compose up -d` is all it takes. Nothing here needs a code change."""
 import os
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 
 # (name, default, type, group, what it does). Order = order on the Settings page and in .env.example.
 SETTINGS = [
@@ -79,6 +79,9 @@ SETTINGS = [
      "Off by default: another J. Smith there could own it. Formats like john@ are never guessed"),
     ("GUESS_PER_STEP", "10", "int", "Email guessing",
      "Guesses checked per step, so Pause and Stop always answer quickly"),
+    ("GUESS_PARALLEL", "10", "int", "Email guessing",
+     "2.8: MillionVerifier checks run this many at a time, each at a different company (1 = one at a time, as before). "
+     "Same checks and credits, much faster"),
     ("GUESS_TIMEOUT_SECONDS", "10", "int", "Email guessing",
      "MillionVerifier answer time limit per check (2–60); a slow answer counts as not valid, never as valid"),
     ("GUESS_CACHE_DAYS", "30", "int", "Email guessing",
@@ -158,6 +161,8 @@ SETTINGS = [
      "Default \"Location applies to\": contact = person's location (recommended), company, bothOR, bothAND"),
     ("PAGE_SIZE", "50", "int", "Search", "Max people per search page (pages are sized to what's still needed)"),
     ("RESEARCH_BATCH", "100", "int", "Search", "Max people sent for research per call (Seamless max 500)"),
+    ("MAX_PULLS_AT_ONCE", "3", "int", "Search",
+     "2.8: pulls that run at the same time, all on the same Seamless account (more wait in line). 1 = one at a time"),
     ("POLL_SECONDS", "4", "int", "Search", "Seconds between checks for research results (free)"),
     ("RATE_LIMIT_PER_MIN", "55", "int", "Search", "Calls per minute per endpoint (Seamless allows 60 per organization)"),
     ("RESEARCH_WAIT_MINUTES", "15", "int", "Search", "Wait this long for slow research answers, then finish without them"),

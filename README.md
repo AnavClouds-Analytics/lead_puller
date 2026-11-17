@@ -1,10 +1,36 @@
-# Lead Puller 2.7.0
+# Lead Puller 2.8.0
 
 Pulls contacts in bulk from Seamless.AI for AnavMail, using Seamless's own filters. The tool's main job is to
 **never spend a credit it doesn't have to**. It is a fresh build that replaces Lead Puller 1.x. Your existing
 memory of everyone already paid for is copied over automatically (see "Moving from 1.x").
 
 One container, one process, one SQLite file. FastAPI + a background pull runner + a single-page UI.
+
+## New in 2.8: faster pulls, several at once
+
+- **Several pulls at the same time** (`MAX_PULLS_AT_ONCE=3` in .env; more wait in line). They all use the same Seamless
+  account (your second account is only used when the first runs low, as before) and take turns step by step.
+- **Nobody is paid for twice**, with the same filters or different ones: whoever keeps a person first has them, the
+  other pulls skip them ("Already in another pull running at the same time"). Your history (everyone already pulled,
+  the do-not-pull list, contacts already in your Seamless accounts) is checked first, as always.
+- **Same filters share one place in Seamless's list**: if two pulls have identical filters, each part of the list is
+  read once between them, not once per pull. A part one pull finds too costly is left for both.
+- **Companies are shared**: if one pull is working out a company's email format, the others wait for that answer
+  instead of checking the same company again.
+- **MillionVerifier checks run side by side** (`GUESS_PARALLEL=10`): different companies at the same time, one person
+  per company, in the same order as before within a company. `GUESS_PARALLEL=1` = exactly as 2.7.
+- **Where the time went** on the pull page: searching, checking guesses, sending people to Seamless, waiting for
+  Seamless's answers, Icypeas, taking turns with your other pulls.
+- Everything else is unchanged, including the Evenly / In order split.
+
+Measured on the test data (the same 15 runs as 2.6): Seamless research credits 6.5% lower than 2.5.1 (more people
+found by guessing), search credits the same, every run reached the same number of emails, MillionVerifier checks
+still 11% below 2.5.1 (4% above 2.7, because more guesses are made, each saving a Seamless credit).
+
+### Upgrading to 2.8
+
+Same as below: back up `data/`, unzip over the folder, `docker compose up -d --build`, check `/healthz` shows 2.8.0.
+Two new optional .env settings (MAX_PULLS_AT_ONCE, GUESS_PARALLEL) have defaults; one column is added automatically.
 
 ## New in 2.7: split a pull evenly across sizes and countries
 

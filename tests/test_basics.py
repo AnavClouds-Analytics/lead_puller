@@ -61,7 +61,9 @@ def test_a_pull_needs_real_filters_and_a_target(env):
     assert r.status_code == 400
 
 
-def test_only_one_pull_runs_at_a_time(env):
+def test_only_one_pull_runs_at_a_time(env, monkeypatch):
+    """With MAX_PULLS_AT_ONCE=1 (before 2.8 always): one pull at a time, the next waits its turn."""
+    monkeypatch.setenv("MAX_PULLS_AT_ONCE", "1")
     client, fake, clock = env
     a = start(client, US, target=40, max_credits=400)
     b = start(client, {"contactCountry": {"in": ["Canada"]}}, target=20, max_credits=400)

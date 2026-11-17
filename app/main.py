@@ -124,7 +124,7 @@ def _overview():
 
 @app.get("/api/meta", dependencies=AUTH)
 def meta():
-    return {"version": APP_VERSION, "fields": F.FIELDS, "defaults": {
+    return {"version": APP_VERSION, "max_pulls": max(1, cfg.MAX_PULLS_AT_ONCE), "fields": F.FIELDS, "defaults": {
         "filters": F.default_filters(), "target": cfg.DEFAULT_TARGET,
         "max_per_email": cfg.DEFAULT_MAX_CREDITS_PER_EMAIL, "max_per_company": cfg.MAX_PER_COMPANY,
         "columns": exports.default_columns(), "page_size": cfg.TABLE_PAGE_SIZE,
@@ -192,6 +192,17 @@ def estimate(target: int = 0):
 # ---------------------------------------------------------------- pulls
 def _page(offset, limit):
     return max(0, int(offset or 0)), max(1, min(int(limit or cfg.TABLE_PAGE_SIZE), 250))
+
+
+def _time_out(p):
+    """2.8: where the pull's time went, biggest first: [{label, seconds, pct}]."""
+    raw = engine._TIMES.get(p["id"], {}).get("acc") or json.loads(p.get("time_json") or "{}") or {}
+    tot = sum(v for v in raw.values() if v > 0)
+    if tot <= 0:
+        return []
+    out = [{"key": k, "label": engine.PHASES.get(k, k), "seconds": round(v), "pct": round(100 * v / tot)}
+           for k, v in raw.items() if v > 0]
+    return sorted(out, key=lambda x: -x["seconds"])
 
 
 def _pull_out(pid):
@@ -265,7 +276,7 @@ def _pull_out(pid):
                             "SELECT COUNT(*) n FROM research_requests WHERE pull_id=? AND gave_up=1", (pid,))["n"],
                         "oldest_pending_at": oldest, "skips": skips,
                         "downloadable": len(exports.anavmail_rows(pid)) if p["status"] == "done" else emails},
-              "slices": slices, "groups": [{**g, "expected": round(g["expected"]), "share": round(g["share"])}
+              "time": _time_out(p), "slices": slices, "groups": [{**g, "expected": round(g["expected"]), "share": round(g["share"])}
                                            for g in engine.group_stats(p, hit)],
               "account": acct["name"] if acct else None, "summary": "Enrich contacts from your file" if p.get("mode") == "enrich" else F.summary(p["filters"]),
               "overview": _overview()})
